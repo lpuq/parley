@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.parley.Parley</id>
+  <name>Parley</name>
+  <summary>Private voice, video and screen-share calls between friends</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <launchable type="desktop-id">io.github.parley.Parley.desktop</launchable>
+  <description>
+    <p>
+      Parley lets two or three friends call each other directly: voice, webcams and
+      screen sharing with sound, all at once. There are no accounts and no servers to set up,
+      and calls are end-to-end encrypted.
+    </p>
+    <ul>
+      <li>Add a friend once by sharing a code or scanning a QR code</li>
+      <li>Group calls that survive someone dropping out, with one-click rejoin</li>
+      <li>Share your whole desktop's sound or just chosen apps, without echoing the call</li>
+      <li>Echo cancellation and noise suppression</li>
+    </ul>
+  </description>
+  <content_rating type="oars-1.1">
+    <content_attribute id="social-audio">intense</content_attribute>
+  </content_rating>
+  <releases>
+    <release version="0.1.0" date="2026-11-11"/>
+  </releases>
+</component>

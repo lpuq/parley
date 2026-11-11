@@ -1,0 +1,1470 @@
+//! Network engine. One actor task owns all call state; per-connection tasks
+//! feed it events. Calls are a full mesh (fine for the 2–3 people we target):
+//! every participant holds one encrypted QUIC connection to every other.
+
+use std::{
+    collections::HashMap,
+    sync::{Arc, atomic::AtomicBool},
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result, anyhow};
+use iroh::{
+    Endpoint, EndpointAddr, EndpointId, SecretKey,
+    endpoint::{Connection, RecvStream, SendStream, presets},
+};
+use tokio::{sync::mpsc, task::JoinHandle};
+use tracing::{debug, info, warn};
+
+use crate::{
+    hub::{Hub, PeerOut, VIDEO_QUEUE, VideoFrame},
+    proto::*,
+    store::{Contact, Group, Member, RoomId, join_proof, room_id_for, verify_proof},
+};
+
+const RING_TIMEOUT: Duration = Duration::from_secs(45);
+const DIAL_TIMEOUT: Duration = Duration::from_secs(25);
+const RECONNECT_WINDOW: Duration = Duration::from_secs(60);
+const STALE_FRAME: Duration = Duration::from_millis(500);
+
+#[derive(Debug)]
+pub enum NetCmd {
+    Directory {
+        my_name: String,
+        contacts: Vec<Contact>,
+        groups: Vec<Group>,
+        allow_unknown: bool,
+    },
+    CallDirect(EndpointId),
+    JoinGroup(RoomId),
+    Accept(RoomKey),
+    Decline(RoomKey),
+    Hangup,
+    MediaState(MediaState),
+    /// We just started decoding this peer's track: ask them for a fresh keyframe.
+    RequestKeyframe(EndpointId, Track),
+    /// Start/stop watching a peer's screen share (video and its audio).
+    WatchScreen(EndpointId, bool),
+    /// Test hook: drop every connection abruptly, as a crash or network loss would.
+    #[cfg(test)]
+    SimulateDropout,
+}
+
+#[derive(Debug, Clone)]
+pub enum UiEvent {
+    Ready {
+        #[allow(dead_code)]
+        id: EndpointId,
+    },
+    Incoming { room: RoomKey, from: EndpointId, name: String, group_name: Option<String> },
+    IncomingGone { room: RoomKey },
+    OutgoingRinging,
+    CallActive { room: RoomKey },
+    CallEnded { reason: String },
+    PeerJoined { id: EndpointId, name: String, state: MediaState },
+    PeerLeft { id: EndpointId },
+    PeerReconnecting { id: EndpointId },
+    PeerState { id: EndpointId, state: MediaState },
+    PeerLink { id: EndpointId, direct: bool, rtt_ms: u32 },
+    /// A group was learned from an invite or gained members; the UI merges and saves it.
+    GroupUpdate { group: Group },
+    MissedCall { from: EndpointId, name: String },
+    Notice(String),
+}
+
+#[derive(Clone)]
+pub struct NetHandle {
+    tx: mpsc::UnboundedSender<NetCmd>,
+}
+
+impl NetHandle {
+    pub fn send(&self, cmd: NetCmd) {
+        let _ = self.tx.send(cmd);
+    }
+}
+
+pub async fn start(
+    secret: SecretKey,
+    hub: Arc<Hub>,
+    ui: async_channel::Sender<UiEvent>,
+) -> Result<NetHandle> {
+    let transport = iroh::endpoint::QuicTransportConfig::builder()
+        .keep_alive_interval(Duration::from_secs(2))
+        .max_idle_timeout(Some(Duration::from_secs(12).try_into()?))
+        .max_concurrent_uni_streams(128u32.into())
+        .stream_receive_window((8u32 * 1024 * 1024).into())
+        .send_window(32 * 1024 * 1024)
+        .build();
+    let ep = Endpoint::builder(presets::N0)
+        .secret_key(secret)
+        .alpns(vec![ALPN.to_vec()])
+        .transport_config(transport)
+        .bind()
+        .await
+        .context("starting network endpoint")?;
+    let me = ep.id();
+    info!("endpoint id {me}");
+    let _ = ui.try_send(UiEvent::Ready { id: me });
+
+    let (tx, cmd_rx) = mpsc::unbounded_channel();
+    let (itx, irx) = mpsc::unbounded_channel();
+
+    // Accept loop.
+    {
+        let ep = ep.clone();
+        let itx = itx.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = ep.accept().await {
+                let itx = itx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_incoming(incoming, itx).await {
+                        debug!("incoming connection failed: {e:#}");
+                    }
+                });
+            }
+        });
+    }
+
+    let engine = Engine {
+        ep,
+        me,
+        hub,
+        ui,
+        itx,
+        my_name: String::new(),
+        contacts: HashMap::new(),
+        groups: HashMap::new(),
+        allow_unknown: true,
+        sessions: HashMap::new(),
+        next_sid: 1,
+        call: None,
+        pending: HashMap::new(),
+        my_state: MediaState::default(),
+    };
+    tokio::spawn(engine.run(cmd_rx, irx));
+    Ok(NetHandle { tx })
+}
+
+async fn handle_incoming(
+    incoming: iroh::endpoint::Incoming,
+    itx: mpsc::UnboundedSender<Internal>,
+) -> Result<()> {
+    let conn = incoming.accept()?.await?;
+    if conn.alpn() != ALPN {
+        conn.close(CLOSE_DECLINE.into(), b"alpn");
+        return Ok(());
+    }
+    let (send, mut recv) = tokio::time::timeout(Duration::from_secs(10), conn.accept_bi())
+        .await
+        .context("hello timeout")??;
+    let hello = tokio::time::timeout(Duration::from_secs(10), read_ctrl(&mut recv))
+        .await
+        .context("hello timeout")??;
+    if !matches!(hello, Ctrl::Hello { .. }) {
+        return Err(anyhow!("expected hello"));
+    }
+    let _ = itx.send(Internal::Incoming { conn, send, recv, hello });
+    Ok(())
+}
+
+type Sid = u64;
+
+enum Internal {
+    Incoming { conn: Connection, send: SendStream, recv: RecvStream, hello: Ctrl },
+    DialDone { sid: Sid, result: Result<(Connection, SendStream, RecvStream)> },
+    Ctrl { sid: Sid, msg: Ctrl },
+    Closed { sid: Sid, code: Option<u32> },
+    RingTimeout { room: RoomKey },
+    Tick,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Dialing,
+    AwaitingAnswer,
+    IncomingPending,
+    Active,
+}
+
+struct Session {
+    peer: EndpointId,
+    room: RoomKey,
+    phase: Phase,
+    conn: Option<Connection>,
+    ctrl: Option<mpsc::UnboundedSender<Ctrl>>,
+    peer_name: String,
+    peer_state: MediaState,
+    invite: Option<Invite>,
+    media: Vec<JoinHandle<()>>,
+    /// Ended on purpose (hangup/duplicate/decline); don't treat closure as a dropout.
+    retired: bool,
+}
+
+impl Session {
+    fn send(&self, msg: Ctrl) {
+        if let Some(c) = &self.ctrl {
+            let _ = c.send(msg);
+        }
+    }
+    fn close(&mut self, code: u32) {
+        self.retired = true;
+        if let Some(c) = &self.conn {
+            let conn = c.clone();
+            // Let queued control messages (e.g. Leave/Decline) flush first.
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                conn.close(code.into(), b"");
+            });
+        }
+        for t in self.media.drain(..) {
+            t.abort();
+        }
+    }
+}
+
+struct Call {
+    room: RoomKey,
+    /// Direct call we placed that hasn't been answered yet.
+    outgoing: bool,
+    peers: HashMap<EndpointId, Sid>,
+    /// Peers that dropped unexpectedly and when; we keep redialing for a while.
+    lost: HashMap<EndpointId, Instant>,
+    /// Peers that hung up recently; stale rosters must not pull them back in.
+    left: HashMap<EndpointId, Instant>,
+    started: Instant,
+}
+
+struct Engine {
+    ep: Endpoint,
+    me: EndpointId,
+    hub: Arc<Hub>,
+    ui: async_channel::Sender<UiEvent>,
+    itx: mpsc::UnboundedSender<Internal>,
+    my_name: String,
+    contacts: HashMap<EndpointId, String>,
+    groups: HashMap<RoomId, Group>,
+    allow_unknown: bool,
+    sessions: HashMap<Sid, Session>,
+    next_sid: Sid,
+    call: Option<Call>,
+    /// Unanswered incoming rings by room.
+    pending: HashMap<RoomKey, Vec<Sid>>,
+    my_state: MediaState,
+}
+
+impl Engine {
+    async fn run(
+        mut self,
+        mut cmds: mpsc::UnboundedReceiver<NetCmd>,
+        mut internal: mpsc::UnboundedReceiver<Internal>,
+    ) {
+        let mut tick = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            tokio::select! {
+                cmd = cmds.recv() => match cmd {
+                    Some(c) => self.on_cmd(c),
+                    None => break,
+                },
+                Some(ev) = internal.recv() => self.on_internal(ev),
+                _ = tick.tick() => self.on_internal(Internal::Tick),
+            }
+        }
+        self.hangup();
+        self.ep.close().await;
+    }
+
+    fn emit(&self, ev: UiEvent) {
+        let _ = self.ui.try_send(ev);
+    }
+
+    fn name_of(&self, id: &EndpointId) -> String {
+        if let Some(n) = self.contacts.get(id) {
+            return n.clone();
+        }
+        for g in self.groups.values() {
+            if let Some(m) = g.members.iter().find(|m| &m.id == id) {
+                if !m.name.is_empty() {
+                    return m.name.clone();
+                }
+            }
+        }
+        id.fmt_short().to_string()
+    }
+
+    fn secret_for(&self, room: &RoomId) -> Option<[u8; 32]> {
+        self.groups.get(room).map(|g| g.secret)
+    }
+
+    // ---------- commands ----------
+
+    fn on_cmd(&mut self, cmd: NetCmd) {
+        match cmd {
+            NetCmd::Directory { my_name, contacts, groups, allow_unknown } => {
+                self.my_name = my_name;
+                self.contacts = contacts.into_iter().map(|c| (c.id, c.name)).collect();
+                self.groups = groups.into_iter().map(|g| (g.room_id(), g)).collect();
+                self.allow_unknown = allow_unknown;
+            }
+            NetCmd::CallDirect(peer) => {
+                self.hangup();
+                let room = RoomKey::Direct(peer);
+                self.call = Some(Call::new(room, true));
+                self.dial(peer, room);
+            }
+            NetCmd::JoinGroup(room_id) => {
+                self.hangup();
+                let room = RoomKey::Group(room_id);
+                self.call = Some(Call::new(room, false));
+                self.emit(UiEvent::CallActive { room });
+                self.dial_group_members(room_id);
+            }
+            NetCmd::Accept(room) => self.accept_pending(room),
+            NetCmd::Decline(room) => {
+                for sid in self.pending.remove(&room).unwrap_or_default() {
+                    if let Some(s) = self.sessions.get_mut(&sid) {
+                        s.send(Ctrl::Decline(DeclineReason::Declined));
+                        s.close(CLOSE_DECLINE);
+                    }
+                }
+            }
+            NetCmd::Hangup => {
+                self.hangup();
+                self.emit(UiEvent::CallEnded { reason: String::new() });
+            }
+            #[cfg(test)]
+            NetCmd::SimulateDropout => {
+                for s in self.sessions.values() {
+                    if let Some(c) = &s.conn {
+                        c.close(99u32.into(), b"");
+                    }
+                }
+            }
+            NetCmd::RequestKeyframe(peer, track) => {
+                if let Some(sid) = self.call.as_ref().and_then(|c| c.peers.get(&peer)) {
+                    if let Some(s) = self.sessions.get(sid) {
+                        s.send(Ctrl::Keyframe(track));
+                    }
+                }
+            }
+            NetCmd::WatchScreen(peer, on) => {
+                if let Some(sid) = self.call.as_ref().and_then(|c| c.peers.get(&peer)) {
+                    if let Some(s) = self.sessions.get(sid) {
+                        s.send(Ctrl::Watch { track: Track::Screen, on });
+                        s.send(Ctrl::Watch { track: Track::ScreenAudio, on });
+                    }
+                }
+            }
+            NetCmd::MediaState(st) => {
+                self.my_state = st;
+                for s in self.sessions.values() {
+                    if s.phase == Phase::Active {
+                        s.send(Ctrl::State(st));
+                    }
+                }
+            }
+        }
+    }
+
+    fn hangup(&mut self) {
+        if self.call.take().is_none() {
+            return;
+        }
+        let in_call: Vec<Sid> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.phase != Phase::IncomingPending)
+            .map(|(k, _)| *k)
+            .collect();
+        for sid in in_call {
+            if let Some(mut s) = self.sessions.remove(&sid) {
+                s.send(Ctrl::Leave);
+                s.close(CLOSE_LEAVE);
+            }
+        }
+        self.hub.clear_peers();
+    }
+
+    fn dial_group_members(&mut self, room_id: RoomId) {
+        let Some(g) = self.groups.get(&room_id) else { return };
+        let ids: Vec<EndpointId> =
+            g.members.iter().map(|m| m.id).filter(|id| *id != self.me).collect();
+        for id in ids {
+            if !self.has_session_with(&id) {
+                self.dial(id, RoomKey::Group(room_id));
+            }
+        }
+    }
+
+    fn has_session_with(&self, peer: &EndpointId) -> bool {
+        self.sessions
+            .values()
+            .any(|s| &s.peer == peer && !s.retired && s.phase != Phase::IncomingPending)
+    }
+
+    fn accept_pending(&mut self, room: RoomKey) {
+        let sids = self.pending.remove(&room).unwrap_or_default();
+        let live: Vec<Sid> = sids.into_iter().filter(|s| self.sessions.contains_key(s)).collect();
+        if live.is_empty() {
+            self.emit(UiEvent::CallEnded { reason: "The call was no longer available.".into() });
+            return;
+        }
+        self.hangup();
+        self.call = Some(Call::new(room, false));
+        // Remember a group we were invited into.
+        if let RoomKey::Group(room_id) = room {
+            if !self.groups.contains_key(&room_id) {
+                if let Some(inv) = live.iter().find_map(|s| self.sessions[s].invite.clone()) {
+                    let g = Group { name: inv.name, secret: inv.secret, members: inv.members };
+                    self.groups.insert(room_id, g.clone());
+                    self.emit(UiEvent::GroupUpdate { group: g });
+                }
+            }
+        }
+        self.emit(UiEvent::CallActive { room });
+        for sid in live {
+            let proof = self.acceptor_proof(sid);
+            if let Some(s) = self.sessions.get(&sid) {
+                s.send(Ctrl::Accept { name: self.my_name.clone(), proof, state: self.my_state });
+            }
+            self.activate(sid);
+        }
+        if let RoomKey::Group(room_id) = room {
+            self.dial_group_members(room_id);
+        }
+    }
+
+    fn acceptor_proof(&self, sid: Sid) -> Option<[u8; 32]> {
+        let s = self.sessions.get(&sid)?;
+        match s.room {
+            RoomKey::Group(r) => self.secret_for(&r).map(|sec| join_proof(&sec, &self.me, &s.peer)),
+            RoomKey::Direct(_) => None,
+        }
+    }
+
+    // ---------- dialing ----------
+
+    fn new_session(&mut self, peer: EndpointId, room: RoomKey, phase: Phase) -> Sid {
+        let sid = self.next_sid;
+        self.next_sid += 1;
+        self.sessions.insert(
+            sid,
+            Session {
+                peer,
+                room,
+                phase,
+                conn: None,
+                ctrl: None,
+                peer_name: self.name_of(&peer),
+                peer_state: MediaState::default(),
+                invite: None,
+                media: Vec::new(),
+                retired: false,
+            },
+        );
+        sid
+    }
+
+    fn dial(&mut self, peer: EndpointId, room: RoomKey) {
+        if peer == self.me {
+            return;
+        }
+        info!("calling {} ({})", self.name_of(&peer), peer.fmt_short());
+        let sid = self.new_session(peer, room, Phase::Dialing);
+        let (room_id, proof, invite) = match room {
+            RoomKey::Direct(_) => (None, None, None),
+            RoomKey::Group(r) => {
+                let Some(g) = self.groups.get(&r) else { return };
+                let inv = Invite { name: g.name.clone(), secret: g.secret, members: g.members.clone() };
+                (Some(r), Some(join_proof(&g.secret, &self.me, &peer)), Some(inv))
+            }
+        };
+        let hello = Ctrl::Hello {
+            version: PROTO_VERSION,
+            name: self.my_name.clone(),
+            room: room_id,
+            proof,
+            invite,
+            state: self.my_state,
+        };
+        let ep = self.ep.clone();
+        let itx = self.itx.clone();
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(DIAL_TIMEOUT, async {
+                let conn = ep.connect(EndpointAddr::from(peer), ALPN).await?;
+                let (mut send, recv) = conn.open_bi().await?;
+                write_ctrl(&mut send, &hello).await?;
+                anyhow::Ok((conn, send, recv))
+            })
+            .await
+            .map_err(|_| anyhow!("timed out"))
+            .and_then(|r| r);
+            let _ = itx.send(Internal::DialDone { sid, result });
+        });
+    }
+
+    fn attach_conn(&mut self, sid: Sid, conn: Connection, mut send: SendStream, mut recv: RecvStream) {
+        let (ctx, mut crx) = mpsc::unbounded_channel::<Ctrl>();
+        tokio::spawn(async move {
+            while let Some(msg) = crx.recv().await {
+                if write_ctrl(&mut send, &msg).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let itx = self.itx.clone();
+        let c2 = conn.clone();
+        tokio::spawn(async move {
+            loop {
+                match read_ctrl(&mut recv).await {
+                    Ok(msg) => {
+                        let _ = itx.send(Internal::Ctrl { sid, msg });
+                    }
+                    Err(_) => break,
+                }
+            }
+            // Wait for the connection to actually close to learn the reason.
+            let _ = tokio::time::timeout(Duration::from_secs(15), c2.closed()).await;
+            let code = close_code(&c2);
+            let _ = itx.send(Internal::Closed { sid, code });
+        });
+        if let Some(s) = self.sessions.get_mut(&sid) {
+            s.conn = Some(conn);
+            s.ctrl = Some(ctx);
+        }
+    }
+
+    // ---------- internal events ----------
+
+    fn on_internal(&mut self, ev: Internal) {
+        match ev {
+            Internal::Incoming { conn, send, recv, hello } => self.on_incoming(conn, send, recv, hello),
+            Internal::DialDone { sid, result } => self.on_dial_done(sid, result),
+            Internal::Ctrl { sid, msg } => self.on_ctrl(sid, msg),
+            Internal::Closed { sid, code } => self.on_closed(sid, code),
+            Internal::RingTimeout { room } => {
+                if let Some(sids) = self.pending.remove(&room) {
+                    let mut who = None;
+                    for sid in sids {
+                        if let Some(mut s) = self.sessions.remove(&sid) {
+                            // Keep a missed group's invite (from a contact) so it can be joined later.
+                            if let (RoomKey::Group(r), Some(inv)) = (room, s.invite.take()) {
+                                if !self.groups.contains_key(&r) && self.contacts.contains_key(&s.peer) {
+                                    let g = Group { name: inv.name, secret: inv.secret, members: inv.members };
+                                    self.groups.insert(r, g.clone());
+                                    self.emit(UiEvent::GroupUpdate { group: g });
+                                }
+                            }
+                            who.get_or_insert((s.peer, s.peer_name.clone()));
+                            s.send(Ctrl::Decline(DeclineReason::Declined));
+                            s.close(CLOSE_DECLINE);
+                        }
+                    }
+                    self.emit(UiEvent::IncomingGone { room });
+                    if let Some((from, name)) = who {
+                        self.emit(UiEvent::MissedCall { from, name });
+                    }
+                }
+            }
+            Internal::Tick => self.on_tick(),
+        }
+    }
+
+    fn on_incoming(&mut self, conn: Connection, send: SendStream, recv: RecvStream, hello: Ctrl) {
+        let Ctrl::Hello { version, name, room, proof, invite, state } = hello else { return };
+        let peer = conn.remote_id();
+        info!("incoming call from {name} ({})", peer.fmt_short());
+        if version != PROTO_VERSION {
+            spawn_decline(send, conn, DeclineReason::Unknown);
+            self.emit(UiEvent::Notice(format!(
+                "{} tried to call with a different Parley version.",
+                if name.is_empty() { peer.fmt_short().to_string() } else { name }
+            )));
+            return;
+        }
+
+        let room_key = match room {
+            None => RoomKey::Direct(peer),
+            Some(r) => RoomKey::Group(r),
+        };
+
+        // Authorization.
+        let mut accepted_invite = None;
+        match room_key {
+            RoomKey::Group(r) => {
+                let secret = self.secret_for(&r).or_else(|| {
+                    invite
+                        .as_ref()
+                        .filter(|i| room_id_for(&i.secret) == r)
+                        .map(|i| i.secret)
+                });
+                let ok = match (secret, proof) {
+                    (Some(sec), Some(p)) => verify_proof(&sec, &peer, &self.me, &p),
+                    _ => false,
+                };
+                if !ok {
+                    spawn_decline(send, conn, DeclineReason::NotAllowed);
+                    return;
+                }
+                if !self.groups.contains_key(&r) {
+                    // Only someone we know may pull us into a brand-new group.
+                    if !self.contacts.contains_key(&peer) && !self.allow_unknown {
+                        spawn_decline(send, conn, DeclineReason::NotAllowed);
+                        return;
+                    }
+                    accepted_invite = invite;
+                }
+            }
+            RoomKey::Direct(_) => {
+                if !self.contacts.contains_key(&peer) && !self.allow_unknown {
+                    spawn_decline(send, conn, DeclineReason::NotAllowed);
+                    return;
+                }
+            }
+        }
+
+        let in_this_call = self.call.as_ref().is_some_and(|c| c.room == room_key);
+        if self.call.is_some() && !in_this_call {
+            spawn_decline(send, conn, DeclineReason::Busy);
+            let n = if name.is_empty() { self.name_of(&peer) } else { name };
+            self.emit(UiEvent::MissedCall { from: peer, name: n });
+            return;
+        }
+
+        if in_this_call {
+            // Resolve a simultaneous dial: the connection dialed by the lower id wins.
+            let existing: Vec<Sid> = self
+                .sessions
+                .iter()
+                .filter(|(_, s)| s.peer == peer && !s.retired && s.room == room_key)
+                .map(|(k, _)| *k)
+                .collect();
+            for sid in existing {
+                let s = self.sessions.get_mut(&sid).unwrap();
+                match s.phase {
+                    Phase::Dialing | Phase::AwaitingAnswer if self.me < peer => {
+                        // Ours wins; refuse theirs.
+                        spawn_decline(send, conn, DeclineReason::Duplicate);
+                        return;
+                    }
+                    _ => {
+                        // Theirs wins (or it's a reconnect replacing a stale session).
+                        s.close(CLOSE_DUPLICATE);
+                    }
+                }
+            }
+        }
+
+        // Don't let anyone flood us with ringing calls: one at a time per caller, and
+        // only a few callers at once.
+        if !in_this_call {
+            let ringing: Vec<&Session> =
+                self.sessions.values().filter(|s| s.phase == Phase::IncomingPending && !s.retired).collect();
+            if ringing.iter().any(|s| s.peer == peer) || ringing.len() >= 4 {
+                spawn_decline(send, conn, DeclineReason::Busy);
+                return;
+            }
+        }
+
+        let sid = self.new_session(peer, room_key, Phase::IncomingPending);
+        {
+            let s = self.sessions.get_mut(&sid).unwrap();
+            if !name.is_empty() {
+                s.peer_name = name.clone();
+            }
+            s.peer_state = state;
+            s.invite = accepted_invite.clone();
+        }
+        self.attach_conn(sid, conn, send, recv);
+
+        if in_this_call {
+            let proof = self.acceptor_proof(sid);
+            self.sessions[&sid].send(Ctrl::Accept { name: self.my_name.clone(), proof, state: self.my_state });
+            self.activate(sid);
+            return;
+        }
+
+        // Ring.
+        self.sessions[&sid].send(Ctrl::Ringing);
+        let first = !self.pending.contains_key(&room_key);
+        self.pending.entry(room_key).or_default().push(sid);
+        if first {
+            let group_name = match room_key {
+                RoomKey::Group(r) => self
+                    .groups
+                    .get(&r)
+                    .map(|g| g.name.clone())
+                    .or(accepted_invite.map(|i| i.name)),
+                RoomKey::Direct(_) => None,
+            };
+            let display = self.sessions[&sid].peer_name.clone();
+            self.emit(UiEvent::Incoming { room: room_key, from: peer, name: display, group_name });
+            let itx = self.itx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(RING_TIMEOUT).await;
+                let _ = itx.send(Internal::RingTimeout { room: room_key });
+            });
+        }
+    }
+
+    fn on_dial_done(&mut self, sid: Sid, result: Result<(Connection, SendStream, RecvStream)>) {
+        let Some(s) = self.sessions.get(&sid) else {
+            if let Ok((conn, ..)) = result {
+                conn.close(CLOSE_LEAVE.into(), b"");
+            }
+            return;
+        };
+        let (peer, room, retired) = (s.peer, s.room, s.retired);
+        match result {
+            Ok((conn, send, recv)) => {
+                let still_wanted = !retired && self.call.as_ref().is_some_and(|c| c.room == room);
+                // An incoming connection may have already connected us.
+                let already = self.call.as_ref().is_some_and(|c| {
+                    c.peers.get(&peer).is_some_and(|other| *other != sid)
+                });
+                if !still_wanted || already {
+                    self.sessions.remove(&sid);
+                    conn.close(CLOSE_DUPLICATE.into(), b"");
+                    return;
+                }
+                self.sessions.get_mut(&sid).unwrap().phase = Phase::AwaitingAnswer;
+                self.attach_conn(sid, conn, send, recv);
+            }
+            Err(e) => {
+                info!("couldn't reach {}: {e:#}", peer.fmt_short());
+                self.sessions.remove(&sid);
+                if let Some(call) = &self.call {
+                    if call.outgoing && call.room == room && !call.lost.contains_key(&peer) {
+                        let name = self.name_of(&peer);
+                        self.call = None;
+                        self.emit(UiEvent::CallEnded {
+                            reason: format!("Couldn't reach {name}. They may be offline or not running Parley."),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    fn on_ctrl(&mut self, sid: Sid, msg: Ctrl) {
+        let Some(s) = self.sessions.get_mut(&sid) else { return };
+        if s.retired {
+            return;
+        }
+        let peer = s.peer;
+        match msg {
+            Ctrl::Hello { .. } => {}
+            Ctrl::Ringing => {
+                if self.call.as_ref().is_some_and(|c| c.outgoing) {
+                    self.emit(UiEvent::OutgoingRinging);
+                }
+            }
+            Ctrl::Accept { name, proof, state } => {
+                if s.phase != Phase::AwaitingAnswer {
+                    return;
+                }
+                if let RoomKey::Group(r) = s.room {
+                    let ok = match (self.groups.get(&r), proof) {
+                        (Some(g), Some(p)) => verify_proof(&g.secret, &peer, &self.me, &p),
+                        _ => false,
+                    };
+                    if !ok {
+                        warn!("peer {} failed group proof", peer.fmt_short());
+                        s.close(CLOSE_DECLINE);
+                        self.sessions.remove(&sid);
+                        return;
+                    }
+                }
+                if !name.is_empty() {
+                    s.peer_name = name;
+                }
+                s.peer_state = state;
+                let mut became_active = None;
+                if let Some(call) = &mut self.call {
+                    if call.outgoing {
+                        call.outgoing = false;
+                        call.started = Instant::now();
+                        became_active = Some(call.room);
+                    }
+                }
+                if let Some(room) = became_active {
+                    self.emit(UiEvent::CallActive { room });
+                }
+                self.activate(sid);
+            }
+            Ctrl::Decline(reason) => {
+                let name = s.peer_name.clone();
+                let room = s.room;
+                s.close(CLOSE_DECLINE);
+                self.sessions.remove(&sid);
+                if reason == DeclineReason::Duplicate {
+                    return;
+                }
+                if let Some(call) = &mut self.call {
+                    call.lost.remove(&peer);
+                    if matches!(room, RoomKey::Direct(_)) && call.room == room {
+                        if call.peers.is_empty() {
+                            self.call = None;
+                            self.hub.clear_peers();
+                            let reason = match reason {
+                                DeclineReason::Busy => format!("{name} is in another call."),
+                                DeclineReason::NotAllowed => {
+                                    format!("{name} only accepts calls from their contacts.")
+                                }
+                                DeclineReason::Unknown => {
+                                    format!("{name} is running an incompatible version of Parley.")
+                                }
+                                _ => format!("{name} declined the call."),
+                            };
+                            self.emit(UiEvent::CallEnded { reason });
+                        }
+                    } else {
+                        self.emit(UiEvent::PeerLeft { id: peer });
+                    }
+                }
+            }
+            Ctrl::State(st) => {
+                s.peer_state = st;
+                if s.phase == Phase::Active {
+                    self.emit(UiEvent::PeerState { id: peer, state: st });
+                }
+            }
+            Ctrl::Keyframe(t) => {
+                if t.is_video() {
+                    self.hub.request_keyframe(t);
+                }
+            }
+            Ctrl::Watch { track, on } => {
+                if s.phase == Phase::Active {
+                    self.hub.set_paused(&peer, track, !on);
+                }
+            }
+            Ctrl::Roster(members) => {
+                let room = s.room;
+                if s.phase != Phase::Active {
+                    return;
+                }
+                let mut changed = false;
+                if let RoomKey::Group(r) = room {
+                    if let Some(g) = self.groups.get_mut(&r) {
+                        for m in &members {
+                            if m.id != self.me {
+                                changed |= g.add_member(m.id, &m.name);
+                            }
+                        }
+                        if changed {
+                            let g = g.clone();
+                            self.emit(UiEvent::GroupUpdate { group: g });
+                        }
+                    }
+                    let recently_left = |id: &EndpointId| {
+                        self.call.as_ref().is_some_and(|c| {
+                            c.left.get(id).is_some_and(|t| t.elapsed() < Duration::from_secs(15))
+                        })
+                    };
+                    let to_dial: Vec<EndpointId> = members
+                        .iter()
+                        .map(|m| m.id)
+                        .filter(|id| *id != self.me && !self.has_session_with(id) && !recently_left(id))
+                        .collect();
+                    for id in to_dial {
+                        self.dial(id, room);
+                    }
+                }
+            }
+            Ctrl::Leave => {
+                s.retired = true;
+                self.peer_gone(sid, true);
+            }
+        }
+    }
+
+    /// Promotes a session to a live call participant and starts media.
+    fn activate(&mut self, sid: Sid) {
+        let Some(call) = &mut self.call else { return };
+        let Some(s) = self.sessions.get_mut(&sid) else { return };
+        let Some(conn) = s.conn.clone() else { return };
+        s.phase = Phase::Active;
+        let peer = s.peer;
+        if let Some(old) = call.peers.insert(peer, sid) {
+            if old != sid {
+                if let Some(o) = self.sessions.get_mut(&old) {
+                    o.close(CLOSE_DUPLICATE);
+                }
+            }
+        }
+        call.lost.remove(&peer);
+        call.left.remove(&peer);
+
+        // Media plumbing.
+        let mut senders = Vec::new();
+        let mut flags = Vec::new();
+        let s = self.sessions.get_mut(&sid).unwrap();
+        for t in VIDEO_TRACKS {
+            let (tx, rx) = mpsc::channel::<VideoFrame>(VIDEO_QUEUE);
+            let need_key = Arc::new(AtomicBool::new(true));
+            s.media.push(tokio::spawn(video_writer(
+                conn.clone(),
+                t,
+                rx,
+                need_key.clone(),
+                self.hub.clone(),
+            )));
+            senders.push(tx);
+            flags.push(need_key);
+        }
+        s.media.push(tokio::spawn(datagram_reader(conn.clone(), peer, self.hub.clone())));
+        s.media.push(tokio::spawn(uni_acceptor(conn.clone(), peer, self.hub.clone())));
+        let out = PeerOut {
+            conn: conn.clone(),
+            video: [senders.remove(0), senders.remove(0)],
+            need_key: [flags.remove(0), flags.remove(0)],
+            paused: Default::default(),
+        };
+        self.hub.add_peer(peer, Arc::new(out));
+
+        let (name, state, room) = (s.peer_name.clone(), s.peer_state, s.room);
+        s.send(Ctrl::State(self.my_state));
+
+        // Record membership.
+        if let RoomKey::Group(r) = room {
+            if let Some(g) = self.groups.get_mut(&r) {
+                if g.add_member(peer, &name) {
+                    let g = g.clone();
+                    self.emit(UiEvent::GroupUpdate { group: g });
+                }
+            }
+            // Share who's here so the newcomer can connect to everyone.
+            let roster = self.roster();
+            for s in self.sessions.values() {
+                if s.phase == Phase::Active {
+                    s.send(Ctrl::Roster(roster.clone()));
+                }
+            }
+        }
+        self.emit(UiEvent::PeerJoined { id: peer, name, state });
+    }
+
+    fn roster(&self) -> Vec<Member> {
+        let mut v = vec![Member { id: self.me, name: self.my_name.clone() }];
+        if let Some(call) = &self.call {
+            for (id, sid) in &call.peers {
+                let name = self.sessions.get(sid).map(|s| s.peer_name.clone()).unwrap_or_default();
+                v.push(Member { id: *id, name });
+            }
+        }
+        v
+    }
+
+    fn on_closed(&mut self, sid: Sid, code: Option<u32>) {
+        let Some(s) = self.sessions.get(&sid) else { return };
+        if s.retired || matches!(code, Some(CLOSE_DUPLICATE)) {
+            // Superseded or intentionally ended; just forget it.
+            let is_current = self
+                .call
+                .as_ref()
+                .is_some_and(|c| c.peers.get(&s.peer) == Some(&sid));
+            if is_current {
+                self.peer_gone(sid, true);
+            } else {
+                self.sessions.remove(&sid);
+            }
+            return;
+        }
+        match s.phase {
+            Phase::IncomingPending => {
+                let room = s.room;
+                self.sessions.remove(&sid);
+                if let Some(v) = self.pending.get_mut(&room) {
+                    v.retain(|x| *x != sid);
+                    if v.is_empty() {
+                        self.pending.remove(&room);
+                        self.emit(UiEvent::IncomingGone { room });
+                    }
+                }
+            }
+            Phase::Active => {
+                let left = matches!(code, Some(CLOSE_LEAVE) | Some(CLOSE_DECLINE));
+                self.peer_gone(sid, left);
+            }
+            Phase::Dialing | Phase::AwaitingAnswer => {
+                let (peer, room) = (s.peer, s.room);
+                self.sessions.remove(&sid);
+                if let Some(call) = &self.call {
+                    if call.outgoing && call.room == room {
+                        let name = self.name_of(&peer);
+                        self.call = None;
+                        self.emit(UiEvent::CallEnded { reason: format!("The call to {name} failed.") });
+                    }
+                }
+            }
+        }
+    }
+
+    /// A participant's session ended. `left` = on purpose; otherwise we try to reconnect.
+    fn peer_gone(&mut self, sid: Sid, left: bool) {
+        let Some(mut s) = self.sessions.remove(&sid) else { return };
+        for t in s.media.drain(..) {
+            t.abort();
+        }
+        let peer = s.peer;
+        if let Some(conn) = &s.conn {
+            self.hub.remove_peer(&peer, conn);
+        }
+        let Some(call) = &mut self.call else { return };
+        if call.peers.get(&peer) != Some(&sid) {
+            return;
+        }
+        call.peers.remove(&peer);
+        let direct = matches!(call.room, RoomKey::Direct(_));
+        if !left {
+            info!("lost {}, will try to reconnect", peer.fmt_short());
+            call.lost.insert(peer, Instant::now());
+            self.emit(UiEvent::PeerReconnecting { id: peer });
+            return;
+        }
+        call.left.insert(peer, Instant::now());
+        self.hub.unregister_peer_sinks(&peer);
+        self.emit(UiEvent::PeerLeft { id: peer });
+        if direct {
+            let name = s.peer_name.clone();
+            self.hangup();
+            self.emit(UiEvent::CallEnded { reason: format!("{name} left the call.") });
+        }
+    }
+
+    fn on_tick(&mut self) {
+        // Reconnect attempts.
+        let mut redial = Vec::new();
+        let mut give_up = Vec::new();
+        if let Some(call) = &self.call {
+            for (peer, since) in &call.lost {
+                if since.elapsed() > RECONNECT_WINDOW {
+                    give_up.push(*peer);
+                } else if !self.has_session_with(peer) {
+                    redial.push((*peer, call.room));
+                }
+            }
+        }
+        for (peer, room) in redial {
+            self.dial(peer, room);
+        }
+        for peer in give_up {
+            self.hub.unregister_peer_sinks(&peer);
+            self.emit(UiEvent::PeerLeft { id: peer });
+            let mut end = None;
+            if let Some(call) = &mut self.call {
+                call.lost.remove(&peer);
+                if matches!(call.room, RoomKey::Direct(_)) && call.peers.is_empty() {
+                    end = Some(self.name_of(&peer));
+                }
+            }
+            if let Some(name) = end {
+                self.hangup();
+                self.emit(UiEvent::CallEnded { reason: format!("Lost connection to {name}.") });
+            }
+        }
+
+        // Link stats for the UI.
+        if let Some(call) = &self.call {
+            for (peer, sid) in &call.peers {
+                if let Some(conn) = self.sessions.get(sid).and_then(|s| s.conn.as_ref()) {
+                    let (direct, rtt) = link_info(conn);
+                    self.emit(UiEvent::PeerLink { id: *peer, direct, rtt_ms: rtt });
+                }
+            }
+        }
+    }
+}
+
+impl Call {
+    fn new(room: RoomKey, outgoing: bool) -> Self {
+        Self { room, outgoing, peers: HashMap::new(), lost: HashMap::new(), left: HashMap::new(), started: Instant::now() }
+    }
+}
+
+fn spawn_decline(mut send: SendStream, conn: Connection, why: DeclineReason) {
+    tokio::spawn(async move {
+        let _ = write_ctrl(&mut send, &Ctrl::Decline(why)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        conn.close(CLOSE_DECLINE.into(), b"");
+    });
+}
+
+fn close_code(conn: &Connection) -> Option<u32> {
+    use iroh::endpoint::ConnectionError;
+    match conn.close_reason()? {
+        ConnectionError::ApplicationClosed(c) => u32::try_from(c.error_code.into_inner()).ok(),
+        ConnectionError::LocallyClosed => Some(CLOSE_LEAVE),
+        _ => None,
+    }
+}
+
+fn link_info(conn: &Connection) -> (bool, u32) {
+    let mut direct = false;
+    let mut rtt = None;
+    for p in conn.paths().iter() {
+        if p.is_ip() {
+            direct = true;
+        }
+        let ms = p.rtt().as_millis() as u32;
+        rtt = Some(rtt.map_or(ms, |x: u32| x.min(ms)));
+    }
+    (direct, rtt.unwrap_or(0))
+}
+
+// ---------- media tasks ----------
+
+async fn datagram_reader(conn: Connection, peer: EndpointId, hub: Arc<Hub>) {
+    // Test hooks: simulate a bad network (random extra delay and loss per packet).
+    let env_num = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let (jitter_ms, loss_pct) = (env_num("PARLEY_TEST_JITTER_MS"), env_num("PARLEY_TEST_LOSS_PCT"));
+    let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let mut n = 0u64;
+    let (mut per_track, mut since) = ([0u64; 2], std::time::Instant::now());
+    while let Ok(d) = conn.read_datagram().await {
+        n += 1;
+        if n % 500 == 1 {
+            debug!("audio from {}: {n} packets", peer.fmt_short());
+        }
+        if let Some(t @ (Track::Mic | Track::ScreenAudio)) = d.first().and_then(|b| Track::from_u8(*b)) {
+            per_track[t as usize] += 1;
+        }
+        if since.elapsed() >= Duration::from_secs(10) {
+            if per_track[1] > 0 || per_track[0] > 0 {
+                info!("audio rx from {} in 10 s: voice {} packets, screen audio {} packets", peer.fmt_short(), per_track[0], per_track[1]);
+            }
+            per_track = [0; 2];
+            since = std::time::Instant::now();
+        }
+        if d.len() < 2 {
+            continue;
+        }
+        let Some(track) = Track::from_u8(d[0]) else { continue };
+        if track.is_video() {
+            continue;
+        }
+        if loss_pct > 0 && next() % 100 < loss_pct {
+            continue;
+        }
+        if jitter_ms > 0 {
+            let (hub, data, delay) = (hub.clone(), d[1..].to_vec(), next() % (jitter_ms + 1));
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                hub.push(&peer, track, data);
+            });
+            continue;
+        }
+        hub.push(&peer, track, d[1..].to_vec());
+    }
+}
+
+async fn uni_acceptor(conn: Connection, peer: EndpointId, hub: Arc<Hub>) {
+    while let Ok(mut recv) = conn.accept_uni().await {
+        let hub = hub.clone();
+        tokio::spawn(async move {
+            let mut t = [0u8; 1];
+            if recv.read_exact(&mut t).await.is_err() {
+                return;
+            }
+            let Some(track) = Track::from_u8(t[0]).filter(|t| t.is_video()) else {
+                let _ = recv.stop(0u32.into());
+                return;
+            };
+            let generation = hub.new_generation(peer, track);
+            let mut hdr = [0u8; FRAME_HEADER_LEN];
+            loop {
+                if recv.read_exact(&mut hdr).await.is_err() {
+                    return;
+                }
+                let (len, _pts, _key) = decode_frame_header(&hdr);
+                if len > MAX_FRAME_LEN {
+                    let _ = recv.stop(0u32.into());
+                    return;
+                }
+                let mut data = vec![0u8; len];
+                if recv.read_exact(&mut data).await.is_err() {
+                    return;
+                }
+                if _key {
+                    debug!("{track:?} keyframe from {} ({len} bytes, gop {generation})", peer.fmt_short());
+                }
+                if !hub.is_current_generation(&peer, track, generation) {
+                    // A newer GOP has started; abandon this one.
+                    let _ = recv.stop(0u32.into());
+                    return;
+                }
+                hub.push(&peer, track, data);
+            }
+        });
+    }
+}
+
+async fn video_writer(
+    conn: Connection,
+    track: Track,
+    mut rx: mpsc::Receiver<VideoFrame>,
+    need_key: Arc<AtomicBool>,
+    hub: Arc<Hub>,
+) {
+    use std::sync::atomic::Ordering;
+    let mut cur: Option<SendStream> = None;
+    let priority = if track == Track::Camera { 1 } else { 0 };
+    while let Some(f) = rx.recv().await {
+        if need_key.load(Ordering::Relaxed) {
+            if let Some(mut s) = cur.take() {
+                let _ = s.reset(0u32.into());
+            }
+            if !f.key {
+                continue;
+            }
+            need_key.store(false, Ordering::Relaxed);
+        }
+        if f.captured.elapsed() > STALE_FRAME {
+            // We're behind: drop the rest of this GOP and ask for a fresh start.
+            need_key.store(true, Ordering::Relaxed);
+            hub.request_keyframe(track);
+            continue;
+        }
+        if f.key {
+            if let Some(mut s) = cur.take() {
+                let _ = s.finish();
+            }
+            debug!("{track:?}: starting GOP stream ({} byte keyframe)", f.data.len());
+            match conn.open_uni().await {
+                Ok(mut s) => {
+                    let _ = s.set_priority(priority);
+                    if s.write_all(&[track as u8]).await.is_err() {
+                        need_key.store(true, Ordering::Relaxed);
+                        continue;
+                    }
+                    cur = Some(s);
+                }
+                Err(_) => return,
+            }
+        }
+        let Some(s) = cur.as_mut() else { continue };
+        let hdr = encode_frame_header(f.data.len(), f.pts_us, f.key);
+        let ok = s.write_all(&hdr).await.is_ok() && s.write_all(&f.data).await.is_ok();
+        if !ok {
+            cur = None;
+            need_key.store(true, Ordering::Relaxed);
+            hub.request_keyframe(track);
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Node {
+        id: EndpointId,
+        hub: Arc<Hub>,
+        net: NetHandle,
+        rx: async_channel::Receiver<UiEvent>,
+        name: String,
+    }
+
+    async fn node(name: &str) -> Node {
+        let key = SecretKey::generate();
+        let (tx, rx) = async_channel::unbounded();
+        let hub = Hub::new();
+        let net = start(key, hub.clone(), tx).await.unwrap();
+        let id = match rx.recv().await.unwrap() {
+            UiEvent::Ready { id } => id,
+            e => panic!("unexpected {e:?}"),
+        };
+        Node { id, hub, net, rx, name: name.into() }
+    }
+
+    impl Node {
+        fn directory(&self, contacts: &[&Node], groups: Vec<Group>) {
+            self.net.send(NetCmd::Directory {
+                my_name: self.name.clone(),
+                contacts: contacts.iter().map(|n| Contact { id: n.id, name: n.name.clone() }).collect(),
+                groups,
+                allow_unknown: true,
+            });
+        }
+        async fn expect<T>(&self, what: &str, mut f: impl FnMut(&UiEvent) -> Option<T>) -> T {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(40);
+            loop {
+                let ev = tokio::time::timeout_at(deadline, self.rx.recv())
+                    .await
+                    .unwrap_or_else(|_| panic!("{}: timed out waiting for {what}", self.name))
+                    .unwrap();
+                eprintln!("[{}] {ev:?}", self.name);
+                if let Some(v) = f(&ev) {
+                    return v;
+                }
+            }
+        }
+    }
+
+    use std::collections::HashSet;
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs internet (n0 relays + discovery)"]
+    async fn direct_and_group_calls() {
+        let _ = tracing_subscriber::fmt().with_env_filter("parley=debug").try_init();
+        let (a, b) = tokio::join!(node("alice"), node("bob"));
+        // Bob only knows Alice from her code; Alice doesn't have Bob (one-way share).
+        a.directory(&[], vec![]);
+        b.directory(&[&a], vec![]);
+        tokio::time::sleep(Duration::from_secs(2)).await; // let discovery publish
+
+        b.net.send(NetCmd::CallDirect(a.id));
+        let room = a.expect("incoming", |e| match e {
+            UiEvent::Incoming { room, from, name, .. } => {
+                assert_eq!(*from, b.id);
+                assert_eq!(name, "bob");
+                Some(*room)
+            }
+            _ => None,
+        }).await;
+        b.expect("ringing", |e| matches!(e, UiEvent::OutgoingRinging).then_some(())).await;
+        a.net.send(NetCmd::Accept(room));
+        a.expect("peer joined", |e| matches!(e, UiEvent::PeerJoined { id, .. } if *id == b.id).then_some(())).await;
+        b.expect("peer joined", |e| matches!(e, UiEvent::PeerJoined { id, .. } if *id == a.id).then_some(())).await;
+        b.net.send(NetCmd::Hangup);
+        a.expect("call ended", |e| matches!(e, UiEvent::CallEnded { .. }).then_some(())).await;
+
+        // ---- group of three; only the creator knows everyone ----
+        let (c, d, e) = tokio::join!(node("carol"), node("dave"), node("erin"));
+        let g = Group::new(
+            "trio".into(),
+            vec![
+                Member { id: c.id, name: "carol".into() },
+                Member { id: d.id, name: "dave".into() },
+                Member { id: e.id, name: "erin".into() },
+            ],
+        );
+        c.directory(&[&d, &e], vec![g.clone()]);
+        d.directory(&[&c], vec![]); // dave never saw the group code
+        e.directory(&[&c], vec![]);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        c.net.send(NetCmd::JoinGroup(g.room_id()));
+        for n in [&d, &e] {
+            let room = n.expect("group ring", |ev| match ev {
+                UiEvent::Incoming { room, group_name, .. } => {
+                    assert_eq!(group_name.as_deref(), Some("trio"));
+                    Some(*room)
+                }
+                _ => None,
+            }).await;
+            n.net.send(NetCmd::Accept(room));
+        }
+        // Everyone ends up connected to both others.
+        for (n, others) in [(&c, [d.id, e.id]), (&d, [c.id, e.id]), (&e, [c.id, d.id])] {
+            let mut seen = HashSet::new();
+            n.expect("full mesh", |ev| {
+                if let UiEvent::PeerJoined { id, .. } = ev {
+                    seen.insert(*id);
+                }
+                others.iter().all(|o| seen.contains(o)).then_some(())
+            }).await;
+        }
+
+        // Dave leaves; Carol and Erin stay connected.
+        d.net.send(NetCmd::Hangup);
+        c.expect("dave left", |ev| matches!(ev, UiEvent::PeerLeft { id } if *id == d.id).then_some(())).await;
+        e.expect("dave left", |ev| matches!(ev, UiEvent::PeerLeft { id } if *id == d.id).then_some(())).await;
+
+        // Dave rejoins from the group he learned via the invite; nobody gets rung.
+        d.directory(&[&c], vec![g.clone()]);
+        d.net.send(NetCmd::JoinGroup(g.room_id()));
+        for (n, who) in [(&c, d.id), (&e, d.id)] {
+            n.expect("dave back", |ev| matches!(ev, UiEvent::PeerJoined { id, .. } if *id == who).then_some(())).await;
+        }
+        let mut seen = HashSet::new();
+        d.expect("dave meshed", |ev| {
+            assert!(!matches!(ev, UiEvent::Incoming { .. }), "rejoin must not ring");
+            if let UiEvent::PeerJoined { id, .. } = ev {
+                seen.insert(*id);
+            }
+            (seen.contains(&c.id) && seen.contains(&e.id)).then_some(())
+        }).await;
+
+        // Erin's network drops without a goodbye: the others see her as reconnecting,
+        // then everyone redials and the call heals by itself.
+        e.net.send(NetCmd::SimulateDropout);
+        c.expect("erin reconnecting", |ev| matches!(ev, UiEvent::PeerReconnecting { id } if *id == e.id).then_some(())).await;
+        c.expect("erin back", |ev| matches!(ev, UiEvent::PeerJoined { id, .. } if *id == e.id).then_some(())).await;
+        d.expect("erin back", |ev| matches!(ev, UiEvent::PeerJoined { id, .. } if *id == e.id).then_some(())).await;
+    }
+
+    /// Collects buffers pushed into a fake receive pipeline.
+    fn capture_sink(hub: &Hub, peer: EndpointId, track: Track) -> (gst::Pipeline, std::sync::mpsc::Receiver<Vec<u8>>) {
+        use gst::prelude::*;
+        let pipeline = gst::Pipeline::new();
+        let src = gst_app::AppSrc::builder().is_live(true).format(gst::Format::Bytes).build();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sink = gst_app::AppSink::builder().sync(false).build();
+        sink.set_callbacks(
+            gst_app::AppSinkCallbacks::builder()
+                .new_sample(move |s| {
+                    let smp = s.pull_sample().unwrap();
+                    let _ = tx.send(smp.buffer().unwrap().map_readable().unwrap().to_vec());
+                    Ok(gst::FlowSuccess::Ok)
+                })
+                .build(),
+        );
+        pipeline.add_many([src.upcast_ref::<gst::Element>(), sink.upcast_ref::<gst::Element>()]).unwrap();
+        src.link(&sink).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        hub.register_sink(peer, track, src);
+        (pipeline, rx)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs internet (n0 relays + discovery)"]
+    async fn media_transport() {
+        gst::init().unwrap();
+        let (a, b) = tokio::join!(node("alice"), node("bob"));
+        a.directory(&[&b], vec![]);
+        b.directory(&[&a], vec![]);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        a.net.send(NetCmd::CallDirect(b.id));
+        let room = b.expect("incoming", |e| match e { UiEvent::Incoming { room, .. } => Some(*room), _ => None }).await;
+        b.net.send(NetCmd::Accept(room));
+        a.expect("joined", |e| matches!(e, UiEvent::PeerJoined { .. }).then_some(())).await;
+
+        let (_p1, video) = capture_sink(&b.hub, a.id, Track::Screen);
+        let (_p2, audio) = capture_sink(&b.hub, a.id, Track::Mic);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Delta frames before the first keyframe must be skipped (decoder can't use them).
+        let frame = |n: u8, key: bool, len: usize| VideoFrame {
+            data: bytes::Bytes::from(vec![n; len]),
+            pts_us: n as u64,
+            key,
+            captured: std::time::Instant::now(),
+        };
+        a.hub.send_video(Track::Screen, frame(0, false, 100));
+        for n in 1..=60u8 {
+            // Two GOPs of 30, with frames large enough to span many packets.
+            a.hub.send_video(Track::Screen, frame(n, n == 1 || n == 31, 20_000));
+            a.hub.send_audio(Track::Mic, &[n; 160]);
+            tokio::time::sleep(Duration::from_millis(16)).await;
+        }
+        let mut got = Vec::new();
+        while let Ok(v) = video.recv_timeout(Duration::from_secs(5)) {
+            assert!(v.iter().all(|x| *x == v[0]), "frame corrupted");
+            got.push(v[0]);
+            if got.len() == 60 { break; }
+        }
+        assert_eq!(got, (1..=60).collect::<Vec<u8>>(), "frames lost or reordered");
+        let mut audio_n = 0;
+        while audio.recv_timeout(Duration::from_millis(500)).is_ok() { audio_n += 1; }
+        assert!(audio_n >= 55, "only {audio_n}/60 audio datagrams arrived");
+        eprintln!("video 60/60 in order, audio {audio_n}/60");
+    }
+}

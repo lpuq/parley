@@ -1,0 +1,9 @@
+target/
+.flatpak-builder/
+flatpak/build-dir/
+flatpak/repo/
+*.flatpak
+.manifest-no-appstream.yml
+*.tar.gz
+*.raw
+*.wav

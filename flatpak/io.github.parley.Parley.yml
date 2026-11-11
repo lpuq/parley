@@ -1,0 +1,47 @@
+# Parley Flatpak manifest (for flatpak-builder / Flathub).
+# For everyday installs use ../install.sh, which needs only `flatpak` and reads
+# finish-args from this file.
+id: io.github.parley.Parley
+runtime: org.gnome.Platform
+runtime-version: '51'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+  - org.freedesktop.Sdk.Extension.llvm22    # libclang, for PipeWire's bindgen
+command: parley
+finish-args:
+  - --share=network          # calls (QUIC/UDP), relays and discovery
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=all             # webcams (V4L2)
+  - --socket=pulseaudio      # mic and speakers via pipewire-pulse
+  - --filesystem=xdg-run/pipewire-0   # app-audio routing for screen shares
+  - --talk-name=org.kde.StatusNotifierWatcher   # tray icon
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm22/bin
+  env:
+    LIBCLANG_PATH: /usr/lib/sdk/llvm22/lib
+    CARGO_HOME: /run/build/parley/cargo
+    CARGO_NET_OFFLINE: 'true'
+modules:
+  - name: parley
+    buildsystem: simple
+    build-commands:
+      - cargo build --release --locked --offline
+      - install -Dm755 target/release/parley /app/bin/parley
+      - install -Dm644 data/io.github.parley.Parley.desktop /app/share/applications/io.github.parley.Parley.desktop
+      - install -Dm644 data/icons/io.github.parley.Parley.svg /app/share/icons/hicolor/scalable/apps/io.github.parley.Parley.svg
+      - install -Dm644 data/io.github.parley.Parley.metainfo.xml /app/share/metainfo/io.github.parley.Parley.metainfo.xml
+    sources:
+      - type: dir
+        path: ..
+        skip:
+          - target
+          - .flatpak-builder
+          - flatpak/build-dir
+          - flatpak/repo
+          - parley-aarch64.flatpak
+          - parley-x86_64.flatpak
+          - parley-x86_64-install.tar.gz
+      - cargo-sources.json

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Parley
+GenericName=Private Calls
+Comment=Encrypted voice, video and screen-share calls straight between friends
+Exec=parley
+Icon=io.github.parley.Parley
+Terminal=false
+Categories=Network;InstantMessaging;AudioVideo;Telephony;
+Keywords=call;voice;video;screen;share;chat;p2p;
+StartupNotify=true
+X-GNOME-UsesNotifications=true
