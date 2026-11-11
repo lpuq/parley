@@ -3,6 +3,8 @@
 Private voice, video and screen-share calls for Linux, straight between friends.
 No accounts, no port forwarding, and no server you have to run or pay for.
 
+![A Parley call: Bob shares a slide while he and Alice talk](docs/screenshot.png)
+
 - **1:1 and group calls** (up to 3 people). Everyone can talk, show their webcam and
   share their screen with sound at the same time.
 - **End-to-end encrypted.** Every connection is QUIC + TLS 1.3, authenticated by each

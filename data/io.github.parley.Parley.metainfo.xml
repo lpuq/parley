@@ -19,6 +19,14 @@
       <li>Echo cancellation and noise suppression</li>
     </ul>
   </description>
+  <screenshots>
+    <screenshot type="default">
+      <caption>A call with a shared screen</caption>
+      <image>https://raw.githubusercontent.com/lpuq/parley/main/docs/screenshot.png</image>
+    </screenshot>
+  </screenshots>
+  <url type="homepage">https://github.com/lpuq/parley</url>
+  <url type="bugtracker">https://github.com/lpuq/parley/issues</url>
   <content_rating type="oars-1.1">
     <content_attribute id="social-audio">intense</content_attribute>
   </content_rating>
