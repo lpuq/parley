@@ -90,6 +90,17 @@ cargo build --release --locked
 ./target/release/parley
 ```
 
+### Updating
+
+```bash
+git pull
+./install.sh
+```
+
+Only what changed is recompiled (about a minute), and your identity, contacts and
+settings are kept. The installer offers to restart a running Parley. To hear about new
+versions, use **Watch → Custom → Releases** on the GitHub page.
+
 ### Verifying a release bundle
 
 If you do use a `.flatpak` from the Releases page, check it against `SHA256SUMS`

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Parley installer — one command, no manual setup.
 #
-#   ./install.sh               install (prebuilt package if one is here, else build it)
+#   ./install.sh               install: builds from source in a git checkout; elsewhere uses
+#                              a prebuilt parley-<arch>.flatpak next to this script if present
+#   ./install.sh --prebuilt    use the prebuilt parley-<arch>.flatpak even in a git checkout
 #   ./install.sh --bundle      also write parley-<arch>.flatpak to copy to other machines
 #   ./install.sh --native      build a native binary instead of a Flatpak (needs -devel pkgs)
 #   ./install.sh --uninstall
@@ -18,13 +20,14 @@ FDO_BRANCH=26.08           # its freedesktop base (for SDK extensions)
 MANIFEST=flatpak/$APP_ID.yml
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/parley-build"
 ARCH="${PARLEY_ARCH:-$(flatpak --default-arch 2>/dev/null || uname -m)}"
-MODE=auto BUNDLE=0
+MODE=auto BUNDLE=0 PREBUILT=0
 for a in "$@"; do
   case "$a" in
     --bundle) BUNDLE=1 ;;
+    --prebuilt) PREBUILT=1 ;;
     --native) MODE=native ;;
     --uninstall) MODE=uninstall ;;
-    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
     *) echo "Unknown option: $a"; exit 2 ;;
   esac
 done
@@ -109,7 +112,17 @@ finish() {
 }
 
 # Fast path: a ready-made package for this machine sits next to the installer.
+# Not in a git checkout, though: there a leftover package would silently replace
+# the code you just pulled, so we build from source unless asked otherwise.
+USE_PREBUILT=0
 if [[ -f "parley-$ARCH.flatpak" && $BUNDLE == 0 ]]; then
+  if [[ ! -d .git || $PREBUILT == 1 ]]; then
+    USE_PREBUILT=1
+  else
+    say "Building from source (ignoring parley-$ARCH.flatpak here; --prebuilt uses it instead)"
+  fi
+fi
+if [[ $USE_PREBUILT == 1 ]]; then
   need org.gnome.Platform//$RUNTIME_BRANCH
   need org.freedesktop.Platform.codecs-extra//$FDO_BRANCH-extra
   say "Installing prebuilt parley-$ARCH.flatpak"
