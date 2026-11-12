@@ -15,6 +15,38 @@ use serde::{Deserialize, Serialize};
 use crate::store::{Member, RoomId};
 
 pub const ALPN: &[u8] = b"parley/1";
+/// Separate, tiny connections that only exchange online status.
+pub const PRESENCE_ALPN: &[u8] = b"parley-presence/1";
+
+/// What someone shows to their contacts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Presence {
+    Online,
+    DoNotDisturb,
+    Offline,
+}
+
+/// Writes one small length-prefixed JSON message (presence exchange).
+pub async fn write_small<T: Serialize>(s: &mut iroh::endpoint::SendStream, msg: &T) -> Result<()> {
+    let body = serde_json::to_vec(msg)?;
+    let mut buf = (body.len() as u32).to_be_bytes().to_vec();
+    buf.extend_from_slice(&body);
+    s.write_all(&buf).await?;
+    Ok(())
+}
+
+/// Reads one small length-prefixed JSON message (at most 1 KiB).
+pub async fn read_small<T: serde::de::DeserializeOwned>(r: &mut iroh::endpoint::RecvStream) -> Result<T> {
+    let mut len = [0u8; 4];
+    r.read_exact(&mut len).await?;
+    let len = u32::from_be_bytes(len) as usize;
+    if len > 1024 {
+        bail!("message too large");
+    }
+    let mut body = vec![0u8; len];
+    r.read_exact(&mut body).await?;
+    Ok(serde_json::from_slice(&body)?)
+}
 pub const PROTO_VERSION: u32 = 1;
 
 /// Media tracks. Audio tracks travel as datagrams, video as streams.

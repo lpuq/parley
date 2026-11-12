@@ -170,6 +170,8 @@ pub struct AudioOut {
     branches: HashMap<(EndpointId, Track), Branch>,
     /// Per-track volume (0.0–2.0): a person's voice and their stream audio separately.
     volumes: HashMap<(EndpointId, Track), f64>,
+    /// Tracks muted locally (volume is kept for when they're unmuted).
+    muted: std::collections::HashSet<(EndpointId, Track)>,
     worker: Worker,
 }
 
@@ -225,7 +227,7 @@ impl AudioOut {
             sink.factory().map(|f| f.name().to_string()).unwrap_or_default()
         );
         let run = Running::start(pipeline, "Audio output", on_error)?;
-        Ok(Self { run, sink: sink.clone(), last_device: Default::default(), ready, mixer, master, branches: HashMap::new(), volumes: HashMap::new(), worker: Worker::new() })
+        Ok(Self { run, sink: sink.clone(), last_device: Default::default(), ready, mixer, master, branches: HashMap::new(), volumes: HashMap::new(), muted: Default::default(), worker: Worker::new() })
     }
 
     pub fn set_deafened(&self, deaf: bool) {
@@ -241,6 +243,21 @@ impl AudioOut {
 
     pub fn volume(&self, peer: &EndpointId, track: Track) -> f64 {
         self.volumes.get(&(*peer, track)).copied().unwrap_or(1.0)
+    }
+
+    pub fn set_muted(&mut self, peer: EndpointId, track: Track, muted: bool) {
+        if muted {
+            self.muted.insert((peer, track));
+        } else {
+            self.muted.remove(&(peer, track));
+        }
+        if let Some(b) = self.branches.get(&(peer, track)) {
+            b.volume.set_property("mute", muted);
+        }
+    }
+
+    pub fn is_muted(&self, peer: &EndpointId, track: Track) -> bool {
+        self.muted.contains(&(*peer, track))
     }
 
     pub fn add(&mut self, hub: &Arc<Hub>, peer: EndpointId, track: Track) -> Result<()> {
@@ -278,6 +295,7 @@ impl AudioOut {
         let caps = caps_filter("audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=2")?;
         let vol = make("volume")?;
         vol.set_property("volume", self.volume(&peer, track));
+        vol.set_property("mute", self.is_muted(&peer, track));
 
         let elements: Vec<gst::Element> =
             vec![src.clone().upcast(), jb, depay, dec, conv, res, caps, vol.clone()];

@@ -8,7 +8,7 @@ use gtk::glib;
 use super::App;
 use crate::{
     media::{appaudio::AudioShare, devices},
-    store::{Group, Member, ScreenQuality, ShareCode},
+    store::{Group, Member, ScreenQuality, ShareCode, Suppression, VoiceMode},
 };
 
 pub fn ask_name(app: &Rc<App>, first_run: bool) {
@@ -422,13 +422,148 @@ pub fn settings(app: &Rc<App>) {
 
     let proc_ = adw::PreferencesGroup::new();
     proc_.set_title("Voice processing");
+    let modes = gtk::StringList::new(&["Voice Isolation", "Studio", "Custom"]);
+    let mode_row = adw::ComboRow::builder().title("Input profile").model(&modes).build();
+    mode_row.set_selected(match s.voice_mode {
+        VoiceMode::Isolation => 0,
+        VoiceMode::Studio => 1,
+        VoiceMode::Custom => 2,
+    });
+    let mode_hint = |m: VoiceMode| match m {
+        VoiceMode::Isolation => "Only your voice: removes keyboards, desk knocks, chewing and other noise, and evens out your volume",
+        VoiceMode::Studio => "Your microphone exactly as it is, with no processing",
+        VoiceMode::Custom => "Choose the suppression, sensitivity and gain yourself",
+    };
+    mode_row.set_subtitle(mode_hint(s.voice_mode));
+
+    let supp = gtk::StringList::new(&["Enhanced", "Standard", "None"]);
+    let supp_row = adw::ComboRow::builder()
+        .title("Noise suppression")
+        .subtitle("Enhanced removes non-speech sounds; Standard only steady background hiss")
+        .model(&supp)
+        .build();
+    supp_row.set_selected(match s.suppression {
+        Suppression::Enhanced => 0,
+        Suppression::Standard => 1,
+        Suppression::Off => 2,
+    });
+    let sens_auto = adw::SwitchRow::builder()
+        .title("Automatically determine input sensitivity")
+        .subtitle("Transmit only while you're speaking")
+        .active(s.sensitivity_auto)
+        .build();
+    let sens_row = adw::ActionRow::builder().title("Input sensitivity").build();
+    let sens = gtk::Scale::with_range(gtk::Orientation::Horizontal, -100.0, 0.0, 1.0);
+    sens.set_value(s.sensitivity_db as f64);
+    sens.set_hexpand(true);
+    sens.set_width_request(200);
+    sens.set_draw_value(true);
+    sens.set_value_pos(gtk::PositionType::Right);
+    sens.set_format_value_func(|_, v| format!("{v:.0} dB"));
+    sens.set_valign(gtk::Align::Center);
+    sens_row.add_suffix(&sens);
+    let agc = adw::SwitchRow::builder()
+        .title("Automatic gain control")
+        .subtitle("Keeps your voice at a steady, comfortable level, even when you lean back")
+        .active(s.auto_gain)
+        .build();
     let echo = adw::SwitchRow::builder().title("Echo cancellation").subtitle("Needed when using speakers instead of headphones").active(s.echo_cancel).build();
-    let noise = adw::SwitchRow::builder().title("Noise suppression").active(s.noise_suppression).build();
-    let agc = adw::SwitchRow::builder().title("Automatic gain control").subtitle("Keeps your voice at a steady level").active(s.auto_gain).build();
-    proc_.add(&echo);
-    proc_.add(&noise);
-    proc_.add(&agc);
+
+    // Live level: green while your voice is being sent.
+    let meter_row = adw::ActionRow::builder().title("Mic level").subtitle("Speak to test").build();
+    let meter = gtk::LevelBar::for_interval(0.0, 1.0);
+    meter.set_mode(gtk::LevelBarMode::Continuous);
+    meter.remove_offset_value(Some(gtk::LEVEL_BAR_OFFSET_LOW));
+    meter.remove_offset_value(Some(gtk::LEVEL_BAR_OFFSET_HIGH));
+    meter.remove_offset_value(Some(gtk::LEVEL_BAR_OFFSET_FULL));
+    meter.set_hexpand(true);
+    meter.set_width_request(200);
+    meter.set_valign(gtk::Align::Center);
+    meter.add_css_class("voice-meter");
+    meter_row.add_suffix(&meter);
+
+    for r in [mode_row.upcast_ref::<gtk::Widget>(), meter_row.upcast_ref(), supp_row.upcast_ref(), sens_auto.upcast_ref(), sens_row.upcast_ref(), agc.upcast_ref(), echo.upcast_ref()] {
+        proc_.add(r);
+    }
     page.add(&proc_);
+
+    // Custom-only rows.
+    let sync_rows = {
+        let (supp_row, sens_auto, sens_row, agc, mode_row) = (supp_row.clone(), sens_auto.clone(), sens_row.clone(), agc.clone(), mode_row.clone());
+        move || {
+            let custom = mode_row.selected() == 2;
+            supp_row.set_visible(custom);
+            sens_auto.set_visible(custom);
+            agc.set_visible(custom);
+            sens_row.set_visible(custom && !sens_auto.is_active());
+        }
+    };
+    sync_rows();
+
+    // Meter: poll the shared level ~20 times a second while the dialog is open.
+    app.start_mic_test();
+    {
+        let (a, weak) = (app.clone(), meter.downgrade());
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            let Some(m) = weak.upgrade() else { return glib::ControlFlow::Break };
+            let db = a.voice.level_db();
+            m.set_value(((db + 100.0) / 100.0).clamp(0.0, 1.0) as f64);
+            let open = a.voice.open.load(std::sync::atomic::Ordering::Relaxed);
+            if open {
+                m.add_css_class("open");
+            } else {
+                m.remove_css_class("open");
+            }
+            glib::ControlFlow::Continue
+        });
+        let a = app.clone();
+        d.connect_closed(move |_| a.stop_mic_test());
+    }
+
+    {
+        let (a, sync1, mode_row2) = (app.clone(), sync_rows.clone(), mode_row.clone());
+        mode_row.connect_selected_notify(move |r| {
+            let m = match r.selected() {
+                0 => VoiceMode::Isolation,
+                1 => VoiceMode::Studio,
+                _ => VoiceMode::Custom,
+            };
+            mode_row2.set_subtitle(mode_hint(m));
+            a.update_voice(|st| st.voice_mode = m);
+            sync1();
+        });
+        let a = app.clone();
+        supp_row.connect_selected_notify(move |r| {
+            let v = match r.selected() {
+                0 => Suppression::Enhanced,
+                1 => Suppression::Standard,
+                _ => Suppression::Off,
+            };
+            a.update_voice(|st| st.suppression = v);
+        });
+        let (a, sync_rows) = (app.clone(), sync_rows.clone());
+        sens_auto.connect_active_notify(move |r| {
+            let on = r.is_active();
+            a.update_voice(|st| st.sensitivity_auto = on);
+            sync_rows();
+        });
+        let a = app.clone();
+        sens.connect_value_changed(move |r| {
+            let v = r.value() as f32;
+            a.update_voice(|st| st.sensitivity_db = v);
+        });
+        let a = app.clone();
+        agc.connect_active_notify(move |r| {
+            let on = r.is_active();
+            a.update_voice(|st| st.auto_gain = on);
+        });
+        let a = app.clone();
+        echo.connect_active_notify(move |r| {
+            a.store.borrow_mut().settings.echo_cancel = r.is_active();
+            a.save();
+            a.restart_mic();
+        });
+    }
 
     let vid = adw::PreferencesGroup::new();
     vid.set_title("Video");
@@ -507,21 +642,6 @@ pub fn settings(app: &Rc<App>) {
         a.save();
         a.restart_camera();
     });
-    for (row, which) in [(&echo, 0), (&noise, 1), (&agc, 2)] {
-        let a = app.clone();
-        row.connect_active_notify(move |r| {
-            {
-                let mut st = a.store.borrow_mut();
-                match which {
-                    0 => st.settings.echo_cancel = r.is_active(),
-                    1 => st.settings.noise_suppression = r.is_active(),
-                    _ => st.settings.auto_gain = r.is_active(),
-                }
-            }
-            a.save();
-            a.restart_mic();
-        });
-    }
     let a = app.clone();
     cam_kbps.connect_value_notify(move |r| {
         a.store.borrow_mut().settings.camera_kbps = r.value() as u32;

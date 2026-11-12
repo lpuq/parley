@@ -31,6 +31,18 @@
     <content_attribute id="social-audio">intense</content_attribute>
   </content_rating>
   <releases>
+    <release version="0.2.0" date="2026-11-12">
+      <description>
+        <ul>
+          <li>Voice Isolation, Studio and Custom input profiles, with neural noise suppression (RNNoise) that removes keyboards, desk knocks and chewing</li>
+          <li>Input sensitivity: automatic, or a manual threshold with a live mic meter</li>
+          <li>Automatic gain keeps voices at a steady, comfortable loudness</li>
+          <li>Online, Do Not Disturb and Invisible status, shown on your friends</li>
+          <li>Right-click a stream or person for volume, mute and stop watching</li>
+          <li>Smoother audio on choppy Wi-Fi; narrow windows fit on screen</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-11-11"/>
   </releases>
 </component>

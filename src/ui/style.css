@@ -84,3 +84,13 @@ window.compact splitbutton.call-btn { padding: 0; }
 window.compact splitbutton.call-btn > button:first-child { min-width: 34px; padding: 0; }
 window.compact splitbutton.call-btn > menubutton > button { min-width: 16px; padding: 0 2px; }
 window.compact .call-btn.hangup { min-width: 48px; }
+
+/* Settings → mic level: grey while gated, green while your voice is sent. */
+levelbar.voice-meter block.filled { background-color: alpha(currentColor, 0.35); }
+levelbar.voice-meter.open block.filled { background-color: #23a55a; }
+
+/* Online status dots (sidebar). */
+.presence-dot { min-width: 10px; min-height: 10px; border-radius: 999px; border: 2px solid @sidebar_bg_color; }
+.presence-dot.online { background-color: #23a55a; }
+.presence-dot.dnd { background-color: #f23f42; }
+.presence-dot.offline { background-color: #80848e; }

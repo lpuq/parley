@@ -1,6 +1,6 @@
 [package]
 name = "parley"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Private, serverless voice/video/screen-share calls for Linux"
 license = "GPL-3.0-or-later"
@@ -29,6 +29,7 @@ rqrr = "0.11"
 ksni = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+nnnoiseless = { version = "0.5.2", default-features = false }
 
 [profile.release]
 opt-level = 3

@@ -12,6 +12,7 @@ use parley::{
     media::{
         appaudio::{AppAudio, AudioShare, PwEvent},
         recv::AudioOut,
+        voice::{Gate, VoiceParams},
         send::{MicOptions, MicSender, ScreenAudioSender},
     },
     net::{self, NetCmd, UiEvent},
@@ -78,7 +79,7 @@ fn main() {
     let mut audio = AudioOut::start(spk.as_ref(), |e| eprintln!("OUT ERROR {e}")).unwrap();
     // Voice: a 1000 Hz tone (PARLEY_TEST_TONE + PARLEY_TEST_TONE_FREQ) when PARLEY_TEST_TONE is set.
     let _mic = std::env::var_os("PARLEY_TEST_TONE").map(|_| {
-        let opts = MicOptions { device: None, echo_cancel: false, noise_suppression: false, auto_gain: false };
+        let opts = MicOptions { device: None, echo_cancel: false, webrtc_ns: false, voice: VoiceParams::new(false, Gate::Off, -100.0, false) };
         MicSender::start(ha.clone(), ida, opts, false, |e| eprintln!("MIC ERROR {e}")).unwrap()
     });
     // Like a real call: both branches exist from call start; screen audio begins later.

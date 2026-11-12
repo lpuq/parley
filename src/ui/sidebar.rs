@@ -6,7 +6,10 @@ use adw::prelude::*;
 use gtk::glib;
 
 use super::{App, dialogs};
-use crate::{proto::RoomKey, store::ShareCode};
+use crate::{
+    proto::{Presence, RoomKey},
+    store::{ShareCode, Status},
+};
 
 pub struct Sidebar {
     app: Weak<App>,
@@ -16,6 +19,8 @@ pub struct Sidebar {
     friends_empty: gtk::Label,
     groups_empty: gtk::Label,
     me_row: adw::ActionRow,
+    status_dot: gtk::Box,
+    status_label: gtk::Label,
 }
 
 impl Sidebar {
@@ -64,6 +69,28 @@ impl Sidebar {
         me_list.add_css_class("boxed-list");
         me_list.append(&me_row);
 
+        // Status: Online / Do Not Disturb / Invisible.
+        let status_menu = gtk::gio::Menu::new();
+        status_menu.append(Some("Online"), Some("app.status::online"));
+        status_menu.append(Some("Do Not Disturb — calls arrive silently"), Some("app.status::dnd"));
+        status_menu.append(Some("Invisible — appear offline"), Some("app.status::invisible"));
+        let status_dot = presence_dot();
+        let status_label = gtk::Label::new(None);
+        let status_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        status_box.append(&status_dot);
+        status_box.append(&status_label);
+        let status_btn = gtk::MenuButton::builder()
+            .child(&status_box)
+            .menu_model(&status_menu)
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .tooltip_text("Your status")
+            .build();
+        let status_row = adw::ActionRow::builder().title("Status").build();
+        status_row.add_suffix(&status_btn);
+        status_row.set_activatable_widget(Some(&status_btn));
+        me_list.append(&status_row);
+
         let friends = list();
         let groups = list();
         let friends_empty = hint("No friends yet. Press + and paste a code a friend sent you.");
@@ -96,7 +123,7 @@ impl Sidebar {
             .build();
         root.set_content(Some(&scroll));
 
-        Self { app, root, friends, groups, friends_empty, groups_empty, me_row }
+        Self { app, root, friends, groups, friends_empty, groups_empty, me_row, status_dot, status_label }
     }
 
     pub fn widget(&self) -> &adw::ToolbarView {
@@ -121,17 +148,39 @@ impl Sidebar {
         }
         let st = app.store.borrow();
         self.me_row.set_title(if st.my_name.is_empty() { "You" } else { &st.my_name });
+        let (cls, text) = match st.settings.status {
+            Status::Online => ("online", "Online"),
+            Status::DoNotDisturb => ("dnd", "Do Not Disturb"),
+            Status::Invisible => ("offline", "Invisible"),
+        };
+        set_presence_class(&self.status_dot, cls);
+        self.status_label.set_label(text);
         let room = app.room();
 
         let mut contacts = st.contacts.clone();
         contacts.sort_by_key(|c| c.name.to_lowercase());
         for c in contacts {
             let in_call = room == Some(RoomKey::Direct(c.id));
+            let presence = app.presence_of(&c.id);
+            let (cls, text) = match presence {
+                Presence::Online => ("online", "Online"),
+                Presence::DoNotDisturb => ("dnd", "Do not disturb"),
+                Presence::Offline => ("offline", "Offline"),
+            };
             let row = adw::ActionRow::builder()
                 .title(glib::markup_escape_text(&c.name))
-                .subtitle(if in_call { "In call".to_string() } else { c.id.fmt_short().to_string() })
+                .subtitle(if in_call { "In call" } else { text })
+                .tooltip_text(c.id.fmt_short().to_string())
                 .build();
-            row.add_prefix(&adw::Avatar::new(32, Some(&c.name), true));
+            let avatar = gtk::Overlay::new();
+            avatar.set_child(Some(&adw::Avatar::new(32, Some(&c.name), true)));
+            let dot = presence_dot();
+            set_presence_class(&dot, if in_call { "online" } else { cls });
+            dot.set_halign(gtk::Align::End);
+            dot.set_valign(gtk::Align::End);
+            avatar.add_overlay(&dot);
+            avatar.set_valign(gtk::Align::Center);
+            row.add_prefix(&avatar);
             let call = gtk::Button::builder()
                 .icon_name("call-start-symbolic")
                 .tooltip_text(format!("Call {}", c.name))
@@ -335,4 +384,19 @@ fn flat_button(label: &str) -> gtk::Button {
         l.set_xalign(0.0);
     }
     b
+}
+
+/// A small round status indicator (green / red / grey).
+fn presence_dot() -> gtk::Box {
+    let d = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    d.add_css_class("presence-dot");
+    d.set_valign(gtk::Align::Center);
+    d
+}
+
+fn set_presence_class(d: &gtk::Box, cls: &str) {
+    for c in ["online", "dnd", "offline"] {
+        d.remove_css_class(c);
+    }
+    d.add_css_class(cls);
 }

@@ -173,6 +173,65 @@ impl ScreenQuality {
     }
 }
 
+/// Microphone processing presets, as in Discord.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum VoiceMode {
+    /// Neural noise suppression, automatic sensitivity and automatic gain.
+    #[default]
+    Isolation,
+    /// The microphone as it is: no suppression, gate or gain.
+    Studio,
+    Custom,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Suppression {
+    /// RNNoise: removes keyboards, fans, chewing and other non-speech sounds.
+    #[default]
+    Enhanced,
+    /// WebRTC's classic suppressor: steady background noise only.
+    Standard,
+    Off,
+}
+
+/// What friends see: online, busy, or nothing at all.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Status {
+    #[default]
+    Online,
+    /// Calls arrive silently: no ringtone or notifications.
+    DoNotDisturb,
+    /// Look offline to everyone.
+    Invisible,
+}
+
+/// The processing the microphone pipeline should apply.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VoiceConfig {
+    /// WebRTC noise suppression (inside webrtcdsp).
+    pub webrtc_ns: bool,
+    /// RNNoise.
+    pub denoise: bool,
+    /// None = gate off; Some(None) = automatic; Some(Some(db)) = threshold.
+    pub gate: Option<Option<f32>>,
+    pub auto_gain: bool,
+}
+
+impl Settings {
+    pub fn voice_config(&self) -> VoiceConfig {
+        match self.voice_mode {
+            VoiceMode::Isolation => VoiceConfig { webrtc_ns: false, denoise: true, gate: Some(None), auto_gain: true },
+            VoiceMode::Studio => VoiceConfig { webrtc_ns: false, denoise: false, gate: None, auto_gain: false },
+            VoiceMode::Custom => VoiceConfig {
+                webrtc_ns: self.suppression == Suppression::Standard,
+                denoise: self.suppression == Suppression::Enhanced,
+                gate: Some(if self.sensitivity_auto { None } else { Some(self.sensitivity_db) }),
+                auto_gain: self.auto_gain,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Settings {
@@ -181,8 +240,15 @@ pub struct Settings {
     pub speaker: String,
     pub camera: String,
     pub echo_cancel: bool,
-    pub noise_suppression: bool,
+    /// Voice processing preset; the fields below apply in [`VoiceMode::Custom`].
+    pub voice_mode: VoiceMode,
+    pub suppression: Suppression,
+    /// Input sensitivity: automatic (voice detection) or a fixed threshold.
+    pub sensitivity_auto: bool,
+    pub sensitivity_db: f32,
     pub auto_gain: bool,
+    /// Online, Do Not Disturb or Invisible.
+    pub status: Status,
     pub screen_quality: ScreenQuality,
     pub camera_kbps: u32,
     pub hw_encode: bool,
@@ -203,8 +269,12 @@ impl Default for Settings {
             speaker: String::new(),
             camera: String::new(),
             echo_cancel: true,
-            noise_suppression: true,
+            voice_mode: VoiceMode::default(),
+            suppression: Suppression::default(),
+            sensitivity_auto: true,
+            sensitivity_db: -50.0,
             auto_gain: true,
+            status: Status::default(),
             screen_quality: ScreenQuality::default(),
             camera_kbps: 1500,
             hw_encode: true,

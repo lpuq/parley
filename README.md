@@ -14,8 +14,16 @@ No accounts, no port forwarding, and no server you have to run or pay for.
   you're contacts. Groups get their own code, which is only needed for people who
   aren't already your contacts.
 - **Discord-style call screen**: video tiles with green speaking rings, click-to-focus,
-  double-click for fullscreen, per-person volume, mute/deafen, mic and camera pickers,
-  and previews of what you're sending.
+  double-click for fullscreen, mute/deafen, mic and camera pickers, and previews of
+  what you're sending. Right-click a person or a stream for its volume, mute, and
+  Stop watching.
+- **Clean voice.** *Voice Isolation* (default) uses neural noise suppression
+  (RNNoise) to remove keyboards, desk knocks, chewing and mic rubbing, transmits only
+  while you speak, and evens out your loudness so you stay audible when you lean back.
+  *Studio* sends your mic untouched; *Custom* lets you pick the suppression and set the
+  input sensitivity (−100 to 0 dB) against a live level meter.
+- **Online status.** See which friends are online or on Do Not Disturb (calls arrive
+  silently), and go Invisible to look offline.
 - **Screen share with app audio.** Share all desktop audio or only chosen apps.
   Parley's own audio (your friends' voices) is never captured, so there's no echo.
 - **Resilient groups.** Someone dropping out doesn't end the call for everyone else.
@@ -160,8 +168,15 @@ automatically.
   too) and records its monitor. Streams belonging to Parley's own process and
   system DSP nodes are never linked. This is the same idea as Vesktop's venmic.
 - **Echo cancellation:** WebRTC's echo canceller (`webrtcdsp`) listens to exactly what
-  Parley plays, so speakers work without feedback. Noise suppression and automatic gain
-  can be toggled in Settings.
+  Parley plays, so speakers work without feedback.
+- **Voice processing** (`media/voice.rs`), after echo cancellation, on 10 ms frames:
+  RNNoise suppression (the pure-Rust `nnnoiseless` port, model built in), a voice gate
+  driven by RNNoise's voice detection or a dB threshold (with hold time and click-free
+  ramps), and an automatic gain that learns your speech level from voiced frames only
+  and steers it to −20 dBFS (up to +24 dB), followed by a limiter.
+- **Online status:** every 30 s Parley opens a tiny separate connection
+  (`parley-presence/1`) to each contact to exchange status. It only answers people in
+  your contacts, and doesn't answer at all while you're Invisible.
 
 ## Privacy and security
 
@@ -173,6 +188,9 @@ automatically.
   and, by calling, learn your IP address, as with any peer-to-peer app. n0's relay and
   discovery servers see your IP address and public key, but not who you talk to inside
   a connection or what is said.
+- **Online status:** only your contacts can see it. Invisible makes Parley stop
+  answering status checks, so you look offline; someone with your code could still
+  notice your computer is reachable at the network level.
 - **Who can ring you:** by default anyone who has your code, so a friend can add you
   and call without you adding them first. Strangers are shown with their ID next to the
   name they chose, so they can't pass as one of your contacts, and only a few calls can

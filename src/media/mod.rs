@@ -6,6 +6,7 @@ pub mod devices;
 pub mod portal;
 pub mod recv;
 pub mod send;
+pub mod voice;
 
 use anyhow::{Result, anyhow};
 use gst::prelude::*;

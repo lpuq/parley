@@ -26,10 +26,11 @@ use crate::{
         portal::ScreenPick,
         recv::{AudioOut, VideoReceiver},
         send::{MicOptions, MicSender, ScreenAudioSender, VideoSender},
+        voice::{Gate, VoiceParams},
     },
     net::{NetCmd, NetHandle, UiEvent},
-    proto::{MediaState, RoomKey, Track},
-    store::{Contact, Group, ShareCode, Store},
+    proto::{MediaState, Presence, RoomKey, Track},
+    store::{Contact, Group, ShareCode, Status, Store},
 };
 
 use callview::CallView;
@@ -101,6 +102,12 @@ pub struct App {
     hold: RefCell<Option<gio::ApplicationHoldGuard>>,
     tray: RefCell<Option<ksni::Handle<tray::ParleyTray>>>,
     bt_mic_hint_shown: Cell<bool>,
+    /// Live voice-processing settings shared with the microphone pipeline.
+    pub voice: Arc<VoiceParams>,
+    /// A microphone running outside calls, for the level meter in Settings.
+    mic_test: RefCell<Option<MicSender>>,
+    /// Contacts' online status, as last heard.
+    presence: RefCell<HashMap<EndpointId, Presence>>,
 }
 
 impl App {
@@ -174,6 +181,9 @@ impl App {
             hold: RefCell::new(None),
             tray: RefCell::new(None),
             bt_mic_hint_shown: Cell::new(false),
+            voice: VoiceParams::new(true, Gate::Auto, -50.0, true),
+            mic_test: RefCell::new(None),
+            presence: RefCell::new(HashMap::new()),
         });
 
         // ----- layout -----
@@ -479,6 +489,8 @@ impl App {
 
     pub fn push_directory(&self) {
         let st = self.store.borrow();
+        // Status first, so the first checks of our contacts already carry it.
+        self.net.send(NetCmd::SetStatus(st.settings.status));
         self.net.send(NetCmd::Directory {
             my_name: st.my_name.clone(),
             contacts: st.contacts.clone(),
@@ -540,6 +552,25 @@ impl App {
         add("decline-call", Box::new(|t| t.answer(false)));
         add("show", Box::new(|t| t.present()));
         add("quit", Box::new(|t| t.quit()));
+        {
+            let cur = match self.store.borrow().settings.status {
+                Status::Online => "online",
+                Status::DoNotDisturb => "dnd",
+                Status::Invisible => "invisible",
+            };
+            let a = gio::SimpleAction::new_stateful("status", Some(glib::VariantTy::STRING), &cur.to_variant());
+            let t = self.clone();
+            a.connect_activate(move |a, v| {
+                let Some(v) = v.and_then(|v| v.str().map(str::to_owned)) else { return };
+                a.set_state(&v.to_variant());
+                t.set_status(match v.as_str() {
+                    "dnd" => Status::DoNotDisturb,
+                    "invisible" => Status::Invisible,
+                    _ => Status::Online,
+                });
+            });
+            self.app.add_action(&a);
+        }
         self.app.set_accels_for_action("app.quit", &["<Ctrl>q"]);
         self.app.set_accels_for_action("app.add-contact", &["<Ctrl>v"]);
     }
@@ -748,14 +779,34 @@ impl App {
             UiEvent::MissedCall { from, name } => {
                 let _ = from;
                 self.toast(&format!("Missed call from {name}"));
-                if !self.window.is_active() {
+                if !self.window.is_active() && !self.dnd() {
                     let n = gio::Notification::new("Missed call");
                     n.set_body(Some(&format!("{name} tried to call you.")));
                     self.app.send_notification(Some("missed"), &n);
                 }
             }
             UiEvent::Notice(msg) => self.toast(&msg),
+            UiEvent::Presence { id, presence } => {
+                self.presence.borrow_mut().insert(id, presence);
+                self.sidebar.refresh_soon();
+            }
         }
+    }
+
+    pub fn dnd(&self) -> bool {
+        self.store.borrow().settings.status == Status::DoNotDisturb
+    }
+
+    /// A contact's last known status (offline until we hear otherwise).
+    pub fn presence_of(&self, id: &EndpointId) -> Presence {
+        self.presence.borrow().get(id).copied().unwrap_or(Presence::Offline)
+    }
+
+    pub fn set_status(self: &Rc<Self>, st: Status) {
+        self.store.borrow_mut().settings.status = st;
+        self.save();
+        self.net.send(NetCmd::SetStatus(st));
+        self.sidebar.refresh(self);
     }
 
     fn show_incoming(self: &Rc<Self>, room: RoomKey, from: EndpointId, name: String, group_name: Option<String>) {
@@ -806,6 +857,10 @@ impl App {
         *self.incoming.borrow_mut() = Some(Incoming { room, from, name: plain, dialog: dialog.clone() });
         self.present();
         dialog.present(Some(&self.window));
+        // Do Not Disturb: the call still shows up, but silently.
+        if self.dnd() {
+            return;
+        }
         self.set_ringer(Some(RingKind::Incoming));
 
         if !self.window.is_active() {
@@ -951,6 +1006,66 @@ impl App {
         self.start_audio();
     }
 
+    /// Pushes the voice settings to the running microphone (no restart needed).
+    pub fn apply_voice(&self) {
+        let c = self.store.borrow().settings.voice_config();
+        self.voice.denoise.store(c.denoise, std::sync::atomic::Ordering::Relaxed);
+        self.voice.auto_gain.store(c.auto_gain, std::sync::atomic::Ordering::Relaxed);
+        match c.gate {
+            None => self.voice.set_gate(Gate::Off),
+            Some(None) => self.voice.set_gate(Gate::Auto),
+            Some(Some(db)) => {
+                self.voice.set_gate(Gate::Threshold);
+                self.voice.set_threshold_db(db);
+            }
+        }
+    }
+
+    /// Changes voice settings: saves them, applies them live, and restarts the mic
+    /// only when the WebRTC suppressor has to be switched on or off.
+    pub fn update_voice(self: &Rc<Self>, f: impl FnOnce(&mut crate::store::Settings)) {
+        let before = self.store.borrow().settings.voice_config().webrtc_ns;
+        f(&mut self.store.borrow_mut().settings);
+        self.save();
+        self.apply_voice();
+        if self.store.borrow().settings.voice_config().webrtc_ns != before {
+            self.restart_any_mic();
+        }
+    }
+
+    /// Runs the microphone outside a call so Settings can show its level.
+    pub fn start_mic_test(self: &Rc<Self>) {
+        if self.room.get().is_some() || self.mic_test.borrow().is_some() {
+            return;
+        }
+        self.apply_voice();
+        let settings = self.store.borrow().settings.clone();
+        let mics = devices::microphones();
+        let opts = MicOptions {
+            device: devices::find(&mics, &settings.mic).map(|d| d.device.clone()),
+            echo_cancel: false,
+            webrtc_ns: settings.voice_config().webrtc_ns,
+            voice: self.voice.clone(),
+        };
+        // Its own hub with nobody in it: the audio goes nowhere.
+        match MicSender::start(Hub::new(), self.me, opts, false, |_| {}) {
+            Ok(m) => *self.mic_test.borrow_mut() = Some(m),
+            Err(e) => tracing::warn!("mic test failed: {e:#}"),
+        }
+    }
+
+    pub fn stop_mic_test(&self) {
+        self.mic_test.borrow_mut().take();
+    }
+
+    /// Restarts whichever microphone is running (call or test) with new settings.
+    pub fn restart_any_mic(self: &Rc<Self>) {
+        if self.mic_test.borrow_mut().take().is_some() {
+            self.start_mic_test();
+        }
+        self.restart_mic();
+    }
+
     pub fn restart_mic(self: &Rc<Self>) {
         let out_ok = self
             .media
@@ -965,6 +1080,7 @@ impl App {
         if self.room.get().is_none() {
             return;
         }
+        self.stop_mic_test();
         self.media.borrow_mut().mic = None;
         let settings = self.store.borrow().settings.clone();
         let mics = devices::microphones();
@@ -991,11 +1107,12 @@ impl App {
             }
         }
         let st = self.state.get();
+        self.apply_voice();
         let opts = MicOptions {
             device: dev,
             echo_cancel: settings.echo_cancel && echo_probe_ready,
-            noise_suppression: settings.noise_suppression,
-            auto_gain: settings.auto_gain,
+            webrtc_ns: settings.voice_config().webrtc_ns,
+            voice: self.voice.clone(),
         };
         match MicSender::start(self.hub.clone(), self.me, opts, st.mic_muted || st.deafened, self.on_media_error()) {
             Ok(m) => self.media.borrow_mut().mic = Some(m),
@@ -1071,6 +1188,16 @@ impl App {
     pub fn set_track_volume(&self, id: EndpointId, track: Track, v: f64) {
         if let Some(o) = self.media.borrow_mut().audio_out.as_mut() {
             o.set_volume(id, track, v);
+        }
+    }
+
+    pub fn track_muted(&self, id: &EndpointId, track: Track) -> bool {
+        self.media.borrow().audio_out.as_ref().is_some_and(|o| o.is_muted(id, track))
+    }
+
+    pub fn set_track_muted(&self, id: EndpointId, track: Track, muted: bool) {
+        if let Some(o) = self.media.borrow_mut().audio_out.as_mut() {
+            o.set_muted(id, track, muted);
         }
     }
 

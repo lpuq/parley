@@ -19,13 +19,16 @@ use tracing::{debug, info, warn};
 use crate::{
     hub::{Hub, PeerOut, VIDEO_QUEUE, VideoFrame},
     proto::*,
-    store::{Contact, Group, Member, RoomId, join_proof, room_id_for, verify_proof},
+    store::{Contact, Group, Member, RoomId, Status, join_proof, room_id_for, verify_proof},
 };
 
 const RING_TIMEOUT: Duration = Duration::from_secs(45);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(25);
 const RECONNECT_WINDOW: Duration = Duration::from_secs(60);
 const STALE_FRAME: Duration = Duration::from_millis(500);
+/// How often contacts' online status is checked.
+const PRESENCE_INTERVAL: Duration = Duration::from_secs(30);
+const PRESENCE_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug)]
 pub enum NetCmd {
@@ -45,6 +48,8 @@ pub enum NetCmd {
     RequestKeyframe(EndpointId, Track),
     /// Start/stop watching a peer's screen share (video and its audio).
     WatchScreen(EndpointId, bool),
+    /// Our status as shown to contacts.
+    SetStatus(Status),
     /// Test hook: drop every connection abruptly, as a crash or network loss would.
     #[cfg(test)]
     SimulateDropout,
@@ -69,6 +74,8 @@ pub enum UiEvent {
     /// A group was learned from an invite or gained members; the UI merges and saves it.
     GroupUpdate { group: Group },
     MissedCall { from: EndpointId, name: String },
+    /// A contact's online status changed.
+    Presence { id: EndpointId, presence: Presence },
     Notice(String),
 }
 
@@ -97,7 +104,7 @@ pub async fn start(
         .build();
     let ep = Endpoint::builder(presets::N0)
         .secret_key(secret)
-        .alpns(vec![ALPN.to_vec()])
+        .alpns(vec![ALPN.to_vec(), PRESENCE_ALPN.to_vec()])
         .transport_config(transport)
         .bind()
         .await
@@ -140,6 +147,12 @@ pub async fn start(
         call: None,
         pending: HashMap::new(),
         my_state: MediaState::default(),
+        status: Status::Online,
+        presence: HashMap::new(),
+        probing: std::collections::HashSet::new(),
+        reprobe: std::collections::HashSet::new(),
+        last_probe: None,
+        probed_by: HashMap::new(),
     };
     tokio::spawn(engine.run(cmd_rx, irx));
     Ok(NetHandle { tx })
@@ -150,6 +163,16 @@ async fn handle_incoming(
     itx: mpsc::UnboundedSender<Internal>,
 ) -> Result<()> {
     let conn = incoming.accept()?.await?;
+    if conn.alpn() == PRESENCE_ALPN {
+        let (send, mut recv) = tokio::time::timeout(Duration::from_secs(5), conn.accept_bi())
+            .await
+            .context("presence timeout")??;
+        let theirs: Presence = tokio::time::timeout(Duration::from_secs(5), read_small(&mut recv))
+            .await
+            .context("presence timeout")??;
+        let _ = itx.send(Internal::PresenceProbe { conn, send, theirs });
+        return Ok(());
+    }
     if conn.alpn() != ALPN {
         conn.close(CLOSE_DECLINE.into(), b"alpn");
         return Ok(());
@@ -176,6 +199,10 @@ enum Internal {
     Closed { sid: Sid, code: Option<u32> },
     RingTimeout { room: RoomKey },
     Tick,
+    /// A contact checked our status (and told us theirs).
+    PresenceProbe { conn: Connection, send: SendStream, theirs: Presence },
+    /// Our check of a contact finished; None = unreachable.
+    PresenceResult { peer: EndpointId, presence: Option<Presence> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,6 +277,15 @@ struct Engine {
     /// Unanswered incoming rings by room.
     pending: HashMap<RoomKey, Vec<Sid>>,
     my_state: MediaState,
+    /// Our status, and what we last learned about each contact's.
+    status: Status,
+    presence: HashMap<EndpointId, Presence>,
+    probing: std::collections::HashSet<EndpointId>,
+    /// Checks to redo once the one in flight finishes (our status changed meanwhile).
+    reprobe: std::collections::HashSet<EndpointId>,
+    last_probe: Option<Instant>,
+    /// When each peer last checked our status (rate limit).
+    probed_by: HashMap<EndpointId, Instant>,
 }
 
 impl Engine {
@@ -304,6 +340,11 @@ impl Engine {
                 self.contacts = contacts.into_iter().map(|c| (c.id, c.name)).collect();
                 self.groups = groups.into_iter().map(|g| (g.room_id(), g)).collect();
                 self.allow_unknown = allow_unknown;
+                self.presence.retain(|id, _| self.contacts.contains_key(id));
+                let new: Vec<EndpointId> = self.contacts.keys().filter(|id| !self.presence.contains_key(*id)).copied().collect();
+                for id in new {
+                    self.probe(id);
+                }
             }
             NetCmd::CallDirect(peer) => {
                 self.hangup();
@@ -344,6 +385,17 @@ impl Engine {
                     if let Some(s) = self.sessions.get(sid) {
                         s.send(Ctrl::Keyframe(track));
                     }
+                }
+            }
+            NetCmd::SetStatus(st) => {
+                if st != self.status {
+                    info!("status now {st:?}");
+                    self.status = st;
+                    // Tell everyone right away (a check carries our status); checks
+                    // already under way carried the old one, so redo those after.
+                    self.reprobe.extend(self.probing.iter().copied());
+                    self.last_probe = None;
+                    self.on_tick();
                 }
             }
             NetCmd::WatchScreen(peer, on) => {
@@ -566,6 +618,16 @@ impl Engine {
                 }
             }
             Internal::Tick => self.on_tick(),
+            Internal::PresenceProbe { conn, send, theirs } => self.on_presence_probe(conn, send, theirs),
+            Internal::PresenceResult { peer, presence } => {
+                self.probing.remove(&peer);
+                if self.contacts.contains_key(&peer) {
+                    self.set_presence(peer, presence.unwrap_or(Presence::Offline));
+                    if self.reprobe.remove(&peer) {
+                        self.probe(peer);
+                    }
+                }
+            }
         }
     }
 
@@ -1032,7 +1094,78 @@ impl Engine {
         }
     }
 
+    fn my_presence(&self) -> Presence {
+        match self.status {
+            Status::Online => Presence::Online,
+            Status::DoNotDisturb => Presence::DoNotDisturb,
+            Status::Invisible => Presence::Offline,
+        }
+    }
+
+    fn set_presence(&mut self, peer: EndpointId, p: Presence) {
+        if self.presence.insert(peer, p) != Some(p) {
+            debug!("{} is {p:?}", peer.fmt_short());
+            self.emit(UiEvent::Presence { id: peer, presence: p });
+        }
+    }
+
+    /// Checks a contact's status, telling them ours on the way.
+    fn probe(&mut self, peer: EndpointId) {
+        if !self.probing.insert(peer) {
+            return;
+        }
+        let (ep, itx, mine) = (self.ep.clone(), self.itx.clone(), self.my_presence());
+        tokio::spawn(async move {
+            let res = tokio::time::timeout(PRESENCE_TIMEOUT, async {
+                let conn = ep.connect(EndpointAddr::from(peer), PRESENCE_ALPN).await?;
+                let (mut send, mut recv) = conn.open_bi().await?;
+                write_small(&mut send, &mine).await?;
+                let theirs: Presence = read_small(&mut recv).await?;
+                conn.close(0u32.into(), b"");
+                anyhow::Ok(theirs)
+            })
+            .await;
+            let presence = match res {
+                Ok(Ok(p)) => Some(p),
+                _ => None,
+            };
+            let _ = itx.send(Internal::PresenceResult { peer, presence });
+        });
+    }
+
+    /// A contact checked on us. Only contacts get an answer, and nobody does while
+    /// we're invisible (we look offline).
+    fn on_presence_probe(&mut self, conn: Connection, mut send: SendStream, theirs: Presence) {
+        let peer = conn.remote_id();
+        if !self.contacts.contains_key(&peer) {
+            conn.close(CLOSE_DECLINE.into(), b"");
+            return;
+        }
+        let now = Instant::now();
+        let recent = self.probed_by.get(&peer).is_some_and(|t| now.duration_since(*t) < Duration::from_secs(5));
+        self.probed_by.insert(peer, now);
+        // Their check tells us they're around (unless they're invisible).
+        self.set_presence(peer, theirs);
+        if recent || self.status == Status::Invisible {
+            conn.close(CLOSE_DECLINE.into(), b"");
+            return;
+        }
+        let mine = self.my_presence();
+        tokio::spawn(async move {
+            let _ = write_small(&mut send, &mine).await;
+            let _ = send.finish();
+            let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+        });
+    }
+
     fn on_tick(&mut self) {
+        if self.last_probe.is_none_or(|t| t.elapsed() >= PRESENCE_INTERVAL) {
+            self.last_probe = Some(Instant::now());
+            let ids: Vec<EndpointId> = self.contacts.keys().copied().collect();
+            for id in ids {
+                self.probe(id);
+            }
+        }
         // Reconnect attempts.
         let mut redial = Vec::new();
         let mut give_up = Vec::new();
@@ -1309,6 +1442,41 @@ mod tests {
     }
 
     use std::collections::HashSet;
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs internet (n0 relays + discovery)"]
+    async fn presence_status() {
+        let _ = tracing_subscriber::fmt().with_env_filter("parley=debug").try_init();
+        let (a, b, c) = tokio::join!(node("alice"), node("bob"), node("carol"));
+        // Carol isn't Bob's contact: Bob must not tell her anything.
+        a.directory(&[&b], vec![]);
+        b.directory(&[&a], vec![]);
+        c.directory(&[&b], vec![]);
+        let want = |id: EndpointId, p: Presence| move |e: &UiEvent| matches!(e, UiEvent::Presence { id: i, presence } if *i == id && *presence == p).then_some(());
+        a.expect("bob online", want(b.id, Presence::Online)).await;
+        b.expect("alice online", want(a.id, Presence::Online)).await;
+
+        b.net.send(NetCmd::SetStatus(Status::DoNotDisturb));
+        a.expect("bob dnd", want(b.id, Presence::DoNotDisturb)).await;
+
+        b.net.send(NetCmd::SetStatus(Status::Invisible));
+        a.expect("bob offline", want(b.id, Presence::Offline)).await;
+
+        // Carol has Bob as a contact but Bob doesn't have her: she never sees him online.
+        b.net.send(NetCmd::SetStatus(Status::Online));
+        a.expect("bob back online", want(b.id, Presence::Online)).await;
+        let seen = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if let Ok(UiEvent::Presence { id, presence }) = c.rx.recv().await {
+                    if id == b.id && presence != Presence::Offline {
+                        return presence;
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(seen.is_err(), "a non-contact learned Bob's status: {seen:?}");
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "needs internet (n0 relays + discovery)"]

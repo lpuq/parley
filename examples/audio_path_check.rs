@@ -4,7 +4,8 @@
 //!   cargo run --example audio_path_check -- out.raw 20
 use std::time::Duration;
 
-use parley::{hub::Hub, media::{recv::AudioOut, send::{MicOptions, MicSender}}, net::{self, NetCmd, UiEvent}, proto::Track, store::Contact};
+use parley::{hub::Hub, media::{recv::AudioOut, voice::{Gate, VoiceParams},
+        send::{MicOptions, MicSender}}, net::{self, NetCmd, UiEvent}, proto::Track, store::Contact};
 
 fn main() {
     tracing_subscriber::fmt().with_env_filter("parley=info").init();
@@ -38,7 +39,7 @@ fn main() {
     unsafe { std::env::set_var("PARLEY_TEST_AUDIO_FILE", &out) };
     let mut audio = AudioOut::start(None, |e| eprintln!("OUT ERROR {e}")).unwrap();
     audio.add(&hb, ida, Track::Mic).unwrap();
-    let opts = MicOptions { device: None, echo_cancel: false, noise_suppression: false, auto_gain: false };
+    let opts = MicOptions { device: None, echo_cancel: false, webrtc_ns: false, voice: VoiceParams::new(false, Gate::Off, -100.0, false) };
     let mic = MicSender::start(ha.clone(), ida, opts, false, |e| eprintln!("MIC ERROR {e}")).unwrap();
     let ml2 = ml.clone();
     gtk::glib::timeout_add_seconds_local_once(secs as u32, move || ml2.quit());

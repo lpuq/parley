@@ -11,7 +11,10 @@ use bytes::Bytes;
 use gst::prelude::*;
 use iroh::EndpointId;
 
-use super::{ECHO_PROBE, Running, caps_filter, has, make, set_opt};
+use super::{
+    ECHO_PROBE, Running, caps_filter, has, make, set_opt,
+    voice::{VoiceParams, VoiceProcessor},
+};
 use crate::{
     hub::{Hub, SPEAKING_THRESHOLD_DB, VideoFrame, rms_dbfs},
     proto::Track,
@@ -25,8 +28,10 @@ pub struct MicOptions {
     pub device: Option<gst::Device>,
     /// Requires the playback pipeline's echo probe to be running.
     pub echo_cancel: bool,
-    pub noise_suppression: bool,
-    pub auto_gain: bool,
+    /// WebRTC's (classic) noise suppression.
+    pub webrtc_ns: bool,
+    /// Neural suppression, voice gate and gain; adjustable while running.
+    pub voice: Arc<VoiceParams>,
 }
 
 pub struct MicSender {
@@ -66,12 +71,13 @@ impl MicSender {
         let caps = caps_filter("audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=1")?;
         let mut chain: Vec<gst::Element> = vec![src, conv, res, caps];
 
-        let processing = opts.echo_cancel || opts.noise_suppression || opts.auto_gain;
-        if processing && has("webrtcdsp") {
+        if (opts.echo_cancel || opts.webrtc_ns) && has("webrtcdsp") {
             let dsp = make("webrtcdsp")?;
             dsp.set_property("echo-cancel", opts.echo_cancel);
-            dsp.set_property("noise-suppression", opts.noise_suppression);
-            dsp.set_property("gain-control", opts.auto_gain);
+            dsp.set_property("noise-suppression", opts.webrtc_ns);
+            set_opt(&dsp, "noise-suppression-level", "high");
+            // Our own gain control (media/voice.rs) follows; two would fight.
+            dsp.set_property("gain-control", false);
             set_opt(&dsp, "probe", ECHO_PROBE);
             set_opt(&dsp, "delay-agnostic", "true");
             set_opt(&dsp, "extended-filter", "true");
@@ -79,6 +85,24 @@ impl MicSender {
             chain.push(dsp);
             chain.push(make("audioconvert")?);
         }
+
+        // Voice processing (see media/voice.rs) works on 48 kHz mono S16.
+        let vcaps = caps_filter("audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=1")?;
+        let proc_ = std::sync::Mutex::new(VoiceProcessor::new(opts.voice.clone()));
+        vcaps.static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            if let Some(gst::PadProbeData::Buffer(buffer)) = &mut info.data {
+                let b = buffer.make_mut();
+                if let Ok(mut map) = b.map_writable() {
+                    let bytes = map.as_mut_slice();
+                    let (pre, samples, _) = unsafe { bytes.align_to_mut::<i16>() };
+                    if pre.is_empty() {
+                        proc_.lock().unwrap().process(samples);
+                    }
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+        chain.push(vcaps);
 
         let valve = make("valve")?;
         valve.set_property("drop", muted);
@@ -112,11 +136,14 @@ impl MicSender {
         });
 
         tracing::info!(
-            "microphone: {} (echo cancel {}, noise suppression {}, auto gain {})",
+            "microphone: {} (echo cancel {}, webrtc suppression {}, neural suppression {}, gate {:?} at {} dB, auto gain {})",
             opts.device.as_ref().map(|d| d.display_name().to_string()).unwrap_or("system default".into()),
             opts.echo_cancel,
-            opts.noise_suppression,
-            opts.auto_gain
+            opts.webrtc_ns,
+            opts.voice.denoise.load(Ordering::Relaxed),
+            opts.voice.gate(),
+            opts.voice.threshold_db(),
+            opts.voice.auto_gain.load(Ordering::Relaxed)
         );
         let run = Running::start(pipeline, "Microphone", on_error)?;
         Ok(Self { _run: run, valve })

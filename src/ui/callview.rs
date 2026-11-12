@@ -42,6 +42,8 @@ struct Tile {
     link: gtk::Label,
     /// Remote screen tiles: shown instead of the video when we're not watching.
     not_watching: Option<gtk::Box>,
+    /// Volume/mute menu button (remote voices and streams).
+    menu: Option<gtk::MenuButton>,
 }
 
 pub struct CallView {
@@ -441,12 +443,17 @@ impl CallView {
             live.set_margin_top(8);
             overlay.add_overlay(&live);
         }
+        let mut menu = None;
         if let TileKey::User(Some(id)) = key {
-            tr.append(&self.user_menu(id));
+            let m = self.tile_menu(id, Track::Mic);
+            tr.append(&m);
+            menu = Some((m, id, Track::Mic));
         }
         let mut not_watching = None;
         if let TileKey::Screen(Some(id)) = key {
-            tr.append(&self.stream_menu(id));
+            let m = self.tile_menu(id, Track::ScreenAudio);
+            tr.append(&m);
+            menu = Some((m, id, Track::ScreenAudio));
             let b = gtk::Box::new(gtk::Orientation::Vertical, 10);
             b.set_halign(gtk::Align::Center);
             b.set_valign(gtk::Align::Center);
@@ -508,17 +515,43 @@ impl CallView {
         });
         overlay.add_controller(click);
 
-        Tile { frame, overlay, picture, avatar, name, muted, status, link, not_watching }
+        // Right-click: the same menu as the tile's button, at the pointer.
+        if let Some((_, id, track)) = &menu {
+            let (id, track) = (*id, *track);
+            let rclick = gtk::GestureClick::builder().button(gtk::gdk::BUTTON_SECONDARY).build();
+            let (w, ov) = (self.app.clone(), overlay.clone());
+            rclick.connect_pressed(move |g, _, x, y| {
+                g.set_state(gtk::EventSequenceState::Claimed);
+                let Some(a) = w.upgrade() else { return };
+                let pop = a.call_view.tile_popover(id, track);
+                pop.set_parent(&ov);
+                pop.set_has_arrow(false);
+                pop.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+                pop.connect_closed(|p| {
+                    let p = p.clone();
+                    glib::idle_add_local_once(move || p.unparent());
+                });
+                pop.popup();
+            });
+            overlay.add_controller(rclick);
+        }
+        let menu = menu.map(|(m, ..)| m);
+
+        Tile { frame, overlay, picture, avatar, name, muted, status, link, not_watching, menu }
     }
 
-    fn user_menu(&self, id: EndpointId) -> gtk::MenuButton {
+    /// The menu for someone's voice (`Track::Mic`) or their stream (`Track::ScreenAudio`):
+    /// volume, mute, and Stop/Watch stream or Add to contacts. Shown from the tile's
+    /// button and on right-click.
+    fn tile_popover(&self, id: EndpointId, track: Track) -> gtk::Popover {
+        let stream = track == Track::ScreenAudio;
         let pop = gtk::Popover::new();
         let b = gtk::Box::new(gtk::Orientation::Vertical, 6);
         b.set_margin_start(6);
         b.set_margin_end(6);
         b.set_margin_top(6);
         b.set_margin_bottom(6);
-        let lbl = gtk::Label::new(Some("Voice volume"));
+        let lbl = gtk::Label::new(Some(if stream { "Stream volume" } else { "Voice volume" }));
         lbl.add_css_class("heading");
         lbl.set_xalign(0.0);
         let scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 200.0, 5.0);
@@ -526,89 +559,62 @@ impl CallView {
         scale.add_mark(100.0, gtk::PositionType::Bottom, None);
         scale.set_format_value_func(|_, v| format!("{v:.0}%"));
         scale.set_draw_value(true);
-        let add = gtk::Button::with_label("Add to contacts");
-        add.add_css_class("flat");
+        let mute = gtk::CheckButton::with_label(if stream { "Mute stream" } else { "Mute" });
+        let action = gtk::Button::new();
+        action.add_css_class("flat");
         b.append(&lbl);
         b.append(&scale);
-        b.append(&add);
+        b.append(&mute);
+        b.append(&action);
         pop.set_child(Some(&b));
-        let a = self.app.clone();
-        let (s2, add2) = (scale.clone(), add.clone());
+
+        let (a, s2, m2, act2) = (self.app.clone(), scale.clone(), mute.clone(), action.clone());
         pop.connect_show(move |_| {
-            if let Some(a) = a.upgrade() {
-                s2.set_value(a.track_volume(&id, Track::Mic) * 100.0);
-                add2.set_visible(a.store.borrow().contact(&id).is_none());
+            let Some(a) = a.upgrade() else { return };
+            s2.set_value(a.track_volume(&id, track) * 100.0);
+            m2.set_active(a.track_muted(&id, track));
+            if stream {
+                act2.set_label(if a.is_watching(&id) { "Stop watching" } else { "Watch stream" });
+                act2.set_visible(true);
+            } else {
+                act2.set_label("Add to contacts");
+                act2.set_visible(a.store.borrow().contact(&id).is_none());
             }
         });
         let a = self.app.clone();
         scale.connect_value_changed(move |s| {
             if let Some(a) = a.upgrade() {
-                a.set_track_volume(id, Track::Mic, s.value() / 100.0);
+                a.set_track_volume(id, track, s.value() / 100.0);
+            }
+        });
+        let a = self.app.clone();
+        mute.connect_toggled(move |m| {
+            if let Some(a) = a.upgrade() {
+                a.set_track_muted(id, track, m.is_active());
+                a.call_view.tick(&a);
             }
         });
         let (a, p) = (self.app.clone(), pop.clone());
-        add.connect_clicked(move |_| {
+        action.connect_clicked(move |_| {
             p.popdown();
-            if let Some(a) = a.upgrade() {
+            let Some(a) = a.upgrade() else { return };
+            if stream {
+                let watching = a.is_watching(&id);
+                a.set_watching(id, !watching);
+            } else {
                 let name = a.participants().iter().find(|x| x.id == id).map(|x| x.name.clone()).unwrap_or_default();
                 a.add_contact(id, &name);
             }
         });
-        gtk::MenuButton::builder()
-            .icon_name("audio-volume-high-symbolic")
-            .tooltip_text("Volume")
-            .css_classes(["osd", "circular", "tile-menu"])
-            .popover(&pop)
-            .build()
+        pop
     }
 
-    /// Menu on a remote screen tile: stream (screen audio) volume and Stop watching.
-    fn stream_menu(&self, id: EndpointId) -> gtk::MenuButton {
-        let pop = gtk::Popover::new();
-        let b = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        b.set_margin_start(6);
-        b.set_margin_end(6);
-        b.set_margin_top(6);
-        b.set_margin_bottom(6);
-        let lbl = gtk::Label::new(Some("Stream volume"));
-        lbl.add_css_class("heading");
-        lbl.set_xalign(0.0);
-        let scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 200.0, 5.0);
-        scale.set_width_request(220);
-        scale.add_mark(100.0, gtk::PositionType::Bottom, None);
-        scale.set_format_value_func(|_, v| format!("{v:.0}%"));
-        scale.set_draw_value(true);
-        let stop = gtk::Button::with_label("Stop watching");
-        stop.add_css_class("flat");
-        b.append(&lbl);
-        b.append(&scale);
-        b.append(&stop);
-        pop.set_child(Some(&b));
-        let (a, s2, stop2) = (self.app.clone(), scale.clone(), stop.clone());
-        pop.connect_show(move |_| {
-            if let Some(a) = a.upgrade() {
-                s2.set_value(a.track_volume(&id, Track::ScreenAudio) * 100.0);
-                stop2.set_visible(a.is_watching(&id));
-            }
-        });
-        let a = self.app.clone();
-        scale.connect_value_changed(move |s| {
-            if let Some(a) = a.upgrade() {
-                a.set_track_volume(id, Track::ScreenAudio, s.value() / 100.0);
-            }
-        });
-        let (a, p) = (self.app.clone(), pop.clone());
-        stop.connect_clicked(move |_| {
-            p.popdown();
-            if let Some(a) = a.upgrade() {
-                a.set_watching(id, false);
-            }
-        });
+    fn tile_menu(&self, id: EndpointId, track: Track) -> gtk::MenuButton {
         gtk::MenuButton::builder()
             .icon_name("audio-volume-high-symbolic")
-            .tooltip_text("Stream volume / stop watching")
+            .tooltip_text(if track == Track::ScreenAudio { "Stream volume, mute, stop watching" } else { "Volume" })
             .css_classes(["osd", "circular", "tile-menu"])
-            .popover(&pop)
+            .popover(&self.tile_popover(id, track))
             .build()
     }
 
@@ -636,6 +642,16 @@ impl CallView {
     pub fn tick(&self, app: &Rc<App>) {
         let st = app.state.get();
         let parts = app.participants();
+        for (k, t) in self.tiles.borrow().iter() {
+            if let Some(m) = &t.menu {
+                let (id, track) = match k {
+                    TileKey::User(Some(id)) => (*id, Track::Mic),
+                    TileKey::Screen(Some(id)) => (*id, Track::ScreenAudio),
+                    _ => continue,
+                };
+                m.set_icon_name(if app.track_muted(&id, track) { "audio-volume-muted-symbolic" } else { "audio-volume-high-symbolic" });
+            }
+        }
         for (k, t) in self.tiles.borrow().iter() {
             let TileKey::User(owner) = k else { continue };
             let (speaking, muted) = match owner {
