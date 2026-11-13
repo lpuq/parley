@@ -1,7 +1,7 @@
 # Parley
-
-Private voice, video and screen-share calls for Linux, straight between friends.
+Private voice, video and screen-share calls (with application audio!!!) for Linux, straight between friends.
 No accounts, no port forwarding, and no server you have to run or pay for.
+Seriously, it's weird how many of these video calling apps exist and next-to-none of them can stream application/desktop audio.
 
 ![A Parley call: Bob shares a slide while he and Alice talk](docs/screenshot.png)
 
