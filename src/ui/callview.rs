@@ -480,6 +480,7 @@ impl CallView {
         nb.set_margin_bottom(8);
         nb.append(&muted);
         nb.append(&name);
+        nb.add_css_class("tile-chrome");
         overlay.add_overlay(&nb);
 
         let tr = gtk::Box::new(gtk::Orientation::Horizontal, 4);
@@ -515,6 +516,7 @@ impl CallView {
             live.set_valign(gtk::Align::Start);
             live.set_margin_start(8);
             live.set_margin_top(8);
+            live.add_css_class("tile-chrome");
             overlay.add_overlay(&live);
         }
         let mut menu = None;
@@ -583,11 +585,74 @@ impl CallView {
         });
         overlay.add_controller(click);
 
+        // Video-player-style overlay: on a tile showing video, the name, LIVE badge and
+        // buttons (and the pointer) fade out after a few seconds without mouse movement.
+        tr.add_css_class("tile-chrome");
+        let menu_open = Rc::new(Cell::new(false));
+        let idle_timer: Rc<RefCell<Option<glib::SourceId>>> = Rc::default();
+        let arm_idle = {
+            let (ov, tr, menu_open, idle_timer) = (overlay.clone(), tr.clone(), menu_open.clone(), idle_timer.clone());
+            Rc::new(move |delay_ms: u64| {
+                if let Some(t) = idle_timer.borrow_mut().take() {
+                    t.remove();
+                }
+                let (ov, tr, menu_open, slot) = (ov.clone(), tr.clone(), menu_open.clone(), idle_timer.clone());
+                let id = glib::timeout_add_local_once(std::time::Duration::from_millis(delay_ms), move || {
+                    slot.borrow_mut().take();
+                    let busy = menu_open.get() || {
+                        let mut c = tr.first_child();
+                        let mut open = false;
+                        while let Some(w) = c {
+                            open |= w.downcast_ref::<gtk::MenuButton>().is_some_and(|m| m.is_active());
+                            c = w.next_sibling();
+                        }
+                        open
+                    };
+                    if ov.has_css_class("has-video") && !busy {
+                        ov.add_css_class("idle");
+                        ov.set_cursor_from_name(Some("none"));
+                    }
+                });
+                *idle_timer.borrow_mut() = Some(id);
+            })
+        };
+        let wake = {
+            let (ov, arm_idle) = (overlay.clone(), arm_idle.clone());
+            move || {
+                ov.remove_css_class("idle");
+                ov.set_cursor_from_name(None);
+                arm_idle(3000);
+            }
+        };
+        let motion = gtk::EventControllerMotion::new();
+        {
+            // GTK also reports "motion" when the layout changes under a resting pointer
+            // (the call timer ticks every second), so only real movement counts.
+            let last = Rc::new(Cell::new((f64::NAN, f64::NAN)));
+            let (w, l) = (wake.clone(), last.clone());
+            motion.connect_enter(move |_, x, y| {
+                l.set((x, y));
+                w();
+            });
+            let (w, l) = (wake.clone(), last.clone());
+            motion.connect_motion(move |_, x, y| {
+                let (lx, ly) = l.get();
+                if (x - lx).abs() > 2.0 || (y - ly).abs() > 2.0 {
+                    l.set((x, y));
+                    w();
+                }
+            });
+            let a = arm_idle.clone();
+            motion.connect_leave(move |_| a(800));
+        }
+        overlay.add_controller(motion);
+        arm_idle(3000);
+
         // Right-click: the same menu as the tile's button, at the pointer.
         if let Some((_, id, track)) = &menu {
             let (id, track) = (*id, *track);
             let rclick = gtk::GestureClick::builder().button(gtk::gdk::BUTTON_SECONDARY).build();
-            let (w, ov) = (self.app.clone(), overlay.clone());
+            let (w, ov, mo) = (self.app.clone(), overlay.clone(), menu_open.clone());
             rclick.connect_pressed(move |g, _, x, y| {
                 g.set_state(gtk::EventSequenceState::Claimed);
                 let Some(a) = w.upgrade() else { return };
@@ -595,7 +660,10 @@ impl CallView {
                 pop.set_parent(&ov);
                 pop.set_has_arrow(false);
                 pop.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-                pop.connect_closed(|p| {
+                mo.set(true);
+                let mo = mo.clone();
+                pop.connect_closed(move |p| {
+                    mo.set(false);
                     let p = p.clone();
                     glib::idle_add_local_once(move || p.unparent());
                 });
@@ -779,6 +847,7 @@ impl CallView {
             if t.picture.paintable() != want {
                 t.picture.set_paintable(want.as_ref());
                 t.avatar.set_visible(want.is_none());
+                toggle_class(t.overlay.upcast_ref(), "has-video", want.is_some());
             }
         }
     }
@@ -789,6 +858,8 @@ fn set_tile(t: &Tile, name: &str, video: Option<gtk::gdk::Paintable>, muted: boo
     t.avatar.set_text(Some(name.trim_end_matches(" (you)").trim_end_matches("'s screen")));
     t.muted.set_visible(muted);
     t.avatar.set_visible(video.is_none() && !screen);
+    // Video gets black bars around it, not the tile's grey.
+    toggle_class(t.overlay.upcast_ref(), "has-video", video.is_some() || screen);
     if t.picture.paintable() != video {
         t.picture.set_paintable(video.as_ref());
     }

@@ -107,3 +107,10 @@ levelbar.voice-meter.open block.filled { background-color: #23a55a; }
 /* People in a group call, listed under the group in the sidebar. */
 .call-member { background: none; }
 .call-member image.call-member-off { color: #f23f42; }
+
+/* Tiles showing video: black bars around the picture (letterboxing), not grey. */
+.tile.has-video, .tile.has-video .tile-bg { background-color: black; }
+
+/* Overlay controls fade out when the pointer rests, like a video player. */
+.tile .tile-chrome { transition: opacity 200ms ease-out; }
+.tile.idle .tile-chrome { opacity: 0; transition: opacity 700ms ease-in; }

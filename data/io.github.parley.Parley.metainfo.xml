@@ -31,6 +31,14 @@
     <content_attribute id="social-audio">intense</content_attribute>
   </content_rating>
   <releases>
+    <release version="0.4.1" date="2026-11-15">
+      <description>
+        <ul>
+          <li>Black bars around video instead of grey</li>
+          <li>A stream's overlay (name, LIVE badge, buttons) and the pointer fade out after a few seconds without mouse movement, like a video player</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.4.0" date="2026-11-14">
       <description>
         <ul>
