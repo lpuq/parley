@@ -15,17 +15,20 @@ Seriously, it's weird how many of these video calling apps exist and next-to-non
   aren't already your contacts.
 - **Discord-style call screen**: video tiles with green speaking rings, click-to-focus,
   double-click for fullscreen, mute/deafen, mic and camera pickers, and previews of
-  what you're sending. Right-click a person or a stream for its volume, mute, and
-  Stop watching.
+  what you're sending. Right-click a person or a stream for its volume, mute, full
+  screen and Stop watching. Chimes when people join and leave.
 - **Clean voice.** *Voice Isolation* (default) uses neural noise suppression
   (RNNoise) to remove keyboards, desk knocks, chewing and mic rubbing, transmits only
   while you speak, and evens out your loudness so you stay audible when you lean back.
   *Studio* sends your mic untouched; *Custom* lets you pick the suppression and set the
-  input sensitivity (−100 to 0 dB) against a live level meter.
+  input sensitivity (−100 to 0 dB) against a live level meter. *Hear yourself* plays
+  your processed mic back a second later.
 - **Online status.** See which friends are online or on Do Not Disturb (calls arrive
   silently), and go Invisible to look offline.
 - **Screen share with app audio.** Share all desktop audio or only chosen apps.
   Parley's own audio (your friends' voices) is never captured, so there's no echo.
+  Pick resolution (720p–1440p) and frame rate (15–60 fps) separately; when the
+  connection can't keep up, the bitrate drops on the fly so motion stays smooth.
 - **Resilient groups.** Someone dropping out doesn't end the call for everyone else.
   Parley reconnects automatically after network blips, and anyone can rejoin with one
   click.
@@ -170,8 +173,10 @@ automatically.
     packets), not from arrival times, and the jitter buffer adapts between 80 and 400 ms
     to cover 97% of packets. On choppy Wi-Fi it grows within seconds; on a calm link it
     shrinks back slowly.
-  - Video: H.264 (hardware VA-API/NVENC when available, otherwise x264 `zerolatency`) at
-    a constant bitrate. Each group of pictures (GOP) goes on its own QUIC stream. If a
+  - Video: H.264 (hardware VA-API/NVENC when available, otherwise x264 `zerolatency`).
+    The bitrate adapts twice a second to how long frames wait to be sent: it falls at
+    once when they back up (softer picture, same frame rate) and climbs back slowly,
+    remembering where trouble started so it doesn't keep overshooting. Each group of pictures (GOP) goes on its own QUIC stream. If a
     link gets congested, the sender drops the stale GOP and restarts at a fresh
     keyframe instead of building up delay.
 - **Screen audio:** while sharing, Parley creates a temporary private PipeWire sink.
@@ -234,7 +239,6 @@ dropout, and in-order delivery of video GOPs plus audio datagrams.
 ## Known limitations / next steps
 
 - Up to 3 people (full mesh). Larger calls would need an SFU-style forwarding peer.
-- Video bitrate is constant (chosen quality preset), not yet adapted to the link.
 - No Signal integration. Codes are plain text built for pasting into Signal or any
   messenger, or can be scanned as QR codes.
 - The Flatpak isn't on Flathub. Publishing it would need an app ID on a domain or

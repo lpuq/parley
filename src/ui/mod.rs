@@ -74,6 +74,7 @@ pub struct App {
     toasts: adw::ToastOverlay,
     split: adw::OverlaySplitView,
     content: gtk::Stack,
+    content_page: adw::ToolbarView,
     home: adw::StatusPage,
     outgoing: adw::StatusPage,
     sidebar: Sidebar,
@@ -106,6 +107,9 @@ pub struct App {
     pub voice: Arc<VoiceParams>,
     /// A microphone running outside calls, for the level meter in Settings.
     mic_test: RefCell<Option<MicSender>>,
+    /// Mic test playback ("hear yourself"): the speaker side, when enabled.
+    mic_test_out: RefCell<Option<AudioOut>>,
+    pub mic_playback: Cell<bool>,
     /// Contacts' online status, as last heard.
     presence: RefCell<HashMap<EndpointId, Presence>>,
 }
@@ -158,6 +162,7 @@ impl App {
             toasts: toasts.clone(),
             split: split.clone(),
             content: content.clone(),
+            content_page: adw::ToolbarView::new(),
             home: home.clone(),
             outgoing: outgoing.clone(),
             sidebar: Sidebar::new(weak.clone()),
@@ -183,11 +188,13 @@ impl App {
             bt_mic_hint_shown: Cell::new(false),
             voice: VoiceParams::new(true, Gate::Auto, -50.0, true),
             mic_test: RefCell::new(None),
+            mic_test_out: RefCell::new(None),
+            mic_playback: Cell::new(false),
             presence: RefCell::new(HashMap::new()),
         });
 
         // ----- layout -----
-        let content_page = adw::ToolbarView::new();
+        let content_page = this.content_page.clone();
         let content_header = adw::HeaderBar::new();
         content_header.set_show_title(false);
         let sidebar_toggle = gtk::ToggleButton::builder()
@@ -250,6 +257,14 @@ impl App {
             content.connect_visible_child_name_notify(move |_| t.sync_sidebar());
         }
 
+        {
+            let t = this.clone();
+            window.connect_fullscreened_notify(move |w| {
+                if !w.is_fullscreen() && t.call_view.is_immersive() {
+                    t.call_view.set_immersive(&t, None);
+                }
+            });
+        }
         this.install_actions();
         this.start_tray();
         this.sidebar.refresh(&this);
@@ -260,11 +275,18 @@ impl App {
             let t = this.clone();
             window.connect_close_request(move |w| {
                 let bg = t.store.borrow().settings.run_in_background;
-                if t.room.get().is_some() {
+                if t.room.get().is_some() && !bg {
                     t.hang_up();
                     t.end_call_media();
                 }
                 if bg {
+                    // Still in a call: it carries on from the tray.
+                    if t.room.get().is_some() {
+                        let n = gio::Notification::new("Still in your call");
+                        n.set_body(Some("Parley keeps the call going in the background. Open it from the tray icon, or hang up there."));
+                        n.set_default_action("app.show");
+                        t.app.send_notification(Some("in-call"), &n);
+                    }
                     // Stay reachable for incoming calls.
                     w.set_visible(false);
                     if t.hold.borrow().is_none() {
@@ -412,7 +434,7 @@ impl App {
     }
 
     /// Shows or hides the sidebar to suit the current page and window width.
-    fn sync_sidebar(&self) {
+    pub(crate) fn sync_sidebar(&self) {
         let home = self.content.visible_child_name().as_deref() == Some("home");
         if home {
             self.split.set_show_sidebar(true);
@@ -708,6 +730,10 @@ impl App {
             }
             UiEvent::CallActive { room } => self.on_call_active(room),
             UiEvent::CallEnded { reason } => {
+                self.play_cue(Cue::Leave);
+                if self.call_view.is_immersive() {
+                    self.call_view.set_immersive(self, None);
+                }
                 self.end_call_media();
                 if !reason.is_empty() {
                     self.toast(&reason);
@@ -722,6 +748,8 @@ impl App {
                         p.reconnecting = false;
                     } else {
                         ps.push(Participant { id, name, state, reconnecting: false, direct: None, rtt_ms: 0 });
+                        drop(ps);
+                        self.play_cue(Cue::Join);
                     }
                 }
                 if self.unwatched.borrow().contains(&id) {
@@ -732,6 +760,7 @@ impl App {
                 self.call_view.rebuild(self);
             }
             UiEvent::PeerLeft { id } => {
+                self.play_cue(Cue::Leave);
                 self.participants.borrow_mut().retain(|p| p.id != id);
                 {
                     let mut m = self.media.borrow_mut();
@@ -1047,8 +1076,22 @@ impl App {
             webrtc_ns: settings.voice_config().webrtc_ns,
             voice: self.voice.clone(),
         };
-        // Its own hub with nobody in it: the audio goes nowhere.
-        match MicSender::start(Hub::new(), self.me, opts, false, |_| {}) {
+        // Its own hub with nobody in it: the audio goes nowhere, unless "hear yourself"
+        // is on, in which case it comes back a second later through the same Opus
+        // decoding and playback path a friend's voice takes.
+        let hub = Hub::new();
+        if self.mic_playback.get() {
+            hub.set_loopback(self.me, std::time::Duration::from_millis(1000));
+            let spk = devices::find(&devices::speakers(), &settings.speaker).map(|d| d.device.clone());
+            match AudioOut::start(spk.as_ref(), |e| tracing::warn!("mic playback: {e}")) {
+                Ok(mut out) => {
+                    let _ = out.add(&hub, self.me, Track::Mic);
+                    *self.mic_test_out.borrow_mut() = Some(out);
+                }
+                Err(e) => tracing::warn!("mic playback failed: {e:#}"),
+            }
+        }
+        match MicSender::start(hub, self.me, opts, false, |_| {}) {
             Ok(m) => *self.mic_test.borrow_mut() = Some(m),
             Err(e) => tracing::warn!("mic test failed: {e:#}"),
         }
@@ -1056,6 +1099,16 @@ impl App {
 
     pub fn stop_mic_test(&self) {
         self.mic_test.borrow_mut().take();
+        self.mic_test_out.borrow_mut().take();
+    }
+
+    /// Turns "hear yourself" on or off (mic test only, outside calls).
+    pub fn set_mic_playback(self: &Rc<Self>, on: bool) {
+        self.mic_playback.set(on);
+        if self.room.get().is_none() {
+            self.stop_mic_test();
+            self.start_mic_test();
+        }
     }
 
     /// Restarts whichever microphone is running (call or test) with new settings.
@@ -1339,7 +1392,7 @@ impl App {
                 pick.fd,
                 pick.node_id,
                 pick.size,
-                settings.screen_quality.params(),
+                settings.screen_params(),
                 settings.hw_encode,
                 on_error,
             ) {
@@ -1441,6 +1494,72 @@ fn load_css() {
 enum RingKind {
     Incoming,
     Outgoing,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cue {
+    Join,
+    Leave,
+}
+
+thread_local! {
+    static LAST_CUE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+impl App {
+    /// A short two-note chime: rising when someone joins, falling when someone leaves.
+    fn play_cue(&self, cue: Cue) {
+        use gst::prelude::*;
+        // Several people arriving at once (joining a group) get one chime.
+        let now = Instant::now();
+        if LAST_CUE.with(|c| c.get().is_some_and(|t| now.duration_since(t).as_millis() < 400)) {
+            return;
+        }
+        LAST_CUE.with(|c| c.set(Some(now)));
+        let (a, b) = match cue {
+            Cue::Join => (523.25, 783.99),
+            Cue::Leave => (783.99, 523.25),
+        };
+        const SR: f64 = 48_000.0;
+        let note = |f: f64, n: usize| {
+            (0..n).map(move |i| {
+                let t = i as f64 / SR;
+                let env = (1.0 - (-t * 400.0).exp()) * (-t * 18.0).exp();
+                (env * 0.22 * ((2.0 * std::f64::consts::PI * f * t).sin() + 0.25 * (4.0 * std::f64::consts::PI * f * t).sin()) * 32767.0)
+                    as i16
+            })
+        };
+        let pcm: Vec<u8> = note(a, 6_000).chain(note(b, 12_000)).flat_map(|s| s.to_le_bytes()).collect();
+
+        let speaker = {
+            let name = self.store.borrow().settings.speaker.clone();
+            devices::find(&devices::speakers(), &name).and_then(|d| d.device.create_element(None).ok())
+        };
+        let Ok(sink) = speaker.map(Ok).unwrap_or_else(|| gst::ElementFactory::make("autoaudiosink").build()) else { return };
+        let src = gst_app::AppSrc::builder()
+            .caps(&gst::Caps::builder("audio/x-raw").field("format", "S16LE").field("layout", "interleaved").field("rate", 48_000i32).field("channels", 1i32).build())
+            .format(gst::Format::Time)
+            .build();
+        let pipeline = gst::Pipeline::new();
+        let Ok(conv) = gst::ElementFactory::make("audioconvert").build() else { return };
+        if pipeline.add_many([src.upcast_ref(), &conv, &sink]).is_err() || gst::Element::link_many([src.upcast_ref(), &conv, &sink]).is_err() {
+            return;
+        }
+        let mut buf = gst::Buffer::from_mut_slice(pcm);
+        buf.get_mut().unwrap().set_pts(gst::ClockTime::ZERO);
+        let _ = src.push_buffer(buf);
+        let _ = src.end_of_stream();
+        // Tear down once played (or after a few seconds whatever happens).
+        let p = pipeline.clone();
+        pipeline.call_async(|p| {
+            let _ = p.set_state(gst::State::Playing);
+        });
+        glib::timeout_add_local_once(std::time::Duration::from_secs(3), move || {
+            p.call_async(|p| {
+                let _ = p.set_state(gst::State::Null);
+            });
+        });
+    }
 }
 
 struct Ringer {

@@ -1348,6 +1348,8 @@ async fn video_writer(
     use std::sync::atomic::Ordering;
     let mut cur: Option<SendStream> = None;
     let priority = if track == Track::Camera { 1 } else { 0 };
+    // Test hook: pretend the link only carries this many kbit/s of video.
+    let cap_kbps: u64 = std::env::var("PARLEY_TEST_VIDEO_CAP_KBPS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     while let Some(f) = rx.recv().await {
         if need_key.load(Ordering::Relaxed) {
             if let Some(mut s) = cur.take() {
@@ -1360,6 +1362,7 @@ async fn video_writer(
         }
         if f.captured.elapsed() > STALE_FRAME {
             // We're behind: drop the rest of this GOP and ask for a fresh start.
+            hub.report_video_drop(track);
             need_key.store(true, Ordering::Relaxed);
             hub.request_keyframe(track);
             continue;
@@ -1384,6 +1387,10 @@ async fn video_writer(
         let Some(s) = cur.as_mut() else { continue };
         let hdr = encode_frame_header(f.data.len(), f.pts_us, f.key);
         let ok = s.write_all(&hdr).await.is_ok() && s.write_all(&f.data).await.is_ok();
+        if cap_kbps > 0 {
+            tokio::time::sleep(Duration::from_micros(f.data.len() as u64 * 8 * 1000 / cap_kbps)).await;
+        }
+        hub.report_video_sent(track, f.captured.elapsed());
         if !ok {
             cur = None;
             need_key.store(true, Ordering::Relaxed);

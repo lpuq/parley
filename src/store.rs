@@ -143,34 +143,17 @@ pub fn verify_proof(secret: &[u8; 32], from: &EndpointId, to: &EndpointId, proof
     mac.verify_slice(proof).is_ok()
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Copy, Default)]
-pub enum ScreenQuality {
-    P720_30,
-    #[default]
-    P1080_30,
-    P1080_60,
-    P1440_60,
-}
+/// Screen share resolutions (max height) and frame rates offered in the share dialog.
+pub const SCREEN_HEIGHTS: [u32; 3] = [720, 1080, 1440];
+pub const SCREEN_FPS: [u32; 3] = [15, 30, 60];
 
-impl ScreenQuality {
-    pub const ALL: [ScreenQuality; 4] = [Self::P720_30, Self::P1080_30, Self::P1080_60, Self::P1440_60];
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::P720_30 => "720p · 30 fps",
-            Self::P1080_30 => "1080p · 30 fps",
-            Self::P1080_60 => "1080p · 60 fps",
-            Self::P1440_60 => "1440p · 60 fps",
-        }
-    }
-    /// (max height, fps, kbps)
-    pub fn params(self) -> (u32, u32, u32) {
-        match self {
-            Self::P720_30 => (720, 30, 2500),
-            Self::P1080_30 => (1080, 30, 4500),
-            Self::P1080_60 => (1080, 60, 7000),
-            Self::P1440_60 => (1440, 60, 10000),
-        }
-    }
+/// Bitrate for a screen share: grows with the pixel count, and less than linearly
+/// with the frame rate (consecutive frames are similar). 1080p30 = 4.5 Mbps,
+/// 1080p60 ≈ 7 Mbps. Adaptive streaming may go lower when the link is congested.
+pub fn screen_kbps(height: u32, fps: u32) -> u32 {
+    let pixels = (height * height * 16 / 9) as f64;
+    let base = 4500.0 * (pixels / (1080.0 * 1920.0)).powf(0.75);
+    (base * (fps as f64 / 30.0).powf(0.6)).round() as u32 / 100 * 100
 }
 
 /// Microphone processing presets, as in Discord.
@@ -218,6 +201,11 @@ pub struct VoiceConfig {
 }
 
 impl Settings {
+    /// (max height, fps, kbps) for screen sharing.
+    pub fn screen_params(&self) -> (u32, u32, u32) {
+        (self.screen_height, self.screen_fps, screen_kbps(self.screen_height, self.screen_fps))
+    }
+
     pub fn voice_config(&self) -> VoiceConfig {
         match self.voice_mode {
             VoiceMode::Isolation => VoiceConfig { webrtc_ns: false, denoise: true, gate: Some(None), auto_gain: true },
@@ -249,7 +237,9 @@ pub struct Settings {
     pub auto_gain: bool,
     /// Online, Do Not Disturb or Invisible.
     pub status: Status,
-    pub screen_quality: ScreenQuality,
+    /// Screen share: max height (720/1080/1440) and frame rate, chosen independently.
+    pub screen_height: u32,
+    pub screen_fps: u32,
     pub camera_kbps: u32,
     pub hw_encode: bool,
     pub run_in_background: bool,
@@ -275,7 +265,8 @@ impl Default for Settings {
             sensitivity_db: -50.0,
             auto_gain: true,
             status: Status::default(),
-            screen_quality: ScreenQuality::default(),
+            screen_height: 1080,
+            screen_fps: 60,
             camera_kbps: 1500,
             hw_encode: true,
             run_in_background: true,
@@ -434,5 +425,16 @@ mod tests {
         assert!(verify_proof(&s, &a, &b, &p));
         assert!(!verify_proof(&s, &b, &a, &p));
         assert!(!verify_proof(&random_bytes32(), &a, &b, &p));
+    }
+}
+
+#[cfg(test)]
+mod screen_tests {
+    #[test]
+    fn bitrates() {
+        assert_eq!(super::screen_kbps(1080, 30), 4500);
+        assert!((6500..=7500).contains(&super::screen_kbps(1080, 60)));
+        assert!(super::screen_kbps(720, 15) < super::screen_kbps(720, 30));
+        assert!(super::screen_kbps(1440, 60) > super::screen_kbps(1080, 60));
     }
 }

@@ -31,6 +31,19 @@
     <content_attribute id="social-audio">intense</content_attribute>
   </content_rating>
   <releases>
+    <release version="0.3.0" date="2026-11-14">
+      <description>
+        <ul>
+          <li>Adaptive streaming: when the connection can't keep up, a stream's bitrate drops at once to keep motion smooth, then climbs back</li>
+          <li>Full-screen view for a stream or person (button, right-click menu, or double-click; Esc exits)</li>
+          <li>Choose screen-share resolution and frame rate independently</li>
+          <li>Closing the window keeps the call going in the tray</li>
+          <li>Sounds when people join and leave</li>
+          <li>A thicker, glowing speaking ring that shows over video</li>
+          <li>"Hear yourself" mic test in Settings, delayed a second</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-11-12">
       <description>
         <ul>

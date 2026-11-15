@@ -8,7 +8,7 @@ use gtk::glib;
 use super::App;
 use crate::{
     media::{appaudio::AudioShare, devices},
-    store::{Group, Member, ScreenQuality, ShareCode, Suppression, VoiceMode},
+    store::{Group, Member, SCREEN_FPS, SCREEN_HEIGHTS, ShareCode, Suppression, VoiceMode, screen_kbps},
 };
 
 pub fn ask_name(app: &Rc<App>, first_run: bool) {
@@ -277,19 +277,35 @@ pub fn screen_share(app: &Rc<App>) {
 
     let q = adw::PreferencesGroup::new();
     q.set_title("Stream quality");
-    let qrow = adw::ComboRow::builder().title("Resolution").build();
-    let labels: Vec<&str> = ScreenQuality::ALL.iter().map(|q| q.label()).collect();
-    qrow.set_model(Some(&gtk::StringList::new(&labels)));
-    let cur = app.store.borrow().settings.screen_quality;
-    qrow.set_selected(ScreenQuality::ALL.iter().position(|x| *x == cur).unwrap_or(1) as u32);
-    let (_, _, kbps) = cur.params();
-    qrow.set_subtitle(&format!("{:.1} Mbps", kbps as f64 / 1000.0));
-    let q2 = qrow.clone();
-    qrow.connect_selected_notify(move |r| {
-        let (_, _, k) = ScreenQuality::ALL[r.selected() as usize].params();
-        q2.set_subtitle(&format!("{:.1} Mbps", k as f64 / 1000.0));
-    });
+    let (cur_h, cur_fps) = {
+        let st = &app.store.borrow().settings;
+        (st.screen_height, st.screen_fps)
+    };
+    let res_labels: Vec<String> = SCREEN_HEIGHTS.iter().map(|h| format!("{h}p")).collect();
+    let res_labels: Vec<&str> = res_labels.iter().map(String::as_str).collect();
+    let qrow = adw::ComboRow::builder().title("Resolution").model(&gtk::StringList::new(&res_labels)).build();
+    qrow.set_selected(SCREEN_HEIGHTS.iter().position(|h| *h == cur_h).unwrap_or(1) as u32);
+    let fps_labels: Vec<String> = SCREEN_FPS.iter().map(|f| format!("{f} fps")).collect();
+    let fps_labels: Vec<&str> = fps_labels.iter().map(String::as_str).collect();
+    let frow = adw::ComboRow::builder().title("Frame rate").model(&gtk::StringList::new(&fps_labels)).build();
+    frow.set_selected(SCREEN_FPS.iter().position(|f| *f == cur_fps).unwrap_or(2) as u32);
+    let rate = {
+        let (qrow, frow) = (qrow.clone(), frow.clone());
+        move || {
+            let h = SCREEN_HEIGHTS[qrow.selected() as usize];
+            let f = SCREEN_FPS[frow.selected() as usize];
+            frow.set_subtitle(&format!("Up to {:.1} Mbps; lowered automatically if the connection can't keep up", screen_kbps(h, f) as f64 / 1000.0));
+        }
+    };
+    rate();
+    {
+        let r = rate.clone();
+        qrow.connect_selected_notify(move |_| r());
+        let r = rate.clone();
+        frow.connect_selected_notify(move |_| r());
+    }
     q.add(&qrow);
+    q.add(&frow);
     page.add(&q);
 
     let g = adw::PreferencesGroup::new();
@@ -361,8 +377,11 @@ pub fn screen_share(app: &Rc<App>) {
 
     let (a, d2) = (app.clone(), d.clone());
     go.connect_clicked(move |_| {
-        let quality = ScreenQuality::ALL[qrow.selected() as usize];
-        a.store.borrow_mut().settings.screen_quality = quality;
+        {
+            let st = &mut a.store.borrow_mut().settings;
+            st.screen_height = SCREEN_HEIGHTS[qrow.selected() as usize];
+            st.screen_fps = SCREEN_FPS[frow.selected() as usize];
+        }
         a.save();
         let audio = match mode.selected() {
             0 => AudioShare::Off,
@@ -482,7 +501,21 @@ pub fn settings(app: &Rc<App>) {
     meter.add_css_class("voice-meter");
     meter_row.add_suffix(&meter);
 
-    for r in [mode_row.upcast_ref::<gtk::Widget>(), meter_row.upcast_ref(), supp_row.upcast_ref(), sens_auto.upcast_ref(), sens_row.upcast_ref(), agc.upcast_ref(), echo.upcast_ref()] {
+    let in_call = app.room().is_some();
+    let play_row = adw::SwitchRow::builder()
+        .title("Hear yourself")
+        .subtitle(if in_call {
+            "Available outside calls"
+        } else {
+            "Plays your mic back a second later, exactly as friends would hear it. Use headphones."
+        })
+        .sensitive(!in_call)
+        .build();
+    {
+        let a = app.clone();
+        play_row.connect_active_notify(move |r| a.set_mic_playback(r.is_active()));
+    }
+    for r in [mode_row.upcast_ref::<gtk::Widget>(), meter_row.upcast_ref(), play_row.upcast_ref(), supp_row.upcast_ref(), sens_auto.upcast_ref(), sens_row.upcast_ref(), agc.upcast_ref(), echo.upcast_ref()] {
         proc_.add(r);
     }
     page.add(&proc_);
@@ -517,7 +550,10 @@ pub fn settings(app: &Rc<App>) {
             glib::ControlFlow::Continue
         });
         let a = app.clone();
-        d.connect_closed(move |_| a.stop_mic_test());
+        d.connect_closed(move |_| {
+            a.mic_playback.set(false);
+            a.stop_mic_test();
+        });
     }
 
     {

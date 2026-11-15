@@ -17,7 +17,7 @@ use crate::{
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-enum TileKey {
+pub(crate) enum TileKey {
     /// `None` = me.
     User(Option<EndpointId>),
     Screen(Option<EndpointId>),
@@ -49,6 +49,13 @@ struct Tile {
 pub struct CallView {
     app: Weak<App>,
     root: gtk::Box,
+    head: gtk::Box,
+    bar: gtk::Box,
+    strip_scroll: gtk::ScrolledWindow,
+    /// Full screen showing only the focused tile.
+    immersive: Cell<bool>,
+    /// Whether the sidebar was showing before going full screen.
+    sidebar_before: Cell<bool>,
     title: gtk::Label,
     subtitle: gtk::Label,
     stage: gtk::Box,
@@ -153,6 +160,11 @@ impl CallView {
         let this = Self {
             app: app.clone(),
             root,
+            head,
+            bar: bar.clone(),
+            strip_scroll: strip_scroll.clone(),
+            immersive: Cell::new(false),
+            sidebar_before: Cell::new(true),
             title,
             subtitle,
             stage,
@@ -215,6 +227,7 @@ impl CallView {
             match key {
                 gtk::gdk::Key::m => a.toggle_mute(),
                 gtk::gdk::Key::d => a.toggle_deafen(),
+                gtk::gdk::Key::Escape if a.call_view.immersive.get() => a.call_view.set_immersive(&a, None),
                 gtk::gdk::Key::Escape if a.window.is_fullscreen() => a.window.unfullscreen(),
                 _ => return glib::Propagation::Proceed,
             }
@@ -226,6 +239,38 @@ impl CallView {
 
     pub fn widget(&self) -> &gtk::Box {
         &self.root
+    }
+
+    /// Full screen with just one tile (a stream, usually); `None` goes back.
+    pub fn set_immersive(&self, app: &Rc<App>, key: Option<TileKey>) {
+        let on = key.is_some();
+        if let Some(k) = key {
+            self.focus.set(Some(k));
+        }
+        if self.immersive.replace(on) == on {
+            self.relayout(app);
+            return;
+        }
+        self.head.set_visible(!on);
+        self.bar.set_visible(!on);
+        self.strip_scroll.set_visible(!on);
+        app.content_page.set_reveal_top_bars(!on);
+        toggle_class(self.root.upcast_ref(), "immersive", on);
+        if on {
+            self.sidebar_before.set(app.split.shows_sidebar());
+            app.split.set_show_sidebar(false);
+            app.window.fullscreen();
+            app.toast("Full screen — press Esc or double-click to exit");
+        } else {
+            app.window.unfullscreen();
+            app.split.set_show_sidebar(self.sidebar_before.get());
+            app.sync_sidebar();
+        }
+        self.relayout(app);
+    }
+
+    pub fn is_immersive(&self) -> bool {
+        self.immersive.get()
     }
 
     pub fn rebuild_empty(&self) {
@@ -435,6 +480,19 @@ impl CallView {
         tr.append(&status);
         tr.append(&link);
         if let TileKey::Screen(_) = key {
+            let fs = gtk::Button::builder()
+                .icon_name("view-fullscreen-symbolic")
+                .tooltip_text("Full screen")
+                .css_classes(["osd", "circular", "tile-menu"])
+                .build();
+            let a = self.app.clone();
+            fs.connect_clicked(move |_| {
+                if let Some(a) = a.upgrade() {
+                    let cv = &a.call_view;
+                    cv.set_immersive(&a, if cv.immersive.get() { None } else { Some(key) });
+                }
+            });
+            tr.append(&fs);
             let live = gtk::Label::new(Some("LIVE"));
             live.add_css_class("live-badge");
             live.set_halign(gtk::Align::Start);
@@ -500,15 +558,9 @@ impl CallView {
             g.set_state(gtk::EventSequenceState::Claimed);
             let cv = &a.call_view;
             if n == 2 {
-                cv.focus.set(Some(key));
-                if a.window.is_fullscreen() {
-                    a.window.unfullscreen();
-                    a.split.set_show_sidebar(true);
-                } else {
-                    a.window.fullscreen();
-                    a.split.set_show_sidebar(false);
-                }
-            } else if n == 1 {
+                cv.set_immersive(&a, if cv.immersive.get() { None } else { Some(key) });
+                return;
+            } else if n == 1 && !cv.immersive.get() {
                 cv.focus.set(if cv.focus.get() == Some(key) { None } else { Some(key) });
             }
             cv.relayout(&a);
@@ -562,10 +614,21 @@ impl CallView {
         let mute = gtk::CheckButton::with_label(if stream { "Mute stream" } else { "Mute" });
         let action = gtk::Button::new();
         action.add_css_class("flat");
+        let full = gtk::Button::with_label("Full screen");
+        full.add_css_class("flat");
         b.append(&lbl);
         b.append(&scale);
         b.append(&mute);
+        b.append(&full);
         b.append(&action);
+        let (a, p) = (self.app.clone(), pop.clone());
+        full.connect_clicked(move |_| {
+            p.popdown();
+            if let Some(a) = a.upgrade() {
+                let key = if stream { TileKey::Screen(Some(id)) } else { TileKey::User(Some(id)) };
+                a.call_view.set_immersive(&a, Some(key));
+            }
+        });
         pop.set_child(Some(&b));
 
         let (a, s2, m2, act2) = (self.app.clone(), scale.clone(), mute.clone(), action.clone());

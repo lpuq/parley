@@ -347,6 +347,124 @@ fn h264_encoder(p: &VideoParams) -> Result<(gst::Element, &'static str)> {
     Err(anyhow!("No H.264 encoder found. Install gstreamer1-plugins-ugly (x264) or openh264."))
 }
 
+/// Adaptive bitrate: smoothness first. When frames back up on the way out (the link
+/// can't carry the bitrate), the encoder's bitrate drops at once, so the picture gets
+/// softer instead of stuttering; once the link has been clear for a while it climbs
+/// back towards the chosen quality. Runs until the encoder is gone.
+fn adapt_bitrate(enc: &gst::Element, hub: Arc<Hub>, track: Track, max_kbps: u32) {
+    // openh264enc counts bits per second; the others kbit/s.
+    let scale = if enc.factory().is_some_and(|f| f.name() == "openh264enc") { 1000 } else { 1 };
+    let weak = enc.downgrade();
+    let _ = std::thread::Builder::new().name("bitrate".into()).spawn(move || {
+        let mut ctl = BitrateControl::new(max_kbps);
+        let idx = track.video_index();
+        hub.congestion[idx].take();
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let Some(enc) = weak.upgrade() else { return };
+            let (delay, drops) = hub.congestion[idx].take();
+            if let Some((from, to)) = ctl.step(delay, drops) {
+                tracing::info!("{track:?}: bitrate {from} → {to} kbps (send delay {delay} ms, {drops} dropped)");
+                set_opt(&enc, "bitrate", &(to * scale).to_string());
+            }
+        }
+    });
+}
+
+/// The adaptive-bitrate decisions, fed every 500 ms with the worst send delay and the
+/// number of dropped frames.
+struct BitrateControl {
+    max: f64,
+    min: f64,
+    cur: f64,
+    applied: f64,
+    calm: u32,
+    /// Where congestion last struck: climb quickly up to just below it, then only
+    /// creep, so we don't keep overshooting into dropped frames (a stutter each time).
+    ceiling: f64,
+}
+
+impl BitrateControl {
+    fn new(max_kbps: u32) -> Self {
+        let max = max_kbps as f64;
+        Self { max, min: (max * 0.15).max(300.0), cur: max, applied: max, calm: 0, ceiling: f64::MAX }
+    }
+
+    /// Returns (old, new) kbps when the encoder should change.
+    fn step(&mut self, delay_ms: u32, drops: u32) -> Option<(u32, u32)> {
+        if drops > 0 || delay_ms > 200 {
+            self.ceiling = self.cur * 0.95;
+            self.cur *= 0.6;
+            self.calm = 0;
+        } else if delay_ms > 80 {
+            self.ceiling = self.cur * 0.95;
+            self.cur *= 0.85;
+            self.calm = 0;
+        } else if delay_ms < 40 {
+            self.calm += 1;
+            if self.calm >= 4 {
+                self.cur *= if self.cur < self.ceiling * 0.9 { 1.05 } else { 1.005 };
+            }
+            // After half a minute without trouble, the link may have improved.
+            if self.calm % 60 == 0 && self.ceiling < f64::MAX {
+                self.ceiling *= 1.05;
+            }
+        }
+        self.cur = self.cur.clamp(self.min, self.max);
+        if (self.cur - self.applied).abs() / self.applied > 0.03 {
+            let from = self.applied as u32;
+            self.applied = self.cur;
+            return Some((from, self.cur as u32));
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod bitrate_tests {
+    use super::BitrateControl;
+
+    /// A link carrying `cap` kbps: excess bitrate builds a queue (delay); past ~150 ms
+    /// the send queue overflows and frames are dropped (a visible stutter).
+    fn simulate(max: u32, cap: f64, secs: u32) -> (u32, f64) {
+        let mut c = BitrateControl::new(max);
+        let (mut backlog_ms, mut drops_total, mut applied) = (0.0f64, 0u32, max as f64);
+        let mut tail = Vec::new();
+        for tick in 0..secs * 2 {
+            backlog_ms = (backlog_ms + (applied - cap) / cap * 500.0).max(0.0);
+            let drops = if backlog_ms > 150.0 {
+                backlog_ms = 0.0;
+                1
+            } else {
+                0
+            };
+            drops_total += drops;
+            if let Some((_, to)) = c.step(backlog_ms as u32, drops) {
+                applied = to as f64;
+            }
+            if tick >= secs {
+                tail.push(applied);
+            }
+        }
+        (drops_total, tail.iter().sum::<f64>() / tail.len() as f64)
+    }
+
+    #[test]
+    fn settles_near_link_capacity_without_repeated_stutters() {
+        let (drops, avg) = simulate(6800, 2500.0, 300);
+        eprintln!("2.5 Mbps link: {drops} stutters in 5 min, average {avg:.0} kbps");
+        assert!(drops <= 6, "{drops} stutters in 5 minutes");
+        assert!(avg > 0.75 * 2500.0 && avg < 2500.0, "average {avg} kbps on a 2500 kbps link");
+    }
+
+    #[test]
+    fn full_quality_on_a_fast_link() {
+        let (drops, avg) = simulate(6800, 50_000.0, 60);
+        assert_eq!(drops, 0);
+        assert_eq!(avg as u32, 6800);
+    }
+}
+
 /// Builds `[raw video] → tee → (preview, encoder → appsink)` and returns the tee's input
 /// element plus the preview paintable.
 fn video_tail(
@@ -357,6 +475,7 @@ fn video_tail(
 ) -> Result<(gst::Element, gtk::gdk::Paintable)> {
     let (enc, fmt) = h264_encoder(p)?;
     tracing::info!("{track:?}: encoder {} {}x{}@{} {}kbps", enc.factory().unwrap().name(), p.width, p.height, p.fps, p.kbps);
+    adapt_bitrate(&enc, hub.clone(), track, p.kbps);
 
     let scale = make("videoconvertscale").or_else(|_| make("videoscale"))?;
     set_opt(&scale, "add-borders", "true");

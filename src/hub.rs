@@ -48,6 +48,27 @@ pub struct Hub {
     /// Last time we heard audio above threshold, per (peer, track); ms since `epoch`.
     pub speaking: Mutex<HashMap<(EndpointId, Track), Arc<AtomicU64>>>,
     pub epoch: once_epoch::Epoch,
+    /// Outgoing video congestion per video track (camera, screen), read and reset by
+    /// the encoder's bitrate controller.
+    pub congestion: [VideoCongestion; 2],
+    /// Mic test playback: our own audio, queued to come back to us after a delay.
+    loopback: Mutex<Option<std::sync::mpsc::Sender<(Instant, Track, Vec<u8>)>>>,
+}
+
+/// How badly a video track's frames are backing up on their way out.
+#[derive(Default)]
+pub struct VideoCongestion {
+    /// Worst time from encoding to sent, in ms, since the last read.
+    pub delay_ms: std::sync::atomic::AtomicU32,
+    /// Frames dropped (stale or queue full) since the last read.
+    pub drops: std::sync::atomic::AtomicU32,
+}
+
+impl VideoCongestion {
+    /// Returns (worst delay ms, drops) and resets both.
+    pub fn take(&self) -> (u32, u32) {
+        (self.delay_ms.swap(0, Ordering::Relaxed), self.drops.swap(0, Ordering::Relaxed))
+    }
 }
 
 pub const VIDEO_QUEUE: usize = 6;
@@ -83,7 +104,29 @@ impl Hub {
     }
 
     /// Called from the audio encoder's appsink for every RTP packet.
+    /// Mic test: from now on, audio we send also comes back into this hub as if
+    /// `as_peer` had sent it, `delay` later (register an audio sink for it).
+    pub fn set_loopback(self: &Arc<Self>, as_peer: EndpointId, delay: std::time::Duration) {
+        let (tx, rx) = std::sync::mpsc::channel::<(Instant, Track, Vec<u8>)>();
+        *self.loopback.lock().unwrap() = Some(tx);
+        let weak = Arc::downgrade(self);
+        let _ = std::thread::Builder::new().name("mic-loopback".into()).spawn(move || {
+            while let Ok((sent, track, data)) = rx.recv() {
+                let due = sent + delay;
+                let now = Instant::now();
+                if due > now {
+                    std::thread::sleep(due - now);
+                }
+                let Some(hub) = weak.upgrade() else { return };
+                hub.push(&as_peer, track, data);
+            }
+        });
+    }
+
     pub fn send_audio(&self, track: Track, rtp: &[u8]) {
+        if let Some(tx) = self.loopback.lock().unwrap().as_ref() {
+            let _ = tx.send((Instant::now(), track, rtp.to_vec()));
+        }
         let peers = self.peers.read().unwrap();
         if peers.is_empty() {
             return;
@@ -115,8 +158,19 @@ impl Hub {
             }
         }
         if congested {
+            self.congestion[idx].drops.fetch_add(1, Ordering::Relaxed);
             self.request_keyframe(track);
         }
+    }
+
+    /// A frame of ours went out `delay` after it was encoded.
+    pub fn report_video_sent(&self, track: Track, delay: std::time::Duration) {
+        self.congestion[track.video_index()].delay_ms.fetch_max(delay.as_millis() as u32, Ordering::Relaxed);
+    }
+
+    /// A frame of ours was dropped for being too late.
+    pub fn report_video_drop(&self, track: Track) {
+        self.congestion[track.video_index()].drops.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A peer stopped/started watching one of our tracks.
