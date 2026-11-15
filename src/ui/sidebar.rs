@@ -7,7 +7,7 @@ use gtk::glib;
 
 use super::{App, dialogs};
 use crate::{
-    proto::{Presence, RoomKey},
+    proto::{MediaState, Presence, RoomKey},
     store::{ShareCode, Status},
 };
 
@@ -211,8 +211,11 @@ impl Sidebar {
                 .filter(|m| m.id != app.me)
                 .map(|m| st.name_for(&m.id).unwrap_or_else(|| m.name.clone()))
                 .collect();
+            let in_room = app.group_call_members(&rid);
             let subtitle = if in_call {
                 "In call".to_string()
+            } else if !in_room.is_empty() {
+                "Call in progress — press Join".to_string()
             } else if others.is_empty() {
                 "Share the group code to invite people".to_string()
             } else {
@@ -242,6 +245,18 @@ impl Sidebar {
             row.add_suffix(&self.group_menu(rid, g.name.clone(), ShareCode::for_group(&g).encode()));
             row.set_activatable_widget(Some(&join));
             self.groups.append(&row);
+            // Who's in the call (Discord-style): avatar, name, LIVE while sharing,
+            // and mute/deafen icons.
+            for (id, ms) in in_room {
+                let name = if id == app.me {
+                    if st.my_name.is_empty() { "You".to_string() } else { st.my_name.clone() }
+                } else {
+                    st.name_for(&id).unwrap_or_else(|| {
+                        g.members.iter().find(|m| m.id == id).map(|m| m.name.clone()).unwrap_or_else(|| id.fmt_short().to_string())
+                    })
+                };
+                self.groups.append(&call_member_row(&name, &ms));
+            }
         }
         self.friends_empty.set_visible(st.contacts.is_empty());
         self.friends.set_visible(!st.contacts.is_empty());
@@ -399,4 +414,40 @@ fn set_presence_class(d: &gtk::Box, cls: &str) {
         d.remove_css_class(c);
     }
     d.add_css_class(cls);
+}
+
+/// One person in a group call, shown under the group.
+fn call_member_row(name: &str, ms: &MediaState) -> gtk::ListBoxRow {
+    let b = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    b.set_margin_start(36);
+    b.set_margin_end(12);
+    b.set_margin_top(4);
+    b.set_margin_bottom(4);
+    b.append(&adw::Avatar::new(24, Some(name), true));
+    let l = gtk::Label::new(Some(name));
+    l.set_xalign(0.0);
+    l.set_hexpand(true);
+    l.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    b.append(&l);
+    if ms.screen {
+        let live = gtk::Label::new(Some("LIVE"));
+        live.add_css_class("live-badge");
+        live.set_valign(gtk::Align::Center);
+        b.append(&live);
+    }
+    if ms.mic_muted && !ms.deafened {
+        let i = gtk::Image::from_icon_name("microphone-disabled-symbolic");
+        i.add_css_class("call-member-off");
+        i.set_tooltip_text(Some("Muted"));
+        b.append(&i);
+    }
+    if ms.deafened {
+        let i = gtk::Image::from_icon_name("audio-volume-muted-symbolic");
+        i.add_css_class("call-member-off");
+        i.set_tooltip_text(Some("Deafened"));
+        b.append(&i);
+    }
+    let row = gtk::ListBoxRow::builder().child(&b).activatable(false).selectable(false).build();
+    row.add_css_class("call-member");
+    row
 }

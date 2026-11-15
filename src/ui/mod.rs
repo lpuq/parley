@@ -29,7 +29,7 @@ use crate::{
         voice::{Gate, VoiceParams},
     },
     net::{NetCmd, NetHandle, UiEvent},
-    proto::{MediaState, Presence, RoomKey, Track},
+    proto::{CallPresence, MediaState, Presence, RoomKey, Track},
     store::{Contact, Group, ShareCode, Status, Store},
 };
 
@@ -112,6 +112,8 @@ pub struct App {
     pub mic_playback: Cell<bool>,
     /// Contacts' online status, as last heard.
     presence: RefCell<HashMap<EndpointId, Presence>>,
+    /// Who's in which group call (as told by group members), with their mute/deafen/share.
+    call_presence: RefCell<HashMap<EndpointId, CallPresence>>,
 }
 
 impl App {
@@ -191,6 +193,7 @@ impl App {
             mic_test_out: RefCell::new(None),
             mic_playback: Cell::new(false),
             presence: RefCell::new(HashMap::new()),
+            call_presence: RefCell::new(HashMap::new()),
         });
 
         // ----- layout -----
@@ -257,14 +260,6 @@ impl App {
             content.connect_visible_child_name_notify(move |_| t.sync_sidebar());
         }
 
-        {
-            let t = this.clone();
-            window.connect_fullscreened_notify(move |w| {
-                if !w.is_fullscreen() && t.call_view.is_immersive() {
-                    t.call_view.set_immersive(&t, None);
-                }
-            });
-        }
         this.install_actions();
         this.start_tray();
         this.sidebar.refresh(&this);
@@ -574,6 +569,13 @@ impl App {
         add("decline-call", Box::new(|t| t.answer(false)));
         add("show", Box::new(|t| t.present()));
         add("quit", Box::new(|t| t.quit()));
+        add("fullscreen", Box::new(|t| {
+            if t.window.is_fullscreen() {
+                t.window.unfullscreen();
+            } else {
+                t.window.fullscreen();
+            }
+        }));
         {
             let cur = match self.store.borrow().settings.status {
                 Status::Online => "online",
@@ -594,6 +596,7 @@ impl App {
             self.app.add_action(&a);
         }
         self.app.set_accels_for_action("app.quit", &["<Ctrl>q"]);
+        self.app.set_accels_for_action("app.fullscreen", &["F11"]);
         self.app.set_accels_for_action("app.add-contact", &["<Ctrl>v"]);
     }
 
@@ -758,6 +761,7 @@ impl App {
                 self.sync_remote_media(id);
                 self.set_ringer(None);
                 self.call_view.rebuild(self);
+                self.sidebar.refresh_soon();
             }
             UiEvent::PeerLeft { id } => {
                 self.play_cue(Cue::Leave);
@@ -770,6 +774,7 @@ impl App {
                     }
                 }
                 self.call_view.rebuild(self);
+                self.sidebar.refresh_soon();
             }
             UiEvent::PeerReconnecting { id } => {
                 if let Some(p) = self.participants.borrow_mut().iter_mut().find(|p| p.id == id) {
@@ -794,6 +799,7 @@ impl App {
                     }
                     self.sync_remote_media(id);
                     self.call_view.rebuild(self);
+                    self.sidebar.refresh_soon();
                 }
             }
             UiEvent::PeerLink { id, direct, rtt_ms } => {
@@ -815,8 +821,12 @@ impl App {
                 }
             }
             UiEvent::Notice(msg) => self.toast(&msg),
-            UiEvent::Presence { id, presence } => {
+            UiEvent::Presence { id, presence, call } => {
                 self.presence.borrow_mut().insert(id, presence);
+                match call {
+                    Some(c) => self.call_presence.borrow_mut().insert(id, c),
+                    None => self.call_presence.borrow_mut().remove(&id),
+                };
                 self.sidebar.refresh_soon();
             }
         }
@@ -824,6 +834,20 @@ impl App {
 
     pub fn dnd(&self) -> bool {
         self.store.borrow().settings.status == Status::DoNotDisturb
+    }
+
+    /// Who's in a group's call, with their media state: the live participants if we're
+    /// in it, otherwise what members told us.
+    pub fn group_call_members(&self, room: &crate::store::RoomId) -> Vec<(EndpointId, MediaState)> {
+        if self.room.get() == Some(RoomKey::Group(*room)) {
+            let mut v = vec![(self.me, self.state.get())];
+            v.extend(self.participants().iter().map(|p| (p.id, p.state)));
+            return v;
+        }
+        let mut v: Vec<(EndpointId, MediaState)> =
+            self.call_presence.borrow().iter().filter(|(_, c)| &c.room == room).map(|(id, c)| (*id, c.state)).collect();
+        v.sort_by_key(|(id, _)| self.display_name(id).to_lowercase());
+        v
     }
 
     /// A contact's last known status (offline until we hear otherwise).
@@ -1256,6 +1280,7 @@ impl App {
 
     fn publish_state(&self, st: MediaState) {
         self.state.set(st);
+        self.sidebar.refresh_soon();
         self.net.send(NetCmd::MediaState(st));
     }
 

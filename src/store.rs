@@ -144,8 +144,9 @@ pub fn verify_proof(secret: &[u8; 32], from: &EndpointId, to: &EndpointId, proof
 }
 
 /// Screen share resolutions (max height) and frame rates offered in the share dialog.
-pub const SCREEN_HEIGHTS: [u32; 3] = [720, 1080, 1440];
-pub const SCREEN_FPS: [u32; 3] = [15, 30, 60];
+pub const SCREEN_HEIGHTS: [u32; 4] = [480, 720, 1080, 1440];
+/// Preset frame rates; the share dialog also offers a custom value.
+pub const SCREEN_FPS: [u32; 3] = [24, 30, 60];
 
 /// Bitrate for a screen share: grows with the pixel count, and less than linearly
 /// with the frame rate (consecutive frames are similar). 1080p30 = 4.5 Mbps,
@@ -434,7 +435,8 @@ mod screen_tests {
     fn bitrates() {
         assert_eq!(super::screen_kbps(1080, 30), 4500);
         assert!((6500..=7500).contains(&super::screen_kbps(1080, 60)));
-        assert!(super::screen_kbps(720, 15) < super::screen_kbps(720, 30));
+        assert!(super::screen_kbps(720, 24) < super::screen_kbps(720, 30));
+        assert!(super::screen_kbps(480, 30) < super::screen_kbps(720, 30));
         assert!(super::screen_kbps(1440, 60) > super::screen_kbps(1080, 60));
     }
 }

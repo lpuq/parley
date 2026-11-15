@@ -284,17 +284,29 @@ pub fn screen_share(app: &Rc<App>) {
     let res_labels: Vec<String> = SCREEN_HEIGHTS.iter().map(|h| format!("{h}p")).collect();
     let res_labels: Vec<&str> = res_labels.iter().map(String::as_str).collect();
     let qrow = adw::ComboRow::builder().title("Resolution").model(&gtk::StringList::new(&res_labels)).build();
-    qrow.set_selected(SCREEN_HEIGHTS.iter().position(|h| *h == cur_h).unwrap_or(1) as u32);
-    let fps_labels: Vec<String> = SCREEN_FPS.iter().map(|f| format!("{f} fps")).collect();
+    qrow.set_selected(SCREEN_HEIGHTS.iter().position(|h| *h == cur_h).unwrap_or(2) as u32);
+    let mut fps_labels: Vec<String> = SCREEN_FPS.iter().map(|f| format!("{f} fps")).collect();
+    fps_labels.push("Custom".into());
     let fps_labels: Vec<&str> = fps_labels.iter().map(String::as_str).collect();
     let frow = adw::ComboRow::builder().title("Frame rate").model(&gtk::StringList::new(&fps_labels)).build();
-    frow.set_selected(SCREEN_FPS.iter().position(|f| *f == cur_fps).unwrap_or(2) as u32);
+    frow.set_selected(SCREEN_FPS.iter().position(|f| *f == cur_fps).unwrap_or(SCREEN_FPS.len()) as u32);
+    let custom = adw::SpinRow::with_range(5.0, 120.0, 1.0);
+    custom.set_title("Custom frame rate");
+    custom.set_value(cur_fps as f64);
+    // The chosen frame rate: a preset, or the custom value.
+    let fps_of = {
+        let (frow, custom) = (frow.clone(), custom.clone());
+        move || SCREEN_FPS.get(frow.selected() as usize).copied().unwrap_or(custom.value() as u32)
+    };
     let rate = {
-        let (qrow, frow) = (qrow.clone(), frow.clone());
+        let (qrow, frow, custom, fps_of) = (qrow.clone(), frow.clone(), custom.clone(), fps_of.clone());
         move || {
+            custom.set_visible(frow.selected() as usize == SCREEN_FPS.len());
             let h = SCREEN_HEIGHTS[qrow.selected() as usize];
-            let f = SCREEN_FPS[frow.selected() as usize];
-            frow.set_subtitle(&format!("Up to {:.1} Mbps; lowered automatically if the connection can't keep up", screen_kbps(h, f) as f64 / 1000.0));
+            frow.set_subtitle(&format!(
+                "Up to {:.1} Mbps; lowered automatically if the connection can't keep up",
+                screen_kbps(h, fps_of()) as f64 / 1000.0
+            ));
         }
     };
     rate();
@@ -303,9 +315,12 @@ pub fn screen_share(app: &Rc<App>) {
         qrow.connect_selected_notify(move |_| r());
         let r = rate.clone();
         frow.connect_selected_notify(move |_| r());
+        let r = rate.clone();
+        custom.connect_value_notify(move |_| r());
     }
     q.add(&qrow);
     q.add(&frow);
+    q.add(&custom);
     page.add(&q);
 
     let g = adw::PreferencesGroup::new();
@@ -380,7 +395,7 @@ pub fn screen_share(app: &Rc<App>) {
         {
             let st = &mut a.store.borrow_mut().settings;
             st.screen_height = SCREEN_HEIGHTS[qrow.selected() as usize];
-            st.screen_fps = SCREEN_FPS[frow.selected() as usize];
+            st.screen_fps = fps_of();
         }
         a.save();
         let audio = match mode.selected() {

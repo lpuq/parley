@@ -31,6 +31,15 @@
     <content_attribute id="social-audio">intense</content_attribute>
   </content_rating>
   <releases>
+    <release version="0.4.0" date="2026-11-14">
+      <description>
+        <ul>
+          <li>Group calls show who's in them in the sidebar, even before you join: avatars, a red LIVE badge while someone shares their screen, and mute/deafen icons</li>
+          <li>A stream can fill the window (F, double-click or its button); F11 toggles full screen</li>
+          <li>Screen share at 480p too, and 24, 30, 60 fps or a custom frame rate</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.3.0" date="2026-11-14">
       <description>
         <ul>

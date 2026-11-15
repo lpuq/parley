@@ -103,3 +103,7 @@ levelbar.voice-meter.open block.filled { background-color: #23a55a; }
 /* Full-screen stream: nothing but the picture. */
 .call-view.immersive { background-color: black; }
 .call-view.immersive .tile { border-radius: 0; }
+
+/* People in a group call, listed under the group in the sidebar. */
+.call-member { background: none; }
+.call-member image.call-member-off { color: #f23f42; }

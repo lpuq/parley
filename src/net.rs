@@ -74,8 +74,8 @@ pub enum UiEvent {
     /// A group was learned from an invite or gained members; the UI merges and saves it.
     GroupUpdate { group: Group },
     MissedCall { from: EndpointId, name: String },
-    /// A contact's online status changed.
-    Presence { id: EndpointId, presence: Presence },
+    /// A contact's online status (and group call, if any) changed.
+    Presence { id: EndpointId, presence: Presence, call: Option<CallPresence> },
     Notice(String),
 }
 
@@ -149,6 +149,7 @@ pub async fn start(
         my_state: MediaState::default(),
         status: Status::Online,
         presence: HashMap::new(),
+        announced: None,
         probing: std::collections::HashSet::new(),
         reprobe: std::collections::HashSet::new(),
         last_probe: None,
@@ -167,7 +168,7 @@ async fn handle_incoming(
         let (send, mut recv) = tokio::time::timeout(Duration::from_secs(5), conn.accept_bi())
             .await
             .context("presence timeout")??;
-        let theirs: Presence = tokio::time::timeout(Duration::from_secs(5), read_small(&mut recv))
+        let theirs: PresenceMsg = tokio::time::timeout(Duration::from_secs(5), read_small(&mut recv))
             .await
             .context("presence timeout")??;
         let _ = itx.send(Internal::PresenceProbe { conn, send, theirs });
@@ -200,9 +201,9 @@ enum Internal {
     RingTimeout { room: RoomKey },
     Tick,
     /// A contact checked our status (and told us theirs).
-    PresenceProbe { conn: Connection, send: SendStream, theirs: Presence },
+    PresenceProbe { conn: Connection, send: SendStream, theirs: PresenceMsg },
     /// Our check of a contact finished; None = unreachable.
-    PresenceResult { peer: EndpointId, presence: Option<Presence> },
+    PresenceResult { peer: EndpointId, presence: Option<PresenceMsg> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,7 +280,9 @@ struct Engine {
     my_state: MediaState,
     /// Our status, and what we last learned about each contact's.
     status: Status,
-    presence: HashMap<EndpointId, Presence>,
+    presence: HashMap<EndpointId, PresenceMsg>,
+    /// What we last told everyone (status, group call, media state): re-announce on change.
+    announced: Option<(Status, Option<RoomKey>, MediaState)>,
     probing: std::collections::HashSet<EndpointId>,
     /// Checks to redo once the one in flight finishes (our status changed meanwhile).
     reprobe: std::collections::HashSet<EndpointId>,
@@ -340,8 +343,9 @@ impl Engine {
                 self.contacts = contacts.into_iter().map(|c| (c.id, c.name)).collect();
                 self.groups = groups.into_iter().map(|g| (g.room_id(), g)).collect();
                 self.allow_unknown = allow_unknown;
-                self.presence.retain(|id, _| self.contacts.contains_key(id));
-                let new: Vec<EndpointId> = self.contacts.keys().filter(|id| !self.presence.contains_key(*id)).copied().collect();
+                let known = self.presence_peers();
+                self.presence.retain(|id, _| known.contains(id));
+                let new: Vec<EndpointId> = known.into_iter().filter(|id| !self.presence.contains_key(id)).collect();
                 for id in new {
                     self.probe(id);
                 }
@@ -391,11 +395,7 @@ impl Engine {
                 if st != self.status {
                     info!("status now {st:?}");
                     self.status = st;
-                    // Tell everyone right away (a check carries our status); checks
-                    // already under way carried the old one, so redo those after.
-                    self.reprobe.extend(self.probing.iter().copied());
-                    self.last_probe = None;
-                    self.on_tick();
+                    self.on_tick(); // announces the change
                 }
             }
             NetCmd::WatchScreen(peer, on) => {
@@ -621,8 +621,8 @@ impl Engine {
             Internal::PresenceProbe { conn, send, theirs } => self.on_presence_probe(conn, send, theirs),
             Internal::PresenceResult { peer, presence } => {
                 self.probing.remove(&peer);
-                if self.contacts.contains_key(&peer) {
-                    self.set_presence(peer, presence.unwrap_or(Presence::Offline));
+                if self.knows(&peer) {
+                    self.set_presence(peer, presence.unwrap_or(PresenceMsg::offline()));
                     if self.reprobe.remove(&peer) {
                         self.probe(peer);
                     }
@@ -1094,33 +1094,56 @@ impl Engine {
         }
     }
 
-    fn my_presence(&self) -> Presence {
-        match self.status {
+    /// Everyone whose status we follow and who may see ours: contacts and the members
+    /// of our groups.
+    fn presence_peers(&self) -> std::collections::HashSet<EndpointId> {
+        let mut s: std::collections::HashSet<EndpointId> = self.contacts.keys().copied().collect();
+        for g in self.groups.values() {
+            s.extend(g.members.iter().map(|m| m.id));
+        }
+        s.remove(&self.me);
+        s
+    }
+
+    fn knows(&self, peer: &EndpointId) -> bool {
+        self.contacts.contains_key(peer) || self.groups.values().any(|g| g.members.iter().any(|m| &m.id == peer))
+    }
+
+    /// What we tell `peer`: our status, and our group call if they're in that group.
+    fn my_presence_for(&self, peer: &EndpointId) -> PresenceMsg {
+        let status = match self.status {
             Status::Online => Presence::Online,
             Status::DoNotDisturb => Presence::DoNotDisturb,
-            Status::Invisible => Presence::Offline,
-        }
+            Status::Invisible => return PresenceMsg::offline(),
+        };
+        let call = match self.call.as_ref().map(|c| c.room) {
+            Some(RoomKey::Group(r)) if self.groups.get(&r).is_some_and(|g| g.members.iter().any(|m| &m.id == peer)) => {
+                Some(CallPresence { room: r, state: self.my_state })
+            }
+            _ => None,
+        };
+        PresenceMsg { status, call }
     }
 
-    fn set_presence(&mut self, peer: EndpointId, p: Presence) {
+    fn set_presence(&mut self, peer: EndpointId, p: PresenceMsg) {
         if self.presence.insert(peer, p) != Some(p) {
-            debug!("{} is {p:?}", peer.fmt_short());
-            self.emit(UiEvent::Presence { id: peer, presence: p });
+            debug!("{} is {:?}{}", peer.fmt_short(), p.status, if p.call.is_some() { " (in a group call)" } else { "" });
+            self.emit(UiEvent::Presence { id: peer, presence: p.status, call: p.call });
         }
     }
 
-    /// Checks a contact's status, telling them ours on the way.
+    /// Checks someone's status, telling them ours on the way.
     fn probe(&mut self, peer: EndpointId) {
         if !self.probing.insert(peer) {
             return;
         }
-        let (ep, itx, mine) = (self.ep.clone(), self.itx.clone(), self.my_presence());
+        let (ep, itx, mine) = (self.ep.clone(), self.itx.clone(), self.my_presence_for(&peer));
         tokio::spawn(async move {
             let res = tokio::time::timeout(PRESENCE_TIMEOUT, async {
                 let conn = ep.connect(EndpointAddr::from(peer), PRESENCE_ALPN).await?;
                 let (mut send, mut recv) = conn.open_bi().await?;
                 write_small(&mut send, &mine).await?;
-                let theirs: Presence = read_small(&mut recv).await?;
+                let theirs: PresenceMsg = read_small(&mut recv).await?;
                 conn.close(0u32.into(), b"");
                 anyhow::Ok(theirs)
             })
@@ -1133,24 +1156,34 @@ impl Engine {
         });
     }
 
-    /// A contact checked on us. Only contacts get an answer, and nobody does while
-    /// we're invisible (we look offline).
-    fn on_presence_probe(&mut self, conn: Connection, mut send: SendStream, theirs: Presence) {
+    /// Tells everyone our current status right away (checks under way carry the old one,
+    /// so they're redone afterwards).
+    fn announce(&mut self) {
+        self.reprobe.extend(self.probing.iter().copied());
+        self.last_probe = Some(Instant::now());
+        for id in self.presence_peers() {
+            self.probe(id);
+        }
+    }
+
+    /// Someone checked on us. Only contacts and group members get an answer, and
+    /// nobody does while we're invisible (we look offline).
+    fn on_presence_probe(&mut self, conn: Connection, mut send: SendStream, theirs: PresenceMsg) {
         let peer = conn.remote_id();
-        if !self.contacts.contains_key(&peer) {
+        if !self.knows(&peer) {
             conn.close(CLOSE_DECLINE.into(), b"");
             return;
         }
         let now = Instant::now();
-        let recent = self.probed_by.get(&peer).is_some_and(|t| now.duration_since(*t) < Duration::from_secs(5));
+        let flood = self.probed_by.get(&peer).is_some_and(|t| now.duration_since(*t) < Duration::from_secs(1));
         self.probed_by.insert(peer, now);
-        // Their check tells us they're around (unless they're invisible).
+        // Their check tells us how they are (offline if they're invisible).
         self.set_presence(peer, theirs);
-        if recent || self.status == Status::Invisible {
+        if flood || self.status == Status::Invisible {
             conn.close(CLOSE_DECLINE.into(), b"");
             return;
         }
-        let mine = self.my_presence();
+        let mine = self.my_presence_for(&peer);
         tokio::spawn(async move {
             let _ = write_small(&mut send, &mine).await;
             let _ = send.finish();
@@ -1159,10 +1192,15 @@ impl Engine {
     }
 
     fn on_tick(&mut self) {
-        if self.last_probe.is_none_or(|t| t.elapsed() >= PRESENCE_INTERVAL) {
+        // Re-announce at once when our status, group call or mute/deafen/sharing changes,
+        // so group members see who's in a call nearly live; otherwise check every 30 s.
+        let now_state = (self.status, self.call.as_ref().map(|c| c.room), self.my_state);
+        if self.announced != Some(now_state) {
+            self.announced = Some(now_state);
+            self.announce();
+        } else if self.last_probe.is_none_or(|t| t.elapsed() >= PRESENCE_INTERVAL) {
             self.last_probe = Some(Instant::now());
-            let ids: Vec<EndpointId> = self.contacts.keys().copied().collect();
-            for id in ids {
+            for id in self.presence_peers() {
                 self.probe(id);
             }
         }
@@ -1459,7 +1497,7 @@ mod tests {
         a.directory(&[&b], vec![]);
         b.directory(&[&a], vec![]);
         c.directory(&[&b], vec![]);
-        let want = |id: EndpointId, p: Presence| move |e: &UiEvent| matches!(e, UiEvent::Presence { id: i, presence } if *i == id && *presence == p).then_some(());
+        let want = |id: EndpointId, p: Presence| move |e: &UiEvent| matches!(e, UiEvent::Presence { id: i, presence, .. } if *i == id && *presence == p).then_some(());
         a.expect("bob online", want(b.id, Presence::Online)).await;
         b.expect("alice online", want(a.id, Presence::Online)).await;
 
@@ -1474,7 +1512,7 @@ mod tests {
         a.expect("bob back online", want(b.id, Presence::Online)).await;
         let seen = tokio::time::timeout(Duration::from_secs(8), async {
             loop {
-                if let Ok(UiEvent::Presence { id, presence }) = c.rx.recv().await {
+                if let Ok(UiEvent::Presence { id, presence, .. }) = c.rx.recv().await {
                     if id == b.id && presence != Presence::Offline {
                         return presence;
                     }
@@ -1483,6 +1521,50 @@ mod tests {
         })
         .await;
         assert!(seen.is_err(), "a non-contact learned Bob's status: {seen:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs internet (n0 relays + discovery)"]
+    async fn group_call_presence() {
+        let _ = tracing_subscriber::fmt().with_env_filter("parley=debug").try_init();
+        let (a, b, c) = tokio::join!(node("alice"), node("bob"), node("carol"));
+        let g = Group::new(
+            "trip".into(),
+            vec![Member { id: a.id, name: "alice".into() }, Member { id: b.id, name: "bob".into() }],
+        );
+        let room = g.room_id();
+        // Carol and Bob are contacts, but Carol isn't in the group.
+        a.directory(&[], vec![g.clone()]);
+        b.directory(&[&c], vec![g.clone()]);
+        c.directory(&[&b], vec![]);
+
+        // Bob starts the group call alone ("waiting"), muted and sharing his screen.
+        b.net.send(NetCmd::MediaState(MediaState { mic_muted: true, screen: true, ..Default::default() }));
+        b.net.send(NetCmd::JoinGroup(room));
+        let st = a
+            .expect("bob in the group call", |e| match e {
+                UiEvent::Presence { id, call: Some(cp), .. } if *id == b.id && cp.room == room => Some(cp.state),
+                _ => None,
+            })
+            .await;
+        assert!(st.mic_muted && st.screen);
+
+        // Carol sees Bob online but never which call he's in.
+        let leaked = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if let Ok(UiEvent::Presence { id, call: Some(_), .. }) = c.rx.recv().await {
+                    if id == b.id {
+                        return;
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(leaked.is_err(), "a non-member learned about the group call");
+
+        // Hanging up clears it for Alice.
+        b.net.send(NetCmd::Hangup);
+        a.expect("bob left the call", |e| matches!(e, UiEvent::Presence { id, call: None, .. } if *id == b.id).then_some(())).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

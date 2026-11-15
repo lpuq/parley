@@ -26,6 +26,55 @@ pub enum Presence {
     Offline,
 }
 
+/// Someone's status plus, while they're in a group call, which one and how they are
+/// in it (muted, deafened, sharing). The call part is only told to that group's members.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PresenceMsg {
+    pub status: Presence,
+    pub call: Option<CallPresence>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallPresence {
+    #[serde(with = "hex_room")]
+    pub room: RoomId,
+    pub state: MediaState,
+}
+
+/// On the wire: a bare status (what Parley 0.2/0.3 sends and understands) or, during a
+/// group call, `{status, call}`.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum PresenceWire {
+    Bare(Presence),
+    Full { status: Presence, call: Option<CallPresence> },
+}
+
+impl Serialize for PresenceMsg {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self.call {
+            None => PresenceWire::Bare(self.status),
+            Some(c) => PresenceWire::Full { status: self.status, call: Some(c) },
+        }
+        .serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for PresenceMsg {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(match PresenceWire::deserialize(d)? {
+            PresenceWire::Bare(status) => PresenceMsg { status, call: None },
+            PresenceWire::Full { status, call } => PresenceMsg { status, call },
+        })
+    }
+}
+
+impl PresenceMsg {
+    pub fn offline() -> Self {
+        Self { status: Presence::Offline, call: None }
+    }
+}
+
 /// Writes one small length-prefixed JSON message (presence exchange).
 pub async fn write_small<T: Serialize>(s: &mut iroh::endpoint::SendStream, msg: &T) -> Result<()> {
     let body = serde_json::to_vec(msg)?;
@@ -274,5 +323,24 @@ mod name_tests {
         assert_eq!(clean_name("  Alice\n\tSmith\u{7}  "), "Alice Smith");
         assert_eq!(clean_name(&"x".repeat(100)).chars().count(), super::MAX_NAME_CHARS + 1);
         assert_eq!(clean_name("<b>Bob</b>"), "<b>Bob</b>"); // escaping is the UI's job
+    }
+}
+
+#[cfg(test)]
+mod presence_tests {
+    use super::*;
+
+    #[test]
+    fn presence_wire_is_compatible() {
+        let bare = PresenceMsg { status: Presence::Online, call: None };
+        assert_eq!(serde_json::to_string(&bare).unwrap(), "\"Online\"");
+        let back: PresenceMsg = serde_json::from_str("\"DoNotDisturb\"").unwrap();
+        assert_eq!(back, PresenceMsg { status: Presence::DoNotDisturb, call: None });
+        let full = PresenceMsg {
+            status: Presence::Online,
+            call: Some(CallPresence { room: [7; 32], state: MediaState { mic_muted: true, screen: true, ..Default::default() } }),
+        };
+        let json = serde_json::to_string(&full).unwrap();
+        assert_eq!(serde_json::from_str::<PresenceMsg>(&json).unwrap(), full);
     }
 }

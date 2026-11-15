@@ -1,7 +1,9 @@
 # Parley
-Private voice, video and screen-share calls (with application audio!!!) for Linux, straight between friends.
-No accounts, no port forwarding, and no server you have to run or pay for.
-Seriously, it's weird how many of these video calling apps exist and next-to-none of them can stream application/desktop audio.
+
+Private voice, video and screen-share calls for Linux, straight between friends,
+including your desktop or individual apps' audio when you share your screen, which
+few calling apps on Linux can do. No accounts, no port forwarding, and no server you
+have to run or pay for.
 
 ![A Parley call: Bob shares a slide while he and Alice talk](docs/screenshot.png)
 
@@ -14,9 +16,10 @@ Seriously, it's weird how many of these video calling apps exist and next-to-non
   you're contacts. Groups get their own code, which is only needed for people who
   aren't already your contacts.
 - **Discord-style call screen**: video tiles with green speaking rings, click-to-focus,
-  double-click for fullscreen, mute/deafen, mic and camera pickers, and previews of
-  what you're sending. Right-click a person or a stream for its volume, mute, full
-  screen and Stop watching. Chimes when people join and leave.
+  double-click (or **F**) to fill the window with a stream, mute/deafen, mic and
+  camera pickers, and previews of what you're sending. Right-click a person or a
+  stream for its volume, mute, fill-window and Stop watching. Chimes when people join
+  and leave.
 - **Clean voice.** *Voice Isolation* (default) uses neural noise suppression
   (RNNoise) to remove keyboards, desk knocks, chewing and mic rubbing, transmits only
   while you speak, and evens out your loudness so you stay audible when you lean back.
@@ -24,10 +27,12 @@ Seriously, it's weird how many of these video calling apps exist and next-to-non
   input sensitivity (−100 to 0 dB) against a live level meter. *Hear yourself* plays
   your processed mic back a second later.
 - **Online status.** See which friends are online or on Do Not Disturb (calls arrive
-  silently), and go Invisible to look offline.
+  silently), and go Invisible to look offline. Group calls list who's in them under
+  the group, with a red LIVE badge for anyone sharing their screen and their
+  mute/deafen state, so you can see who's there before joining.
 - **Screen share with app audio.** Share all desktop audio or only chosen apps.
   Parley's own audio (your friends' voices) is never captured, so there's no echo.
-  Pick resolution (720p–1440p) and frame rate (15–60 fps) separately; when the
+  Pick resolution (480p–1440p) and frame rate (24, 30, 60 or custom) separately; when the
   connection can't keep up, the bitrate drops on the fly so motion stays smooth.
 - **Resilient groups.** Someone dropping out doesn't end the call for everyone else.
   Parley reconnects automatically after network blips, and anyone can rejoin with one
@@ -126,7 +131,8 @@ flatpak install --user parley-x86_64.flatpak
    everyone. Friends who are your contacts don't need any code. For anyone else,
    use **Copy invite code** or **Show invite QR code** on the group. Later, anyone in the group presses **Join**
    to start or rejoin the call.
-5. **In a call:** **M** mutes and **D** deafens. Use the arrows next to the mic and
+5. **In a call:** **M** mutes, **D** deafens, **F** fills the window with a stream and
+   **F11** toggles full screen. Use the arrows next to the mic and
    camera buttons to switch devices. The screen button opens the share options
    (quality, sound), then your desktop's own window/screen picker.
 
@@ -191,8 +197,10 @@ automatically.
   ramps), and an automatic gain that learns your speech level from voiced frames only
   and steers it to −20 dBFS (up to +24 dB), followed by a limiter.
 - **Online status:** every 30 s Parley opens a tiny separate connection
-  (`parley-presence/1`) to each contact to exchange status. It only answers people in
-  your contacts, and doesn't answer at all while you're Invisible.
+  (`parley-presence/1`) to each contact and group member to exchange status, and
+  re-announces within two seconds when your status, group call, or mute/deafen/sharing
+  changes. Which group call you're in is only told to that group's members. It only
+  answers contacts and group members, and doesn't answer at all while you're Invisible.
 
 ## Privacy and security
 

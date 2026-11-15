@@ -229,6 +229,7 @@ impl CallView {
                 gtk::gdk::Key::d => a.toggle_deafen(),
                 gtk::gdk::Key::Escape if a.call_view.immersive.get() => a.call_view.set_immersive(&a, None),
                 gtk::gdk::Key::Escape if a.window.is_fullscreen() => a.window.unfullscreen(),
+                gtk::gdk::Key::f | gtk::gdk::Key::F => a.call_view.toggle_fill(&a),
                 _ => return glib::Propagation::Proceed,
             }
             glib::Propagation::Stop
@@ -241,7 +242,7 @@ impl CallView {
         &self.root
     }
 
-    /// Full screen with just one tile (a stream, usually); `None` goes back.
+    /// One tile (a stream, usually) fills the window; `None` goes back.
     pub fn set_immersive(&self, app: &Rc<App>, key: Option<TileKey>) {
         let on = key.is_some();
         if let Some(k) = key {
@@ -259,14 +260,29 @@ impl CallView {
         if on {
             self.sidebar_before.set(app.split.shows_sidebar());
             app.split.set_show_sidebar(false);
-            app.window.fullscreen();
-            app.toast("Full screen — press Esc or double-click to exit");
+            app.toast("Press F or Esc to exit · F11 for full screen");
         } else {
-            app.window.unfullscreen();
             app.split.set_show_sidebar(self.sidebar_before.get());
             app.sync_sidebar();
         }
         self.relayout(app);
+    }
+
+    /// F: fill the window with the focused tile, or else the first shared screen.
+    pub fn toggle_fill(&self, app: &Rc<App>) {
+        if self.immersive.get() {
+            self.set_immersive(app, None);
+            return;
+        }
+        let order = self.order.borrow().clone();
+        let key = self
+            .focus
+            .get()
+            .or_else(|| order.iter().copied().find(|k| matches!(k, TileKey::Screen(Some(_)))))
+            .or_else(|| order.iter().copied().find(|k| matches!(k, TileKey::Screen(_))));
+        if let Some(k) = key {
+            self.set_immersive(app, Some(k));
+        }
     }
 
     pub fn is_immersive(&self) -> bool {
@@ -482,7 +498,7 @@ impl CallView {
         if let TileKey::Screen(_) = key {
             let fs = gtk::Button::builder()
                 .icon_name("view-fullscreen-symbolic")
-                .tooltip_text("Full screen")
+                .tooltip_text("Fill window (F) · F11 for full screen")
                 .css_classes(["osd", "circular", "tile-menu"])
                 .build();
             let a = self.app.clone();
@@ -614,7 +630,7 @@ impl CallView {
         let mute = gtk::CheckButton::with_label(if stream { "Mute stream" } else { "Mute" });
         let action = gtk::Button::new();
         action.add_css_class("flat");
-        let full = gtk::Button::with_label("Full screen");
+        let full = gtk::Button::with_label("Fill window (F)");
         full.add_css_class("flat");
         b.append(&lbl);
         b.append(&scale);
