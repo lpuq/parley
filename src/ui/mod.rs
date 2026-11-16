@@ -1059,6 +1059,45 @@ impl App {
         self.start_audio();
     }
 
+    /// Starts capturing the picked screen. With `gpu_import`, GPU (DMA-BUF) frames are
+    /// imported through GL; if that fails, capture restarts once on shared-memory
+    /// frames, which every compositor supports. Other failures end the share rather
+    /// than leaving friends on a black tile.
+    fn start_screen_capture(
+        self: &Rc<Self>,
+        fd: Option<std::os::fd::OwnedFd>,
+        node_id: u32,
+        size: Option<(i32, i32)>,
+        gpu_import: bool,
+    ) -> anyhow::Result<()> {
+        let settings = self.store.borrow().settings.clone();
+        let spare = RefCell::new(fd.as_ref().and_then(|f| f.try_clone().ok()));
+        let weak = Rc::downgrade(self);
+        let on_error = move |msg: String| {
+            let Some(t) = weak.upgrade() else { return };
+            if !t.state.get().screen {
+                return;
+            }
+            if gpu_import {
+                tracing::warn!("screen: GPU frame import failed ({msg}); capturing through shared memory instead");
+                let fd = spare.borrow_mut().take();
+                // Replace the failed capture after this error callback returns.
+                glib::idle_add_local_once(move || {
+                    if let Err(e) = t.start_screen_capture(fd, node_id, size, false) {
+                        t.toast(&format!("Screen sharing stopped — {e:#}"));
+                        t.stop_screen_share();
+                    }
+                });
+                return;
+            }
+            t.toast(&format!("Screen sharing stopped — {msg}"));
+            t.stop_screen_share();
+        };
+        let s = VideoSender::screen(self.hub.clone(), fd, node_id, size, settings.screen_params(), settings.hw_encode, gpu_import, on_error)?;
+        self.media.borrow_mut().screen = Some(s);
+        Ok(())
+    }
+
     /// Pushes the voice settings to the running microphone (no restart needed).
     pub fn apply_voice(&self) {
         let c = self.store.borrow().settings.voice_config();
@@ -1401,37 +1440,12 @@ impl App {
                 let _ = pick.stop.send(());
                 return;
             }
-            let settings = t.store.borrow().settings.clone();
-            // If capture breaks, end the share instead of leaving friends on a black tile.
-            let weak = Rc::downgrade(&t);
-            let on_error = move |msg: String| {
-                if let Some(t) = weak.upgrade() {
-                    t.toast(&format!("Screen sharing stopped — {msg}"));
-                    if t.state.get().screen {
-                        t.stop_screen_share();
-                    }
-                }
-            };
-            match VideoSender::screen(
-                t.hub.clone(),
-                pick.fd,
-                pick.node_id,
-                pick.size,
-                settings.screen_params(),
-                settings.hw_encode,
-                on_error,
-            ) {
-                Ok(s) => {
-                    let mut m = t.media.borrow_mut();
-                    m.screen = Some(s);
-                    m.screen_stop = Some(pick.stop);
-                }
-                Err(e) => {
-                    let _ = pick.stop.send(());
-                    t.toast(&format!("Screen share failed: {e:#}"));
-                    return;
-                }
+            if let Err(e) = t.start_screen_capture(pick.fd, pick.node_id, pick.size, true) {
+                let _ = pick.stop.send(());
+                t.toast(&format!("Screen share failed: {e:#}"));
+                return;
             }
+            t.media.borrow_mut().screen_stop = Some(pick.stop);
             let mut st = t.state.get();
             st.screen = true;
             st.screen_audio = audio != AudioShare::Off;

@@ -667,6 +667,7 @@ impl VideoSender {
         size: Option<(i32, i32)>,
         quality: (u32, u32, u32),
         hw: bool,
+        gpu_import: bool,
         on_error: impl Fn(String) + 'static,
     ) -> Result<Self> {
         let (max_h, fps, kbps) = quality;
@@ -680,8 +681,11 @@ impl VideoSender {
         // Compositors (niri, GNOME, KDE…) usually hand out GPU (DMA-BUF) frames, often
         // tiled. Reading those directly with the CPU gives black/garbage, so import them
         // through GL and download a normal image. Shared-memory frames pass through too.
+        // Some GPU buffers can't be imported (e.g. AMD's compressed DCC layouts, when
+        // the GL driver lacks that modifier); then `gpu_import` is false and the
+        // compositor is asked for ordinary shared-memory frames instead.
         let mut head_chain: Vec<gst::Element> = Vec::new();
-        if has("glupload") && has("glcolorconvert") && has("gldownload") {
+        if gpu_import && has("glupload") && has("glcolorconvert") && has("gldownload") {
             head_chain.push(make("glupload")?);
             head_chain.push(make("glcolorconvert")?);
             head_chain.push(make("gldownload")?);
@@ -803,6 +807,15 @@ impl VideoSender {
             }
         })?;
 
+        // Test hook: pretend the GPU import failed (exercises the shared-memory fallback).
+        if gpu_import && std::env::var_os("PARLEY_TEST_FAIL_GPU_IMPORT").is_some() {
+            let p = pipeline.downgrade();
+            gtk::glib::timeout_add_seconds_local_once(1, move || {
+                if let Some(p) = p.upgrade() {
+                    let _ = p.post_message(gst::message::Error::builder(gst::CoreError::Failed, "test: GPU import failed").src(&p).build());
+                }
+            });
+        }
         let mut run = Running::start(pipeline, "Screen share", on_error)?;
         // The portal's PipeWire connection must outlive the pipeline.
         if let Some(fd) = fd {

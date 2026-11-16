@@ -10,7 +10,7 @@ fn main() {
     let w: i32 = a.next().map(|v| v.parse().unwrap()).unwrap_or(1920);
     let h: i32 = a.next().map(|v| v.parse().unwrap()).unwrap_or(1080);
     let hub = parley::hub::Hub::new();
-    let s = parley::media::send::VideoSender::screen(hub, None, node, Some((w, h)), (1080, 30, 4500), true, |e| {
+    let s = parley::media::send::VideoSender::screen(hub, None, node, Some((w, h)), (1080, 30, 4500), true, true, |e| {
         eprintln!("PIPELINE ERROR: {e}")
     })
     .unwrap();
