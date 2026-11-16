@@ -31,6 +31,15 @@
     <content_attribute id="social-audio">intense</content_attribute>
   </content_rating>
   <releases>
+    <release version="0.4.3" date="2026-11-16">
+      <description>
+        <ul>
+          <li>Unique pictures (identicons) and name tags like alice#f3a7, derived from each identity's key, so people with the same name can be told apart</li>
+          <li>User info for each contact: full key and contact code, date added, status and Parley version</li>
+          <li>Parley's version shown at the top of the sidebar; friends' versions in User info and on their call tile</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.4.2" date="2026-11-16">
       <description>
         <ul>

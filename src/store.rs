@@ -76,6 +76,17 @@ pub fn random_bytes32() -> [u8; 32] {
 pub struct Contact {
     pub id: EndpointId,
     pub name: String,
+    /// When they were added (Unix seconds); unknown for contacts saved before 0.4.3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added: Option<u64>,
+}
+
+impl Contact {
+    /// A contact added now.
+    pub fn new(id: EndpointId, name: impl Into<String>) -> Self {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).ok();
+        Self { id, name: name.into(), added: now }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

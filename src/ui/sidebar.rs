@@ -6,6 +6,7 @@ use adw::prelude::*;
 use gtk::glib;
 
 use super::{App, dialogs};
+use super::identity;
 use crate::{
     proto::{MediaState, Presence, RoomKey},
     store::{ShareCode, Status},
@@ -19,6 +20,7 @@ pub struct Sidebar {
     friends_empty: gtk::Label,
     groups_empty: gtk::Label,
     me_row: adw::ActionRow,
+    me_avatar: adw::Avatar,
     status_dot: gtk::Box,
     status_label: gtk::Label,
 }
@@ -27,7 +29,8 @@ impl Sidebar {
     pub fn new(app: Weak<App>) -> Self {
         let root = adw::ToolbarView::new();
         let header = adw::HeaderBar::new();
-        header.set_title_widget(Some(&adw::WindowTitle::new("Parley", "")));
+        // The version, while Parley is young: makes "which version are you on?" easy.
+        header.set_title_widget(Some(&adw::WindowTitle::new("Parley", &format!("v{}", crate::proto::APP_VERSION))));
 
         let menu = gtk::gio::Menu::new();
         menu.append(Some("Add friend or group from code…"), Some("app.add-contact"));
@@ -48,6 +51,9 @@ impl Sidebar {
         root.add_top_bar(&header);
 
         let me_row = adw::ActionRow::builder().title("You").subtitle("Share your code so friends can call you").build();
+        let me_avatar = adw::Avatar::new(32, None, true);
+        me_avatar.set_valign(gtk::Align::Center);
+        me_row.add_prefix(&me_avatar);
         let copy = gtk::Button::builder()
             .icon_name("edit-copy-symbolic")
             .tooltip_text("Copy my code")
@@ -123,7 +129,7 @@ impl Sidebar {
             .build();
         root.set_content(Some(&scroll));
 
-        Self { app, root, friends, groups, friends_empty, groups_empty, me_row, status_dot, status_label }
+        Self { app, root, friends, groups, friends_empty, groups_empty, me_row, me_avatar, status_dot, status_label }
     }
 
     pub fn widget(&self) -> &adw::ToolbarView {
@@ -147,7 +153,10 @@ impl Sidebar {
             self.groups.remove(&c);
         }
         let st = app.store.borrow();
-        self.me_row.set_title(if st.my_name.is_empty() { "You" } else { &st.my_name });
+        let my_name = if st.my_name.is_empty() { "You" } else { &st.my_name };
+        self.me_row.set_title(&identity::tagged_markup(my_name, &app.me));
+        self.me_avatar.set_text(Some(my_name));
+        self.me_avatar.set_custom_image(Some(&identity::identicon(&app.me)));
         let (cls, text) = match st.settings.status {
             Status::Online => ("online", "Online"),
             Status::DoNotDisturb => ("dnd", "Do Not Disturb"),
@@ -168,12 +177,11 @@ impl Sidebar {
                 Presence::Offline => ("offline", "Offline"),
             };
             let row = adw::ActionRow::builder()
-                .title(glib::markup_escape_text(&c.name))
+                .title(identity::tagged_markup(&c.name, &c.id))
                 .subtitle(if in_call { "In call" } else { text })
-                .tooltip_text(c.id.fmt_short().to_string())
                 .build();
             let avatar = gtk::Overlay::new();
-            avatar.set_child(Some(&adw::Avatar::new(32, Some(&c.name), true)));
+            avatar.set_child(Some(&identity::avatar(32, &c.name, &c.id)));
             let dot = presence_dot();
             set_presence_class(&dot, if in_call { "online" } else { cls });
             dot.set_halign(gtk::Align::End);
@@ -255,7 +263,7 @@ impl Sidebar {
                         g.members.iter().find(|m| m.id == id).map(|m| m.name.clone()).unwrap_or_else(|| id.fmt_short().to_string())
                     })
                 };
-                self.groups.append(&call_member_row(&name, &ms));
+                self.groups.append(&call_member_row(&name, &id, &ms));
             }
         }
         self.friends_empty.set_visible(st.contacts.is_empty());
@@ -267,12 +275,21 @@ impl Sidebar {
     fn contact_menu(&self, id: iroh::EndpointId, name: String) -> gtk::MenuButton {
         let pop = gtk::Popover::new();
         let b = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        let info = flat_button("User info");
         let rename = flat_button("Rename…");
         let remove = flat_button("Remove");
         remove.add_css_class("error");
+        b.append(&info);
         b.append(&rename);
         b.append(&remove);
         pop.set_child(Some(&b));
+        let (a, p) = (self.app.clone(), pop.clone());
+        info.connect_clicked(move |_| {
+            p.popdown();
+            if let Some(a) = a.upgrade() {
+                dialogs::user_info(&a, id);
+            }
+        });
         let (a, n, p) = (self.app.clone(), name.clone(), pop.clone());
         rename.connect_clicked(move |_| {
             p.popdown();
@@ -417,14 +434,15 @@ fn set_presence_class(d: &gtk::Box, cls: &str) {
 }
 
 /// One person in a group call, shown under the group.
-fn call_member_row(name: &str, ms: &MediaState) -> gtk::ListBoxRow {
+fn call_member_row(name: &str, id: &iroh::EndpointId, ms: &MediaState) -> gtk::ListBoxRow {
     let b = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     b.set_margin_start(36);
     b.set_margin_end(12);
     b.set_margin_top(4);
     b.set_margin_bottom(4);
-    b.append(&adw::Avatar::new(24, Some(name), true));
-    let l = gtk::Label::new(Some(name));
+    b.append(&identity::avatar(24, name, id));
+    let l = gtk::Label::new(None);
+    l.set_markup(&identity::tagged_markup(name, id));
     l.set_xalign(0.0);
     l.set_hexpand(true);
     l.set_ellipsize(gtk::pango::EllipsizeMode::End);

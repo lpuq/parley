@@ -66,7 +66,7 @@ pub enum UiEvent {
     OutgoingRinging,
     CallActive { room: RoomKey },
     CallEnded { reason: String },
-    PeerJoined { id: EndpointId, name: String, state: MediaState },
+    PeerJoined { id: EndpointId, name: String, state: MediaState, app: String },
     PeerLeft { id: EndpointId },
     PeerReconnecting { id: EndpointId },
     PeerState { id: EndpointId, state: MediaState },
@@ -75,7 +75,7 @@ pub enum UiEvent {
     GroupUpdate { group: Group },
     MissedCall { from: EndpointId, name: String },
     /// A contact's online status (and group call, if any) changed.
-    Presence { id: EndpointId, presence: Presence, call: Option<CallPresence> },
+    Presence { id: EndpointId, presence: Presence, call: Option<CallPresence>, app: Option<String> },
     Notice(String),
 }
 
@@ -221,6 +221,8 @@ struct Session {
     conn: Option<Connection>,
     ctrl: Option<mpsc::UnboundedSender<Ctrl>>,
     peer_name: String,
+    /// Their Parley version, from Hello/Accept (empty before 0.4.3).
+    peer_app: String,
     peer_state: MediaState,
     invite: Option<Invite>,
     media: Vec<JoinHandle<()>>,
@@ -476,7 +478,7 @@ impl Engine {
         for sid in live {
             let proof = self.acceptor_proof(sid);
             if let Some(s) = self.sessions.get(&sid) {
-                s.send(Ctrl::Accept { name: self.my_name.clone(), proof, state: self.my_state });
+                s.send(Ctrl::Accept { name: self.my_name.clone(), proof, state: self.my_state, app: APP_VERSION.into() });
             }
             self.activate(sid);
         }
@@ -507,6 +509,7 @@ impl Engine {
                 conn: None,
                 ctrl: None,
                 peer_name: self.name_of(&peer),
+                peer_app: String::new(),
                 peer_state: MediaState::default(),
                 invite: None,
                 media: Vec::new(),
@@ -537,6 +540,7 @@ impl Engine {
             proof,
             invite,
             state: self.my_state,
+            app: APP_VERSION.into(),
         };
         let ep = self.ep.clone();
         let itx = self.itx.clone();
@@ -632,7 +636,7 @@ impl Engine {
     }
 
     fn on_incoming(&mut self, conn: Connection, send: SendStream, recv: RecvStream, hello: Ctrl) {
-        let Ctrl::Hello { version, name, room, proof, invite, state } = hello else { return };
+        let Ctrl::Hello { version, name, room, proof, invite, state, app } = hello else { return };
         let peer = conn.remote_id();
         info!("incoming call from {name} ({})", peer.fmt_short());
         if version != PROTO_VERSION {
@@ -734,13 +738,14 @@ impl Engine {
                 s.peer_name = name.clone();
             }
             s.peer_state = state;
+            s.peer_app = app;
             s.invite = accepted_invite.clone();
         }
         self.attach_conn(sid, conn, send, recv);
 
         if in_this_call {
             let proof = self.acceptor_proof(sid);
-            self.sessions[&sid].send(Ctrl::Accept { name: self.my_name.clone(), proof, state: self.my_state });
+            self.sessions[&sid].send(Ctrl::Accept { name: self.my_name.clone(), proof, state: self.my_state, app: APP_VERSION.into() });
             self.activate(sid);
             return;
         }
@@ -820,7 +825,7 @@ impl Engine {
                     self.emit(UiEvent::OutgoingRinging);
                 }
             }
-            Ctrl::Accept { name, proof, state } => {
+            Ctrl::Accept { name, proof, state, app } => {
                 if s.phase != Phase::AwaitingAnswer {
                     return;
                 }
@@ -840,6 +845,7 @@ impl Engine {
                     s.peer_name = name;
                 }
                 s.peer_state = state;
+                s.peer_app = app;
                 let mut became_active = None;
                 if let Some(call) = &mut self.call {
                     if call.outgoing {
@@ -984,7 +990,7 @@ impl Engine {
         };
         self.hub.add_peer(peer, Arc::new(out));
 
-        let (name, state, room) = (s.peer_name.clone(), s.peer_state, s.room);
+        let (name, state, room, app) = (s.peer_name.clone(), s.peer_state, s.room, s.peer_app.clone());
         s.send(Ctrl::State(self.my_state));
 
         // Record membership.
@@ -1003,7 +1009,7 @@ impl Engine {
                 }
             }
         }
-        self.emit(UiEvent::PeerJoined { id: peer, name, state });
+        self.emit(UiEvent::PeerJoined { id: peer, name, state, app });
     }
 
     fn roster(&self) -> Vec<Member> {
@@ -1122,13 +1128,14 @@ impl Engine {
             }
             _ => None,
         };
-        PresenceMsg { status, call }
+        PresenceMsg { status, call, app: Some(APP_VERSION.into()) }
     }
 
     fn set_presence(&mut self, peer: EndpointId, p: PresenceMsg) {
-        if self.presence.insert(peer, p) != Some(p) {
+        if self.presence.get(&peer) != Some(&p) {
             debug!("{} is {:?}{}", peer.fmt_short(), p.status, if p.call.is_some() { " (in a group call)" } else { "" });
-            self.emit(UiEvent::Presence { id: peer, presence: p.status, call: p.call });
+            self.emit(UiEvent::Presence { id: peer, presence: p.status, call: p.call, app: p.app.clone() });
+            self.presence.insert(peer, p);
         }
     }
 
@@ -1466,7 +1473,7 @@ mod tests {
         fn directory(&self, contacts: &[&Node], groups: Vec<Group>) {
             self.net.send(NetCmd::Directory {
                 my_name: self.name.clone(),
-                contacts: contacts.iter().map(|n| Contact { id: n.id, name: n.name.clone() }).collect(),
+                contacts: contacts.iter().map(|n| Contact::new(n.id, n.name.clone())).collect(),
                 groups,
                 allow_unknown: true,
             });

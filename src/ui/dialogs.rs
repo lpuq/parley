@@ -803,3 +803,69 @@ fn set_autostart(on: bool) -> std::io::Result<()> {
         Ok(())
     }
 }
+
+/// A contact's details: picture, name#tag, full key and contact code, when they were
+/// added, their status and Parley version.
+pub fn user_info(app: &Rc<App>, id: iroh::EndpointId) {
+    use super::identity;
+    let Some(c) = app.store.borrow().contact(&id).cloned() else { return };
+    let d = adw::Dialog::new();
+    d.set_title("User info");
+    d.set_content_width(440);
+    let tv = adw::ToolbarView::new();
+    tv.add_top_bar(&adw::HeaderBar::new());
+
+    let page = adw::PreferencesPage::new();
+    let top = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    top.set_margin_bottom(12);
+    top.append(&identity::avatar(96, &c.name, &id));
+    let title = gtk::Label::new(None);
+    title.set_markup(&identity::tagged_markup(&c.name, &id));
+    title.add_css_class("title-2");
+    top.append(&title);
+    let status = gtk::Label::new(Some(match app.presence_of(&id) {
+        crate::proto::Presence::Online => "Online",
+        crate::proto::Presence::DoNotDisturb => "Do not disturb",
+        crate::proto::Presence::Offline => "Offline",
+    }));
+    status.add_css_class("dim-label");
+    top.append(&status);
+    let head = adw::PreferencesGroup::new();
+    head.add(&top);
+    page.add(&head);
+
+    let g = adw::PreferencesGroup::new();
+    let key = id.to_string();
+    let key_row = adw::ActionRow::builder()
+        .title("Identity key")
+        .subtitle(&key)
+        .subtitle_selectable(true)
+        .build();
+    key_row.add_css_class("property");
+    let copy_key = gtk::Button::builder().icon_name("edit-copy-symbolic").tooltip_text("Copy key").valign(gtk::Align::Center).css_classes(["flat"]).build();
+    let (a, k) = (app.clone(), key.clone());
+    copy_key.connect_clicked(move |_| a.copy(&k, "Identity key"));
+    key_row.add_suffix(&copy_key);
+    g.add(&key_row);
+
+    let code = ShareCode::Contact { n: c.name.clone(), k: id }.encode();
+    let code_row = adw::ActionRow::builder().title("Contact code").subtitle(code.chars().take(32).collect::<String>() + "…").build();
+    let copy_code = gtk::Button::builder().icon_name("edit-copy-symbolic").tooltip_text("Copy contact code").valign(gtk::Align::Center).css_classes(["flat"]).build();
+    let a = app.clone();
+    copy_code.connect_clicked(move |_| a.copy(&code, "Contact code"));
+    code_row.add_suffix(&copy_code);
+    g.add(&code_row);
+
+    let added = match c.added.and_then(|t| glib::DateTime::from_unix_local(t as i64).ok()) {
+        Some(dt) => dt.format("%e %B %Y").map(|s| s.trim().to_string()).unwrap_or_default(),
+        None => "Before Parley 0.4.3 (not recorded)".to_string(),
+    };
+    g.add(&adw::ActionRow::builder().title("Added").subtitle(&added).css_classes(["property"]).build());
+    let version = app.version_of(&id).map(|v| format!("Parley {v}")).unwrap_or_else(|| "Unknown (not seen yet, or older than 0.4.3)".into());
+    g.add(&adw::ActionRow::builder().title("Version").subtitle(&version).css_classes(["property"]).build());
+    page.add(&g);
+
+    tv.set_content(Some(&page));
+    d.set_child(Some(&tv));
+    d.present(Some(&app.window));
+}

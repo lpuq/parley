@@ -2,6 +2,7 @@
 
 mod callview;
 mod dialogs;
+pub mod identity;
 mod qr;
 mod sidebar;
 mod tray;
@@ -114,6 +115,8 @@ pub struct App {
     presence: RefCell<HashMap<EndpointId, Presence>>,
     /// Who's in which group call (as told by group members), with their mute/deafen/share.
     call_presence: RefCell<HashMap<EndpointId, CallPresence>>,
+    /// Others' Parley versions, as last told (calls and status checks; 0.4.3+).
+    versions: RefCell<HashMap<EndpointId, String>>,
 }
 
 impl App {
@@ -194,6 +197,7 @@ impl App {
             mic_playback: Cell::new(false),
             presence: RefCell::new(HashMap::new()),
             call_presence: RefCell::new(HashMap::new()),
+            versions: RefCell::new(HashMap::new()),
         });
 
         // ----- layout -----
@@ -655,7 +659,7 @@ impl App {
             // call back, without a second code exchange.
             let unknown = self.store.borrow().contact(&inc.from).is_none() && inc.from != self.me;
             if unknown {
-                self.store.borrow_mut().contacts.push(Contact { id: inc.from, name: inc.name.clone() });
+                self.store.borrow_mut().contacts.push(Contact::new(inc.from, inc.name.clone()));
                 self.save();
                 self.sidebar.refresh(self);
                 self.update_home();
@@ -685,7 +689,7 @@ impl App {
             if let Some(c) = st.contacts.iter_mut().find(|c| c.id == id) {
                 c.name = name.to_string();
             } else {
-                st.contacts.push(Contact { id, name: name.to_string() });
+                st.contacts.push(Contact::new(id, name));
             }
         }
         self.save();
@@ -742,7 +746,10 @@ impl App {
                     self.toast(&reason);
                 }
             }
-            UiEvent::PeerJoined { id, name, state } => {
+            UiEvent::PeerJoined { id, name, state, app } => {
+                if !app.is_empty() {
+                    self.versions.borrow_mut().insert(id, app);
+                }
                 {
                     let mut ps = self.participants.borrow_mut();
                     if let Some(p) = ps.iter_mut().find(|p| p.id == id) {
@@ -821,7 +828,10 @@ impl App {
                 }
             }
             UiEvent::Notice(msg) => self.toast(&msg),
-            UiEvent::Presence { id, presence, call } => {
+            UiEvent::Presence { id, presence, call, app } => {
+                if let Some(v) = app {
+                    self.versions.borrow_mut().insert(id, v);
+                }
                 self.presence.borrow_mut().insert(id, presence);
                 match call {
                     Some(c) => self.call_presence.borrow_mut().insert(id, c),
@@ -850,6 +860,11 @@ impl App {
         v
     }
 
+    /// Someone's Parley version, if they've told us (0.4.3 and later do).
+    pub fn version_of(&self, id: &EndpointId) -> Option<String> {
+        self.versions.borrow().get(id).cloned()
+    }
+
     /// A contact's last known status (offline until we hear otherwise).
     pub fn presence_of(&self, id: &EndpointId) -> Presence {
         self.presence.borrow().get(id).copied().unwrap_or(Presence::Offline)
@@ -869,12 +884,12 @@ impl App {
             old.dialog.force_close();
         }
         let known = self.store.borrow().contact(&from).is_some();
-        // A stranger chooses their own name, so it's tagged with their ID: "Mom" calling
-        // from an unknown ID shouldn't look like your contact Mom.
+        // Names carry their key's tag (and the picture is drawn from the key), so a
+        // stranger calling as "Mom" can't pass as your contact Mom.
         let shown = match self.store.borrow().contact(&from) {
-            Some(c) => c.name.clone(),
+            Some(c) => identity::tagged(&c.name, &from),
             None if name.is_empty() => from.fmt_short().to_string(),
-            None => format!("{name} ({})", from.fmt_short()),
+            None => identity::tagged(&name, &from),
         };
         let (heading, mut body) = match &group_name {
             Some(g) => (format!("{shown} is calling “{g}”"), "Group call".to_string()),
@@ -891,7 +906,7 @@ impl App {
         dialog.set_response_appearance("accept", adw::ResponseAppearance::Suggested);
         dialog.set_default_response(Some("accept"));
         dialog.set_close_response("decline");
-        let avatar = adw::Avatar::new(80, Some(&shown), true);
+        let avatar = identity::avatar(80, &shown, &from);
         avatar.set_margin_top(6);
         dialog.set_extra_child(Some(&avatar));
         let t = self.clone();

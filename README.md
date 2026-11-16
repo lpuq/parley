@@ -26,6 +26,10 @@ have to run or pay for.
   *Studio* sends your mic untouched; *Custom* lets you pick the suppression and set the
   input sensitivity (−100 to 0 dB) against a live level meter. *Hear yourself* plays
   your processed mic back a second later.
+- **Tell people apart.** Everyone has a picture (identicon) and a name tag like
+  `alice#f3a7`, both derived from their identity key, so two people (or two identities
+  on one computer) with the same name never look alike. A contact's ⋮ → *User info*
+  shows their full key, when you added them, and their Parley version.
 - **Online status.** See which friends are online or on Do Not Disturb (calls arrive
   silently), and go Invisible to look offline. Group calls list who's in them under
   the group, with a red LIVE badge for anyone sharing their screen and their

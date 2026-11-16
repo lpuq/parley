@@ -8,6 +8,8 @@ use std::{
 
 use adw::prelude::*;
 use gtk::glib;
+
+use super::identity;
 use iroh::EndpointId;
 
 use super::{App, dialogs};
@@ -344,19 +346,23 @@ impl CallView {
                 let t = &tiles[k];
                 match *k {
                     TileKey::User(None) => {
-                        set_tile(t, &format!("{my_name} (you)"), app.local_paintable(Track::Camera), st.mic_muted || st.deafened, false);
+                        set_tile(t, &my_name, &format!("{} (you)", identity::tagged_markup(&my_name, &app.me)), app.local_paintable(Track::Camera), st.mic_muted || st.deafened, false);
                         t.status.set_visible(false);
                         t.picture.set_content_fit(gtk::ContentFit::Cover);
                     }
                     TileKey::Screen(None) => {
-                        set_tile(t, "Your screen", app.local_paintable(Track::Screen), false, true);
+                        set_tile(t, &my_name, "Your screen", app.local_paintable(Track::Screen), false, true);
                         t.status.set_visible(false);
                     }
                     TileKey::User(Some(id)) => {
                         let p = parts.iter().find(|p| p.id == id).unwrap();
                         let name = app.store.borrow().contact(&id).map(|c| c.name.clone()).unwrap_or(p.name.clone());
                         let video = if p.state.camera { app.remote_paintable(&id, Track::Camera) } else { None };
-                        set_tile(t, &name, video, p.state.mic_muted || p.state.deafened, false);
+                        set_tile(t, &name, &identity::tagged_markup(&name, &id), video, p.state.mic_muted || p.state.deafened, false);
+                        t.name.set_tooltip_text(Some(&match app.version_of(&id) {
+                            Some(v) => format!("Parley {v}"),
+                            None => "Parley version unknown (older than 0.4.3)".to_string(),
+                        }));
                         t.picture.set_content_fit(gtk::ContentFit::Cover);
                         t.status.set_visible(p.reconnecting);
                         t.status.set_label("Reconnecting…");
@@ -368,7 +374,7 @@ impl CallView {
                     }
                     TileKey::Screen(Some(id)) => {
                         let name = app.display_name(&id);
-                        set_tile(t, &format!("{name}'s screen"), app.remote_paintable(&id, Track::Screen), false, true);
+                        set_tile(t, &name, &format!("{}'s screen", identity::tagged_markup(&name, &id)), app.remote_paintable(&id, Track::Screen), false, true);
                         t.status.set_visible(false);
                         if let Some(b) = &t.not_watching {
                             b.set_visible(!app.is_watching(&id));
@@ -456,7 +462,7 @@ impl CallView {
             None => app.store.borrow().my_name.clone(),
             Some(id) => app.display_name(&id),
         };
-        let avatar = adw::Avatar::new(88, Some(&label_name), true);
+        let avatar = identity::avatar(88, &label_name, &key.owner().unwrap_or(app.me));
         avatar.set_halign(gtk::Align::Center);
         avatar.set_valign(gtk::Align::Center);
         let base = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -853,9 +859,10 @@ impl CallView {
     }
 }
 
-fn set_tile(t: &Tile, name: &str, video: Option<gtk::gdk::Paintable>, muted: bool, screen: bool) {
-    t.name.set_label(name);
-    t.avatar.set_text(Some(name.trim_end_matches(" (you)").trim_end_matches("'s screen")));
+/// `name` is the plain name (for the avatar), `label` the tile's caption as markup.
+fn set_tile(t: &Tile, name: &str, label: &str, video: Option<gtk::gdk::Paintable>, muted: bool, screen: bool) {
+    t.name.set_markup(label);
+    t.avatar.set_text(Some(name));
     t.muted.set_visible(muted);
     t.avatar.set_visible(video.is_none() && !screen);
     // Video gets black bars around it, not the tile's grey.

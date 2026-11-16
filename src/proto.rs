@@ -28,10 +28,12 @@ pub enum Presence {
 
 /// Someone's status plus, while they're in a group call, which one and how they are
 /// in it (muted, deafened, sharing). The call part is only told to that group's members.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PresenceMsg {
     pub status: Presence,
     pub call: Option<CallPresence>,
+    /// Their Parley version (sent by 0.4.3 and later).
+    pub app: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,37 +43,38 @@ pub struct CallPresence {
     pub state: MediaState,
 }
 
-/// On the wire: a bare status (what Parley 0.2/0.3 sends and understands) or, during a
-/// group call, `{status, call}`.
+/// On the wire: `{status, call, app}`. Parley 0.2/0.3 sent (and only understand) a bare
+/// status, which is still accepted; 0.4.0–0.4.2 ignore the `app` field.
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum PresenceWire {
     Bare(Presence),
-    Full { status: Presence, call: Option<CallPresence> },
+    Full {
+        status: Presence,
+        call: Option<CallPresence>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        app: Option<String>,
+    },
 }
 
 impl Serialize for PresenceMsg {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        match self.call {
-            None => PresenceWire::Bare(self.status),
-            Some(c) => PresenceWire::Full { status: self.status, call: Some(c) },
-        }
-        .serialize(s)
+        PresenceWire::Full { status: self.status, call: self.call, app: self.app.clone() }.serialize(s)
     }
 }
 
 impl<'de> Deserialize<'de> for PresenceMsg {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         Ok(match PresenceWire::deserialize(d)? {
-            PresenceWire::Bare(status) => PresenceMsg { status, call: None },
-            PresenceWire::Full { status, call } => PresenceMsg { status, call },
+            PresenceWire::Bare(status) => PresenceMsg { status, call: None, app: None },
+            PresenceWire::Full { status, call, app } => PresenceMsg { status, call, app: app.map(|a| clean_version(&a)) },
         })
     }
 }
 
 impl PresenceMsg {
     pub fn offline() -> Self {
-        Self { status: Presence::Offline, call: None }
+        Self { status: Presence::Offline, call: None, app: None }
     }
 }
 
@@ -191,6 +194,9 @@ pub enum Ctrl {
         #[serde(default)]
         invite: Option<Invite>,
         state: MediaState,
+        /// Parley version (e.g. "0.4.3"); empty from versions before 0.4.3.
+        #[serde(default)]
+        app: String,
     },
     Ringing,
     Accept {
@@ -198,6 +204,8 @@ pub enum Ctrl {
         #[serde(default, with = "opt_hex_room")]
         proof: Option<[u8; 32]>,
         state: MediaState,
+        #[serde(default)]
+        app: String,
     },
     Decline(DeclineReason),
     State(MediaState),
@@ -247,6 +255,14 @@ pub fn clean_name(s: &str) -> String {
     out
 }
 
+/// This build's version, as told to others.
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// A version string from someone else: digits, dots and letters only, short.
+pub fn clean_version(s: &str) -> String {
+    s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+')).take(24).collect()
+}
+
 impl Ctrl {
     /// Applies [`clean_name`] to every name carried by the message.
     pub fn clean_names(&mut self) {
@@ -257,14 +273,18 @@ impl Ctrl {
             }
         };
         match self {
-            Ctrl::Hello { name, invite, .. } => {
+            Ctrl::Hello { name, invite, app, .. } => {
                 *name = clean_name(name);
+                *app = clean_version(app);
                 if let Some(i) = invite {
                     i.name = clean_name(&i.name);
                     fix_members(&mut i.members);
                 }
             }
-            Ctrl::Accept { name, .. } => *name = clean_name(name),
+            Ctrl::Accept { name, app, .. } => {
+                *name = clean_name(name);
+                *app = clean_version(app);
+            }
             Ctrl::Roster(m) => fix_members(m),
             _ => {}
         }
@@ -332,13 +352,16 @@ mod presence_tests {
 
     #[test]
     fn presence_wire_is_compatible() {
-        let bare = PresenceMsg { status: Presence::Online, call: None };
-        assert_eq!(serde_json::to_string(&bare).unwrap(), "\"Online\"");
+        // What Parley 0.2/0.3 send is still understood.
         let back: PresenceMsg = serde_json::from_str("\"DoNotDisturb\"").unwrap();
-        assert_eq!(back, PresenceMsg { status: Presence::DoNotDisturb, call: None });
+        assert_eq!(back, PresenceMsg { status: Presence::DoNotDisturb, call: None, app: None });
+        // What 0.4.0–0.4.2 send.
+        let old: PresenceMsg = serde_json::from_str("{\"status\":\"Online\",\"call\":null}").unwrap();
+        assert_eq!(old, PresenceMsg { status: Presence::Online, call: None, app: None });
         let full = PresenceMsg {
             status: Presence::Online,
             call: Some(CallPresence { room: [7; 32], state: MediaState { mic_muted: true, screen: true, ..Default::default() } }),
+            app: Some("0.4.3".into()),
         };
         let json = serde_json::to_string(&full).unwrap();
         assert_eq!(serde_json::from_str::<PresenceMsg>(&json).unwrap(), full);
