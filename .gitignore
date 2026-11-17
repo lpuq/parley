@@ -7,3 +7,6 @@ flatpak/repo/
 *.tar.gz
 *.raw
 *.wav
+*.mp4
+*.mkv
+*.webm

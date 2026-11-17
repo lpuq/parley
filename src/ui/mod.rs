@@ -127,6 +127,8 @@ pub struct App {
     chat_panel: gtk::Box,
     /// Peers we're delivering chat to right now (one delivery at a time each).
     chat_inflight: RefCell<std::collections::HashSet<EndpointId>>,
+    /// The sidebar was hidden to fit the chat panel beside a call.
+    sidebar_hidden_for_chat: Cell<bool>,
 }
 
 impl App {
@@ -214,6 +216,7 @@ impl App {
             chat_reveal: gtk::Revealer::new(),
             chat_panel: gtk::Box::new(gtk::Orientation::Vertical, 0),
             chat_inflight: RefCell::new(Default::default()),
+            sidebar_hidden_for_chat: Cell::new(false),
         });
 
         // ----- layout -----
@@ -240,6 +243,9 @@ impl App {
         this.chat_panel.set_width_request(340);
         this.chat_panel.add_css_class("chat-panel");
         this.chat_reveal.set_transition_type(gtk::RevealerTransitionType::SlideLeft);
+        // Never stretch: otherwise the chat inside (which wants to expand) makes the
+        // closed panel claim a share of spare width, leaving an empty grey strip.
+        this.chat_reveal.set_hexpand(false);
         this.chat_reveal.set_child(Some(&this.chat_panel));
         call_page.append(&this.chat_reveal);
         content.add_named(&call_page, Some("call"));
@@ -996,6 +1002,7 @@ impl App {
         }
         if avail >= call_min + PANEL {
             self.split.set_show_sidebar(false);
+            self.sidebar_hidden_for_chat.set(true);
             return true;
         }
         false
@@ -1028,6 +1035,10 @@ impl App {
         let Some(conv) = self.call_conv() else { return };
         if self.chat_reveal.reveals_child() && self.chat_view.conv() == Some(conv) {
             self.chat_reveal.set_reveal_child(false);
+            // Bring back the sidebar if the panel was what pushed it aside.
+            if self.sidebar_hidden_for_chat.replace(false) {
+                self.split.set_show_sidebar(true);
+            }
         } else {
             self.open_chat(conv);
         }
