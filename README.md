@@ -26,6 +26,12 @@ have to run or pay for.
   *Studio* sends your mic untouched; *Custom* lets you pick the suppression and set the
   input sensitivity (−100 to 0 dB) against a live level meter. *Hear yourself* plays
   your processed mic back a second later.
+- **Text chat.** Message friends and groups in a Discord-like view: messages grouped
+  under each person's picture and name, day separators, clickable links, unread
+  counts and notifications. Chat during a call in a side panel. Messages travel
+  directly between you, encrypted; with no server to hold them, a message to someone
+  offline waits on your computer (greyed out) and is delivered as soon as you're both
+  online. History stays on each person's computer.
 - **Tell people apart.** Everyone has a picture (identicon) and a name tag like
   `alice#f3a7`, both derived from their identity key, so two people (or two identities
   on one computer) with the same name never look alike. A contact's ⋮ → *User info*
@@ -200,6 +206,13 @@ automatically.
   driven by RNNoise's voice detection or a dB threshold (with hold time and click-free
   ramps), and an automatic gain that learns your speech level from voiced frames only
   and steers it to −20 dBFS (up to +24 dB), followed by a limiter.
+- **Chat:** each delivery is a small connection (`parley-chat/1`) carrying up to 50
+  messages, acknowledged by the recipient; undelivered messages wait in an outbox and
+  are retried when the recipient shows up online, and every minute. Direct messages
+  are accepted from contacts (and, if you allow calls from people not in your
+  contacts, from anyone with your code, who is then added as a contact); group
+  messages only from that group's members. History is one JSON-lines file per
+  conversation in Parley's data folder.
 - **Online status:** every 30 s Parley opens a tiny separate connection
   (`parley-presence/1`) to each contact and group member to exchange status, and
   re-announces within two seconds when your status, group call, or mute/deafen/sharing

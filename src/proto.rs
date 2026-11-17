@@ -17,6 +17,60 @@ use crate::store::{Member, RoomId};
 pub const ALPN: &[u8] = b"parley/1";
 /// Separate, tiny connections that only exchange online status.
 pub const PRESENCE_ALPN: &[u8] = b"parley-presence/1";
+/// Text chat: one connection per batch of messages, answered with an ack.
+pub const CHAT_ALPN: &[u8] = b"parley-chat/1";
+
+/// Longest chat message we send or accept, in characters.
+pub const MAX_CHAT_CHARS: usize = 4000;
+/// Most messages per delivery.
+pub const MAX_CHAT_BATCH: usize = 50;
+
+/// A chat message on the wire (the sender is the connection's authenticated peer).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WireMsg {
+    pub id: String,
+    /// Sender's clock, Unix milliseconds.
+    pub ts: u64,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChatEnvelope {
+    /// The group conversation, or None for a direct message.
+    #[serde(default, with = "opt_hex_room")]
+    pub group: Option<RoomId>,
+    /// The sender's display name (so a first message from someone new has a name).
+    #[serde(default)]
+    pub name: String,
+    pub msgs: Vec<WireMsg>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChatAck {
+    pub ids: Vec<String>,
+    /// We don't take messages from them (not a contact or group member).
+    #[serde(default)]
+    pub refused: bool,
+}
+
+impl ChatEnvelope {
+    /// Drops anything malformed and makes the rest safe to show.
+    pub fn clean(&mut self) {
+        self.name = clean_name(&self.name);
+        self.msgs.truncate(MAX_CHAT_BATCH);
+        self.msgs.retain(|m| !m.id.is_empty() && m.id.len() <= 64 && m.id.chars().all(|c| c.is_ascii_alphanumeric()));
+        for m in &mut self.msgs {
+            m.text = clean_text(&m.text);
+        }
+        self.msgs.retain(|m| !m.text.is_empty());
+    }
+}
+
+/// Chat text from someone else: no control characters except line breaks and tabs,
+/// at most [`MAX_CHAT_CHARS`].
+pub fn clean_text(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control() || *c == '\n' || *c == '\t').take(MAX_CHAT_CHARS).collect::<String>().trim().to_string()
+}
 
 /// What someone shows to their contacts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,10 +143,15 @@ pub async fn write_small<T: Serialize>(s: &mut iroh::endpoint::SendStream, msg: 
 
 /// Reads one small length-prefixed JSON message (at most 1 KiB).
 pub async fn read_small<T: serde::de::DeserializeOwned>(r: &mut iroh::endpoint::RecvStream) -> Result<T> {
+    read_limited(r, 1024).await
+}
+
+/// Reads one length-prefixed JSON message of at most `max` bytes.
+pub async fn read_limited<T: serde::de::DeserializeOwned>(r: &mut iroh::endpoint::RecvStream, max: usize) -> Result<T> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len).await?;
     let len = u32::from_be_bytes(len) as usize;
-    if len > 1024 {
+    if len > max {
         bail!("message too large");
     }
     let mut body = vec![0u8; len];
@@ -365,5 +424,29 @@ mod presence_tests {
         };
         let json = serde_json::to_string(&full).unwrap();
         assert_eq!(serde_json::from_str::<PresenceMsg>(&json).unwrap(), full);
+    }
+}
+
+#[cfg(test)]
+mod chat_tests {
+    use super::*;
+
+    #[test]
+    fn chat_envelopes_are_cleaned() {
+        let mut e = ChatEnvelope {
+            group: None,
+            name: "Bob\n".into(),
+            msgs: vec![
+                WireMsg { id: "abc123".into(), ts: 1, text: " hi\u{7}\nthere ".into() },
+                WireMsg { id: "../etc".into(), ts: 1, text: "x".into() },
+                WireMsg { id: "def".into(), ts: 1, text: "\u{1b}".into() },
+                WireMsg { id: "long".into(), ts: 1, text: "y".repeat(MAX_CHAT_CHARS + 50) },
+            ],
+        };
+        e.clean();
+        assert_eq!(e.name, "Bob");
+        assert_eq!(e.msgs.len(), 2);
+        assert_eq!(e.msgs[0].text, "hi\nthere");
+        assert_eq!(e.msgs[1].text.chars().count(), MAX_CHAT_CHARS);
     }
 }

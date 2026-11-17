@@ -50,6 +50,8 @@ pub enum NetCmd {
     WatchScreen(EndpointId, bool),
     /// Our status as shown to contacts.
     SetStatus(Status),
+    /// Deliver chat messages to `to` (a direct message when `group` is None).
+    SendChat { to: EndpointId, group: Option<RoomId>, name: String, msgs: Vec<WireMsg> },
     /// Test hook: drop every connection abruptly, as a crash or network loss would.
     #[cfg(test)]
     SimulateDropout,
@@ -74,6 +76,10 @@ pub enum UiEvent {
     /// A group was learned from an invite or gained members; the UI merges and saves it.
     GroupUpdate { group: Group },
     MissedCall { from: EndpointId, name: String },
+    /// Chat messages arrived (already acknowledged to the sender).
+    ChatReceived { from: EndpointId, name: String, group: Option<RoomId>, msgs: Vec<WireMsg> },
+    /// A delivery finished: `ids` reached `to` (empty if it failed or was refused).
+    ChatDelivered { to: EndpointId, ids: Vec<String>, refused: bool },
     /// A contact's online status (and group call, if any) changed.
     Presence { id: EndpointId, presence: Presence, call: Option<CallPresence>, app: Option<String> },
     Notice(String),
@@ -104,7 +110,7 @@ pub async fn start(
         .build();
     let ep = Endpoint::builder(presets::N0)
         .secret_key(secret)
-        .alpns(vec![ALPN.to_vec(), PRESENCE_ALPN.to_vec()])
+        .alpns(vec![ALPN.to_vec(), PRESENCE_ALPN.to_vec(), CHAT_ALPN.to_vec()])
         .transport_config(transport)
         .bind()
         .await
@@ -174,6 +180,17 @@ async fn handle_incoming(
         let _ = itx.send(Internal::PresenceProbe { conn, send, theirs });
         return Ok(());
     }
+    if conn.alpn() == CHAT_ALPN {
+        let (send, mut recv) = tokio::time::timeout(Duration::from_secs(10), conn.accept_bi())
+            .await
+            .context("chat timeout")??;
+        let mut env: ChatEnvelope = tokio::time::timeout(Duration::from_secs(10), read_limited(&mut recv, 512 * 1024))
+            .await
+            .context("chat timeout")??;
+        env.clean();
+        let _ = itx.send(Internal::ChatIn { conn, send, env });
+        return Ok(());
+    }
     if conn.alpn() != ALPN {
         conn.close(CLOSE_DECLINE.into(), b"alpn");
         return Ok(());
@@ -202,6 +219,8 @@ enum Internal {
     Tick,
     /// A contact checked our status (and told us theirs).
     PresenceProbe { conn: Connection, send: SendStream, theirs: PresenceMsg },
+    /// Chat messages arrived from someone.
+    ChatIn { conn: Connection, send: SendStream, env: ChatEnvelope },
     /// Our check of a contact finished; None = unreachable.
     PresenceResult { peer: EndpointId, presence: Option<PresenceMsg> },
 }
@@ -392,6 +411,30 @@ impl Engine {
                         s.send(Ctrl::Keyframe(track));
                     }
                 }
+            }
+            NetCmd::SendChat { to, group, name, msgs } => {
+                let (ep, ui) = (self.ep.clone(), self.ui.clone());
+                tokio::spawn(async move {
+                    let ids: Vec<String> = msgs.iter().map(|m| m.id.clone()).collect();
+                    let env = ChatEnvelope { group, name, msgs };
+                    let res = tokio::time::timeout(Duration::from_secs(20), async {
+                        let conn = ep.connect(EndpointAddr::from(to), CHAT_ALPN).await?;
+                        let (mut send, mut recv) = conn.open_bi().await?;
+                        write_small(&mut send, &env).await?;
+                        let ack: ChatAck = read_limited(&mut recv, 64 * 1024).await?;
+                        conn.close(0u32.into(), b"");
+                        anyhow::Ok(ack)
+                    })
+                    .await;
+                    let ev = match res {
+                        Ok(Ok(ack)) => {
+                            let ok: Vec<String> = ack.ids.into_iter().filter(|i| ids.contains(i)).collect();
+                            UiEvent::ChatDelivered { to, ids: ok, refused: ack.refused }
+                        }
+                        _ => UiEvent::ChatDelivered { to, ids: Vec::new(), refused: false },
+                    };
+                    let _ = ui.send(ev).await;
+                });
             }
             NetCmd::SetStatus(st) => {
                 if st != self.status {
@@ -623,6 +666,7 @@ impl Engine {
             }
             Internal::Tick => self.on_tick(),
             Internal::PresenceProbe { conn, send, theirs } => self.on_presence_probe(conn, send, theirs),
+            Internal::ChatIn { conn, send, env } => self.on_chat_in(conn, send, env),
             Internal::PresenceResult { peer, presence } => {
                 self.probing.remove(&peer);
                 if self.knows(&peer) {
@@ -1173,6 +1217,25 @@ impl Engine {
         }
     }
 
+    /// Chat messages from someone: group messages from that group's members, direct
+    /// ones from contacts (or anyone with our code, if we allow unknown callers).
+    fn on_chat_in(&mut self, conn: Connection, mut send: SendStream, env: ChatEnvelope) {
+        let peer = conn.remote_id();
+        let allowed = match env.group {
+            Some(r) => self.groups.get(&r).is_some_and(|g| g.members.iter().any(|m| m.id == peer)),
+            None => self.contacts.contains_key(&peer) || self.allow_unknown,
+        };
+        let ack = ChatAck { ids: if allowed { env.msgs.iter().map(|m| m.id.clone()).collect() } else { Vec::new() }, refused: !allowed };
+        if allowed && !env.msgs.is_empty() {
+            self.emit(UiEvent::ChatReceived { from: peer, name: env.name, group: env.group, msgs: env.msgs });
+        }
+        tokio::spawn(async move {
+            let _ = write_small(&mut send, &ack).await;
+            let _ = send.finish();
+            let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+        });
+    }
+
     /// Someone checked on us. Only contacts and group members get an answer, and
     /// nobody does while we're invisible (we look offline).
     fn on_presence_probe(&mut self, conn: Connection, mut send: SendStream, theirs: PresenceMsg) {
@@ -1528,6 +1591,48 @@ mod tests {
         })
         .await;
         assert!(seen.is_err(), "a non-contact learned Bob's status: {seen:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs internet (n0 relays + discovery)"]
+    async fn chat_delivery() {
+        let _ = tracing_subscriber::fmt().with_env_filter("parley=debug").try_init();
+        let (a, b, c) = tokio::join!(node("alice"), node("bob"), node("carol"));
+        let g = Group::new("trip".into(), vec![Member { id: a.id, name: "alice".into() }, Member { id: b.id, name: "bob".into() }]);
+        a.directory(&[&b], vec![g.clone()]);
+        b.directory(&[&a], vec![g.clone()]);
+        // Carol knows Bob's code, but Bob doesn't take messages from strangers.
+        c.net.send(NetCmd::Directory { my_name: "carol".into(), contacts: vec![Contact::new(b.id, "bob")], groups: vec![], allow_unknown: false });
+        b.net.send(NetCmd::Directory { my_name: "bob".into(), contacts: vec![Contact::new(a.id, "alice")], groups: vec![g.clone()], allow_unknown: false });
+
+        let m = |id: &str, t: &str| WireMsg { id: id.into(), ts: 1, text: t.into() };
+        a.net.send(NetCmd::SendChat { to: b.id, group: None, name: "alice".into(), msgs: vec![m("m1", "hi bob"), m("m2", "you there?")] });
+        let got = b
+            .expect("direct message", |e| match e {
+                UiEvent::ChatReceived { from, group: None, msgs, .. } if *from == a.id => Some(msgs.clone()),
+                _ => None,
+            })
+            .await;
+        assert_eq!(got.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(), ["hi bob", "you there?"]);
+        let acked = a
+            .expect("ack", |e| match e {
+                UiEvent::ChatDelivered { to, ids, .. } if *to == b.id => Some(ids.clone()),
+                _ => None,
+            })
+            .await;
+        assert_eq!(acked, ["m1", "m2"]);
+
+        a.net.send(NetCmd::SendChat { to: b.id, group: Some(g.room_id()), name: "alice".into(), msgs: vec![m("g1", "group hello")] });
+        b.expect("group message", |e| matches!(e, UiEvent::ChatReceived { group: Some(r), .. } if *r == g.room_id()).then_some(())).await;
+
+        c.net.send(NetCmd::SendChat { to: b.id, group: None, name: "carol".into(), msgs: vec![m("c1", "spam")] });
+        let refused = c
+            .expect("refusal", |e| match e {
+                UiEvent::ChatDelivered { to, ids, refused } if *to == b.id => Some((ids.is_empty(), *refused)),
+                _ => None,
+            })
+            .await;
+        assert_eq!(refused, (true, true));
     }
 
     #[tokio::test(flavor = "multi_thread")]

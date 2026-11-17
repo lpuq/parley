@@ -178,6 +178,7 @@ impl Sidebar {
             };
             let row = adw::ActionRow::builder()
                 .title(identity::tagged_markup(&c.name, &c.id))
+                .title_lines(1)
                 .subtitle(if in_call { "In call" } else { text })
                 .build();
             let avatar = gtk::Overlay::new();
@@ -202,9 +203,27 @@ impl Sidebar {
                     a.call_contact(id);
                 }
             });
+            let conv = crate::chat::Conv::Direct(c.id);
+            // Unread count on the avatar's corner, so names keep their room.
+            if let Some(b) = unread_badge(app.chat.borrow().unread(&conv)) {
+                b.set_halign(gtk::Align::End);
+                b.set_valign(gtk::Align::Start);
+                avatar.add_overlay(&b);
+            }
+            row.add_suffix(&self.chat_button(conv, &format!("Message {}", c.name)));
             row.add_suffix(&call);
             row.add_suffix(&self.contact_menu(c.id, c.name.clone()));
-            row.set_activatable_widget(Some(&call));
+            // Clicking the row opens the chat (the green button calls).
+            row.set_activatable(true);
+            let a = self.app.clone();
+            row.connect_activated(move |_| {
+                if let Some(a) = a.upgrade() {
+                    a.open_chat(conv);
+                }
+            });
+            if app.chat_open() == Some(conv) {
+                row.add_css_class("conv-open");
+            }
             self.friends.append(&row);
         }
 
@@ -231,12 +250,16 @@ impl Sidebar {
             };
             let row = adw::ActionRow::builder()
                 .title(glib::markup_escape_text(&g.name))
+                .title_lines(1)
                 .subtitle(glib::markup_escape_text(&subtitle))
                 .build();
             let icon = gtk::Image::from_icon_name("system-users-symbolic");
             icon.set_pixel_size(20);
             icon.add_css_class("group-icon");
-            row.add_prefix(&icon);
+            let group_icon = gtk::Overlay::new();
+            group_icon.set_child(Some(&icon));
+            group_icon.set_valign(gtk::Align::Center);
+            row.add_prefix(&group_icon);
             let join = gtk::Button::builder()
                 .label(if in_call { "Joined" } else { "Join" })
                 .valign(gtk::Align::Center)
@@ -249,9 +272,25 @@ impl Sidebar {
                     a.join_group(rid);
                 }
             });
+            let conv = crate::chat::Conv::Group(rid);
+            if let Some(b) = unread_badge(app.chat.borrow().unread(&conv)) {
+                b.set_halign(gtk::Align::End);
+                b.set_valign(gtk::Align::Start);
+                group_icon.add_overlay(&b);
+            }
+            row.add_suffix(&self.chat_button(conv, &format!("Message {}", g.name)));
             row.add_suffix(&join);
             row.add_suffix(&self.group_menu(rid, g.name.clone(), ShareCode::for_group(&g).encode()));
-            row.set_activatable_widget(Some(&join));
+            row.set_activatable(true);
+            let a = self.app.clone();
+            row.connect_activated(move |_| {
+                if let Some(a) = a.upgrade() {
+                    a.open_chat(conv);
+                }
+            });
+            if app.chat_open() == Some(conv) {
+                row.add_css_class("conv-open");
+            }
             self.groups.append(&row);
             // Who's in the call (Discord-style): avatar, name, LIVE while sharing,
             // and mute/deafen icons.
@@ -270,6 +309,23 @@ impl Sidebar {
         self.friends.set_visible(!st.contacts.is_empty());
         self.groups_empty.set_visible(st.groups.is_empty());
         self.groups.set_visible(!st.groups.is_empty());
+    }
+
+    /// Opens the conversation (no call needed).
+    fn chat_button(&self, conv: crate::chat::Conv, tip: &str) -> gtk::Button {
+        let b = gtk::Button::builder()
+            .icon_name("chat-message-new-symbolic")
+            .tooltip_text(tip)
+            .valign(gtk::Align::Center)
+            .css_classes(["circular", "chat-row-btn"])
+            .build();
+        let a = self.app.clone();
+        b.connect_clicked(move |_| {
+            if let Some(a) = a.upgrade() {
+                a.open_chat(conv);
+            }
+        });
+        b
     }
 
     fn contact_menu(&self, id: iroh::EndpointId, name: String) -> gtk::MenuButton {
@@ -468,4 +524,14 @@ fn call_member_row(name: &str, id: &iroh::EndpointId, ms: &MediaState) -> gtk::L
     let row = gtk::ListBoxRow::builder().child(&b).activatable(false).selectable(false).build();
     row.add_css_class("call-member");
     row
+}
+
+/// A red unread-count pill, if there's anything unread.
+fn unread_badge(n: u32) -> Option<gtk::Label> {
+    (n > 0).then(|| {
+        let l = gtk::Label::new(Some(&if n > 99 { "99+".to_string() } else { n.to_string() }));
+        l.add_css_class("unread-badge");
+        l.set_valign(gtk::Align::Center);
+        l
+    })
 }

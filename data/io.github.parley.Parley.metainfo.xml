@@ -31,6 +31,15 @@
     <content_attribute id="social-audio">intense</content_attribute>
   </content_rating>
   <releases>
+    <release version="0.5.0" date="2026-11-16">
+      <description>
+        <ul>
+          <li>Text chat with friends and groups, peer to peer and end-to-end encrypted, in a Discord-like view; messages to someone offline are delivered when you're both online</li>
+          <li>Chat beside a call, unread counts, notifications and clickable links</li>
+          <li>The installer moves your identity over and removes the old launcher when switching between native and Flatpak installs</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.4.3" date="2026-11-16">
       <description>
         <ul>

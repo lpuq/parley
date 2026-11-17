@@ -1,5 +1,6 @@
 //! Parley — private, serverless voice / video / screen-share calls for Linux.
 
+pub mod chat;
 pub mod hub;
 pub mod media;
 pub mod net;

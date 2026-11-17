@@ -19,7 +19,7 @@ fn config_dir() -> PathBuf {
     base.join(app_dir_name())
 }
 
-fn data_dir() -> PathBuf {
+pub(crate) fn data_dir() -> PathBuf {
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| {

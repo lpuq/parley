@@ -139,6 +139,7 @@ impl CallView {
         let cam_btn = adw::SplitButton::builder().icon_name("camera-web-symbolic").tooltip_text("Turn on camera").build();
         cam_btn.add_css_class("call-btn");
         let screen_btn = round_button("video-display-symbolic", "Share your screen");
+        let chat_btn = round_button("chat-message-new-symbolic", "Chat");
         let settings_btn = round_button("emblem-system-symbolic", "Settings");
         settings_btn.set_action_name(Some("app.settings"));
         let hang = round_button("call-stop-symbolic", "Leave call");
@@ -149,7 +150,7 @@ impl CallView {
         bar.set_halign(gtk::Align::Center);
         bar.set_margin_top(12);
         bar.set_margin_bottom(16);
-        for w in [mic_btn.upcast_ref::<gtk::Widget>(), deaf_btn.upcast_ref(), cam_btn.upcast_ref(), screen_btn.upcast_ref(), settings_btn.upcast_ref()] {
+        for w in [mic_btn.upcast_ref::<gtk::Widget>(), deaf_btn.upcast_ref(), cam_btn.upcast_ref(), screen_btn.upcast_ref(), chat_btn.upcast_ref(), settings_btn.upcast_ref()] {
             bar.append(w);
         }
         let sep = gtk::Separator::new(gtk::Orientation::Vertical);
@@ -182,7 +183,7 @@ impl CallView {
             deaf_btn,
             cam_btn,
             screen_btn,
-            wide_only: vec![settings_btn.upcast(), sep.upcast()],
+            wide_only: vec![chat_btn.clone().upcast(), settings_btn.upcast(), sep.upcast()],
         };
 
         let a = app.clone();
@@ -207,6 +208,12 @@ impl CallView {
         this.screen_btn.connect_clicked(move |_| {
             if let Some(a) = a.upgrade() {
                 dialogs::screen_share(&a);
+            }
+        });
+        let a = app.clone();
+        chat_btn.connect_clicked(move |_| {
+            if let Some(a) = a.upgrade() {
+                a.toggle_call_chat();
             }
         });
         let a = app.clone();

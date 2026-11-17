@@ -1,6 +1,7 @@
 //! GTK4 / libadwaita front end.
 
 mod callview;
+mod chat;
 mod dialogs;
 pub mod identity;
 mod qr;
@@ -117,6 +118,15 @@ pub struct App {
     call_presence: RefCell<HashMap<EndpointId, CallPresence>>,
     /// Others' Parley versions, as last told (calls and status checks; 0.4.3+).
     versions: RefCell<HashMap<EndpointId, String>>,
+
+    /// Text chat: history and outbox, the view, and where it can be shown.
+    pub chat: RefCell<crate::chat::ChatStore>,
+    chat_view: Rc<chat::ChatView>,
+    chat_page: gtk::Box,
+    chat_reveal: gtk::Revealer,
+    chat_panel: gtk::Box,
+    /// Peers we're delivering chat to right now (one delivery at a time each).
+    chat_inflight: RefCell<std::collections::HashSet<EndpointId>>,
 }
 
 impl App {
@@ -139,7 +149,7 @@ impl App {
         let toasts = adw::ToastOverlay::new();
         let split = adw::OverlaySplitView::new();
         split.set_sidebar_width_fraction(0.26);
-        split.set_min_sidebar_width(260.0);
+        split.set_min_sidebar_width(290.0);
         split.set_max_sidebar_width(340.0);
 
         let content = gtk::Stack::new();
@@ -198,6 +208,12 @@ impl App {
             presence: RefCell::new(HashMap::new()),
             call_presence: RefCell::new(HashMap::new()),
             versions: RefCell::new(HashMap::new()),
+            chat: RefCell::new(crate::chat::ChatStore::open()),
+            chat_view: chat::ChatView::new(weak.clone()),
+            chat_page: gtk::Box::new(gtk::Orientation::Vertical, 0),
+            chat_reveal: gtk::Revealer::new(),
+            chat_panel: gtk::Box::new(gtk::Orientation::Vertical, 0),
+            chat_inflight: RefCell::new(Default::default()),
         });
 
         // ----- layout -----
@@ -217,7 +233,18 @@ impl App {
         let (home_page, home_buttons) = this.home_page();
         content.add_named(&home_page, Some("home"));
         content.add_named(&outgoing, Some("outgoing"));
-        content.add_named(this.call_view.widget(), Some("call"));
+        // The call page: the call, and a side panel for its chat.
+        let call_page = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        this.call_view.widget().set_hexpand(true);
+        call_page.append(this.call_view.widget());
+        this.chat_panel.set_width_request(340);
+        this.chat_panel.add_css_class("chat-panel");
+        this.chat_reveal.set_transition_type(gtk::RevealerTransitionType::SlideLeft);
+        this.chat_reveal.set_child(Some(&this.chat_panel));
+        call_page.append(&this.chat_reveal);
+        content.add_named(&call_page, Some("call"));
+        this.chat_page.set_vexpand(true);
+        content.add_named(&this.chat_page, Some("chat"));
         content.set_visible_child_name("home");
 
         split.set_sidebar(Some(this.sidebar.widget()));
@@ -236,6 +263,7 @@ impl App {
         bp.add_setter(&home_buttons, "orientation", Some(&gtk::Orientation::Vertical.to_value()));
         // Leave a strip of the content (and its header's close button) uncovered.
         bp.add_setter(&split, "max-sidebar-width", Some(&280.0f64.to_value()));
+        bp.add_setter(&split, "min-sidebar-width", Some(&260.0f64.to_value()));
         for w in &this.call_view.wide_only {
             bp.add_setter(w, "visible", Some(&false.to_value()));
         }
@@ -243,6 +271,8 @@ impl App {
             let t = this.clone();
             bp.connect_apply(move |_| {
                 t.window.add_css_class("compact");
+                // No room for the chat beside a call: it stays on its own page instead.
+                t.chat_reveal.set_reveal_child(false);
                 t.call_view.relayout(&t);
             });
             let t = this.clone();
@@ -265,6 +295,23 @@ impl App {
         }
 
         this.install_actions();
+        // Chat: retry waiting messages now and then, and clear unread counts when the
+        // window comes back to an open conversation.
+        {
+            let t = this.clone();
+            glib::timeout_add_seconds_local(60, move || {
+                t.deliver_all_chat();
+                glib::ControlFlow::Continue
+            });
+            let t = this.clone();
+            window.connect_is_active_notify(move |_| {
+                if let Some(c) = t.chat_view.conv() {
+                    if t.chat_visible(c) {
+                        t.mark_read(c);
+                    }
+                }
+            });
+        }
         this.start_tray();
         this.sidebar.refresh(&this);
         this.update_home();
@@ -342,6 +389,10 @@ impl App {
             glib::timeout_add_local(std::time::Duration::from_millis(120), move || {
                 if t.room.get().is_some() {
                     t.call_view.tick(&t);
+                    // The window got too narrow for the chat beside the call.
+                    if t.chat_reveal.reveals_child() && !t.make_room_for_chat_panel() {
+                        t.open_chat_page_in_call();
+                    }
                 }
                 glib::ControlFlow::Continue
             });
@@ -573,6 +624,16 @@ impl App {
         add("decline-call", Box::new(|t| t.answer(false)));
         add("show", Box::new(|t| t.present()));
         add("quit", Box::new(|t| t.quit()));
+        {
+            let a = gio::SimpleAction::new("open-chat", Some(glib::VariantTy::STRING));
+            let t = self.clone();
+            a.connect_activate(move |_, v| {
+                let Some(conv) = v.and_then(|v| v.str()).and_then(crate::chat::Conv::from_key) else { return };
+                t.present();
+                t.open_chat(conv);
+            });
+            self.app.add_action(&a);
+        }
         add("fullscreen", Box::new(|t| {
             if t.window.is_fullscreen() {
                 t.window.unfullscreen();
@@ -828,9 +889,18 @@ impl App {
                 }
             }
             UiEvent::Notice(msg) => self.toast(&msg),
+            UiEvent::ChatReceived { from, name, group, msgs } => self.on_chat_received(from, name, group, msgs),
+            UiEvent::ChatDelivered { to, ids, refused } => self.on_chat_delivered(to, ids, refused),
             UiEvent::Presence { id, presence, call, app } => {
                 if let Some(v) = app {
                     self.versions.borrow_mut().insert(id, v);
+                }
+                // They're reachable: hand over anything waiting for them.
+                if presence != Presence::Offline {
+                    self.deliver_chat(id);
+                }
+                if self.chat_view.conv() == Some(crate::chat::Conv::Direct(id)) {
+                    self.chat_view.refresh_header(self);
                 }
                 self.presence.borrow_mut().insert(id, presence);
                 match call {
@@ -858,6 +928,273 @@ impl App {
             self.call_presence.borrow().iter().filter(|(_, c)| &c.room == room).map(|(id, c)| (*id, c.state)).collect();
         v.sort_by_key(|(id, _)| self.display_name(id).to_lowercase());
         v
+    }
+
+    // ------------------------------------------------------------ chat
+
+    /// The page to show when not in a call: the open chat, or the welcome page.
+    fn show_idle(&self) {
+        if self.chat_view.conv().is_some() {
+            self.put_chat(false);
+            self.content.set_visible_child_name("chat");
+        } else {
+            self.content.set_visible_child_name("home");
+        }
+    }
+
+    /// The conversation shown, if the chat is on screen.
+    pub fn chat_open(&self) -> Option<crate::chat::Conv> {
+        let shown = match self.content.visible_child_name().as_deref() {
+            Some("chat") => true,
+            Some("call") => self.chat_reveal.reveals_child(),
+            _ => false,
+        };
+        self.chat_view.conv().filter(|_| shown)
+    }
+
+    pub fn show_call(&self) {
+        if self.room.get().is_some() {
+            self.content.set_visible_child_name("call");
+        }
+    }
+
+    /// Moves the chat view into the call's side panel or onto its own page.
+    fn put_chat(&self, panel: bool) {
+        let root = &self.chat_view.root;
+        let target = if panel { &self.chat_panel } else { &self.chat_page };
+        if root.parent().as_ref() != Some(target.upcast_ref()) {
+            if let Some(p) = root.parent().and_then(|p| p.downcast::<gtk::Box>().ok()) {
+                p.remove(root);
+            }
+            target.append(root);
+        }
+        self.chat_view.set_panel(panel);
+        if !panel {
+            self.chat_reveal.set_reveal_child(false);
+        }
+    }
+
+    /// The conversation of the call we're in.
+    fn call_conv(&self) -> Option<crate::chat::Conv> {
+        match self.room.get()? {
+            RoomKey::Direct(id) => Some(crate::chat::Conv::Direct(id)),
+            RoomKey::Group(r) => Some(crate::chat::Conv::Group(r)),
+        }
+    }
+
+    /// Opens a conversation: beside the call if it's the call's own (and there's
+    /// room), otherwise as a page.
+    /// Whether the chat panel fits beside the call, hiding the sidebar if that's what
+    /// it takes. (Without this check a too-narrow window would cut off its own edge.)
+    fn make_room_for_chat_panel(&self) -> bool {
+        const PANEL: i32 = 340;
+        let call_min = self.call_view.widget().measure(gtk::Orientation::Horizontal, -1).0;
+        let side = if self.split.shows_sidebar() && !self.split.is_collapsed() { self.sidebar.widget().width() } else { 0 };
+        let avail = self.window.width();
+        if avail >= call_min + PANEL + side {
+            return true;
+        }
+        if avail >= call_min + PANEL {
+            self.split.set_show_sidebar(false);
+            return true;
+        }
+        false
+    }
+
+    /// In a call but no room beside it: the chat as a page, with "Return to call".
+    fn open_chat_page_in_call(&self) {
+        self.put_chat(false);
+        self.content.set_visible_child_name("chat");
+    }
+
+    pub fn open_chat(self: &Rc<Self>, conv: crate::chat::Conv) {
+        let wide = !self.window.has_css_class("compact");
+        let beside_call = wide && self.call_conv() == Some(conv) && self.room.get().is_some() && self.make_room_for_chat_panel();
+        self.put_chat(beside_call);
+        self.chat_view.show(self, conv);
+        if beside_call {
+            self.chat_reveal.set_reveal_child(true);
+            self.content.set_visible_child_name("call");
+        } else {
+            self.content.set_visible_child_name("chat");
+        }
+        self.mark_read(conv);
+        self.sidebar.refresh_soon();
+    }
+
+    /// The call's Chat button: toggles the side panel (or opens the chat page in
+    /// narrow windows).
+    pub fn toggle_call_chat(self: &Rc<Self>) {
+        let Some(conv) = self.call_conv() else { return };
+        if self.chat_reveal.reveals_child() && self.chat_view.conv() == Some(conv) {
+            self.chat_reveal.set_reveal_child(false);
+        } else {
+            self.open_chat(conv);
+        }
+    }
+
+    fn chat_visible(&self, conv: crate::chat::Conv) -> bool {
+        if self.chat_view.conv() != Some(conv) || !self.window.is_active() {
+            return false;
+        }
+        match self.content.visible_child_name().as_deref() {
+            Some("chat") => true,
+            Some("call") => self.chat_reveal.reveals_child(),
+            _ => false,
+        }
+    }
+
+    fn mark_read(&self, conv: crate::chat::Conv) {
+        if self.chat.borrow().unread(&conv) > 0 {
+            self.chat.borrow_mut().set_unread(&conv, 0);
+            self.sidebar.refresh_soon();
+        }
+    }
+
+    /// Someone's name as shown in a conversation: contact name, else the name the
+    /// group knows them by, else their short ID.
+    pub fn name_in(&self, conv: &crate::chat::Conv, id: &EndpointId) -> String {
+        if *id == self.me {
+            let n = self.store.borrow().my_name.clone();
+            return if n.is_empty() { "You".into() } else { n };
+        }
+        if let Some(c) = self.store.borrow().contact(id) {
+            return c.name.clone();
+        }
+        if let crate::chat::Conv::Group(r) = conv {
+            if let Some(m) = self.store.borrow().groups.iter().find(|g| g.room_id() == *r).and_then(|g| g.members.iter().find(|m| m.id == *id)) {
+                return m.name.clone();
+            }
+        }
+        id.fmt_short().to_string()
+    }
+
+    /// A group's name and a "with …" line for the chat header.
+    pub fn group_summary(&self, room: &crate::store::RoomId) -> (String, String) {
+        let st = self.store.borrow();
+        let Some(g) = st.groups.iter().find(|g| g.room_id() == *room) else { return ("Group".into(), String::new()) };
+        let others: Vec<String> = g.members.iter().filter(|m| m.id != self.me).map(|m| st.name_for(&m.id).unwrap_or_else(|| m.name.clone())).collect();
+        (g.name.clone(), others.join(", "))
+    }
+
+    /// Who should receive a message in `conv` (everyone but us).
+    fn chat_recipients(&self, conv: &crate::chat::Conv) -> Vec<EndpointId> {
+        match conv {
+            crate::chat::Conv::Direct(id) => vec![*id],
+            crate::chat::Conv::Group(r) => self
+                .store
+                .borrow()
+                .groups
+                .iter()
+                .find(|g| g.room_id() == *r)
+                .map(|g| g.members.iter().map(|m| m.id).filter(|id| *id != self.me).collect())
+                .unwrap_or_default(),
+        }
+    }
+
+    pub fn send_chat(self: &Rc<Self>, conv: crate::chat::Conv, text: String) {
+        let wire = crate::proto::WireMsg { id: crate::chat::new_id(), ts: crate::chat::now_ms(), text };
+        let msg = crate::chat::Message { id: wire.id.clone(), from: self.me, ts: wire.ts, text: wire.text.clone() };
+        let to = self.chat_recipients(&conv);
+        {
+            let mut c = self.chat.borrow_mut();
+            c.add(&conv, msg.clone());
+            c.queue(&conv, wire, to.clone());
+        }
+        if self.chat_view.conv() == Some(conv) {
+            self.chat_view.append(self, &msg, (!to.is_empty()).then_some(false));
+            self.chat_view.refresh_pending(self);
+        }
+        for peer in to {
+            self.deliver_chat(peer);
+        }
+    }
+
+    /// Sends `peer` everything we owe them (one delivery at a time per peer).
+    fn deliver_chat(self: &Rc<Self>, peer: EndpointId) {
+        if self.chat_inflight.borrow().contains(&peer) {
+            return;
+        }
+        let owed = self.chat.borrow().owed_to(&peer);
+        let Some((group, msgs)) = owed.into_iter().next() else { return };
+        self.chat_inflight.borrow_mut().insert(peer);
+        let msgs = msgs.into_iter().take(crate::proto::MAX_CHAT_BATCH).collect();
+        let name = self.store.borrow().my_name.clone();
+        self.net.send(NetCmd::SendChat { to: peer, group, name, msgs });
+    }
+
+    /// Retries everything still owed to people who look reachable.
+    fn deliver_all_chat(self: &Rc<Self>) {
+        let peers: std::collections::HashSet<EndpointId> = self.chat.borrow().outbox.iter().flat_map(|p| p.to.clone()).collect();
+        for p in peers {
+            if self.presence_of(&p) != Presence::Offline || self.participants().iter().any(|x| x.id == p) {
+                self.deliver_chat(p);
+            }
+        }
+    }
+
+    fn on_chat_delivered(self: &Rc<Self>, to: EndpointId, ids: Vec<String>, refused: bool) {
+        self.chat_inflight.borrow_mut().remove(&to);
+        if refused {
+            self.chat.borrow_mut().refused(&to);
+        }
+        if !ids.is_empty() {
+            self.chat.borrow_mut().delivered(&to, &ids);
+            // More may be waiting (another conversation, or a bigger backlog).
+            self.deliver_chat(to);
+        }
+        self.chat_view.refresh_pending(self);
+    }
+
+    fn on_chat_received(self: &Rc<Self>, from: EndpointId, name: String, group: Option<crate::store::RoomId>, msgs: Vec<crate::proto::WireMsg>) {
+        let conv = match group {
+            Some(r) => crate::chat::Conv::Group(r),
+            None => crate::chat::Conv::Direct(from),
+        };
+        // Someone with our code messaged us first: add them, like answering a call does.
+        if group.is_none() && self.store.borrow().contact(&from).is_none() && from != self.me {
+            let shown = if name.is_empty() { from.fmt_short().to_string() } else { name };
+            self.store.borrow_mut().contacts.push(Contact::new(from, shown.clone()));
+            self.save();
+            self.push_directory();
+            self.toast(&glib::markup_escape_text(&format!("{} messaged you and was added to your contacts", identity::tagged(&shown, &from))));
+        }
+        let mut fresh = Vec::new();
+        for m in msgs {
+            let msg = crate::chat::Message { id: m.id, from, ts: m.ts, text: m.text };
+            if self.chat.borrow_mut().add(&conv, msg.clone()) {
+                fresh.push(msg);
+            }
+        }
+        if fresh.is_empty() {
+            return;
+        }
+        if self.chat_view.conv() == Some(conv) {
+            for m in &fresh {
+                self.chat_view.append(self, m, None);
+            }
+        }
+        if self.chat_visible(conv) {
+            return;
+        }
+        let unread = self.chat.borrow().unread(&conv) + fresh.len() as u32;
+        self.chat.borrow_mut().set_unread(&conv, unread);
+        self.sidebar.refresh_soon();
+        if self.dnd() {
+            return;
+        }
+        self.play_cue(Cue::Message);
+        let who = identity::tagged(&self.name_in(&conv, &from), &from);
+        let title = match conv {
+            crate::chat::Conv::Group(r) => format!("{who} in {}", self.group_summary(&r).0),
+            crate::chat::Conv::Direct(_) => who,
+        };
+        let last = &fresh[fresh.len() - 1].text;
+        let body: String = last.chars().take(140).collect();
+        let n = gio::Notification::new(&title);
+        n.set_body(Some(&body));
+        n.set_default_action_and_target_value("app.open-chat", Some(&conv.key().to_variant()));
+        self.app.send_notification(Some(&format!("chat-{}", conv.key())), &n);
     }
 
     /// Someone's Parley version, if they've told us (0.4.3 and later do).
@@ -1001,7 +1338,8 @@ impl App {
         st.screen = false;
         st.screen_audio = false;
         self.state.set(st);
-        self.content.set_visible_child_name("home");
+        self.chat_reveal.set_reveal_child(false);
+        self.show_idle();
         self.call_view.rebuild_empty();
         self.update_tray();
         self.sidebar.refresh_soon();
@@ -1554,6 +1892,8 @@ enum RingKind {
 enum Cue {
     Join,
     Leave,
+    /// A new chat message (a single soft note).
+    Message,
 }
 
 thread_local! {
@@ -1573,6 +1913,7 @@ impl App {
         let (a, b) = match cue {
             Cue::Join => (523.25, 783.99),
             Cue::Leave => (783.99, 523.25),
+            Cue::Message => (1046.5, 0.0),
         };
         const SR: f64 = 48_000.0;
         let note = |f: f64, n: usize| {
@@ -1583,7 +1924,11 @@ impl App {
                     as i16
             })
         };
-        let pcm: Vec<u8> = note(a, 6_000).chain(note(b, 12_000)).flat_map(|s| s.to_le_bytes()).collect();
+        let pcm: Vec<u8> = if b == 0.0 {
+            note(a, 9_000).map(|s| s / 2).flat_map(|s| s.to_le_bytes()).collect()
+        } else {
+            note(a, 6_000).chain(note(b, 12_000)).flat_map(|s| s.to_le_bytes()).collect()
+        };
 
         let speaker = {
             let name = self.store.borrow().settings.speaker.clone();
