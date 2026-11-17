@@ -42,6 +42,7 @@ impl Sidebar {
         menu.append(Some("New group…"), Some("app.new-group"));
         let sec = gtk::gio::Menu::new();
         sec.append(Some("Change my name…"), Some("app.rename-me"));
+        sec.append(Some("Change my picture…"), Some("app.edit-my-picture"));
         sec.append(Some("Settings"), Some("app.settings"));
         sec.append(Some("Quit"), Some("app.quit"));
         menu.append_section(None, &sec);
@@ -204,8 +205,7 @@ impl Sidebar {
         let st = app.store.borrow();
         let my_name = if st.my_name.is_empty() { "You" } else { &st.my_name };
         self.me_row.set_title(&identity::tagged_markup(my_name, &app.me()));
-        self.me_avatar.set_text(Some(my_name));
-        self.me_avatar.set_custom_image(Some(&identity::identicon(&app.me())));
+        identity::apply(&self.me_avatar, my_name, &app.me());
         let (cls, text) = match st.settings.status {
             Status::Online => ("online", "Online"),
             Status::DoNotDisturb => ("dnd", "Do Not Disturb"),
@@ -538,11 +538,20 @@ impl Sidebar {
         let b = gtk::Box::new(gtk::Orientation::Vertical, 2);
         let info = flat_button("User info");
         let rename = flat_button("Rename…");
+        let picture = flat_button("Change picture…");
         let remove = flat_button("Remove");
         remove.add_css_class("error");
         b.append(&info);
         b.append(&rename);
+        b.append(&picture);
         b.append(&remove);
+        let (a, p) = (self.app.clone(), pop.clone());
+        picture.connect_clicked(move |_| {
+            p.popdown();
+            if let Some(a) = a.upgrade() {
+                a.edit_picture(id);
+            }
+        });
         pop.set_child(Some(&b));
         let (a, p) = (self.app.clone(), pop.clone());
         info.connect_clicked(move |_| {

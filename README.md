@@ -36,7 +36,12 @@ have to run or pay for.
   `alice#f3a7`, both derived from their identity key, so two people (or two identities
   on one computer) with the same name never look alike. A contact's ⋮ → *User info*
   shows their full key, when you added them, and their Parley version. Settings →
-  *Appearance* can hide the tags (strangers calling always show theirs).
+  *Appearance* can hide the tags (strangers calling always show theirs), or show
+  GNOME-style initials instead of the patterns.
+- **Pictures, your way.** Give yourself or anyone a picture: an image file, or letters
+  or a symbol on a colour or gradient, GNOME style (a contact's ⋮ → *Change picture*,
+  or the menu → *Change my picture*). Pictures stay on your computer; nobody else sees
+  them.
 - **Online status.** See which friends are online or on Do Not Disturb (calls arrive
   silently), and go Invisible to look offline. Group calls list who's in them under
   the group, with a red LIVE badge for anyone sharing their screen and their

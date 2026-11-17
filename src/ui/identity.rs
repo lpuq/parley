@@ -2,7 +2,11 @@
 //! Discord's discriminators) and an identicon (a symmetric pattern and colour derived
 //! from the key), so two identities with the same name never look alike.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use adw::prelude::*;
 use gtk::{gdk, glib};
@@ -80,10 +84,39 @@ pub fn identicon(id: &EndpointId) -> gdk::Texture {
     .upcast()
 }
 
-/// An avatar showing the identicon (initials stay as the accessible text).
+thread_local! {
+    /// Pictures chosen for people (see `ui::picture`), drawn once.
+    static PICTURES: RefCell<HashMap<EndpointId, gdk::Texture>> = RefCell::new(HashMap::new());
+}
+static INITIALS: AtomicBool = AtomicBool::new(false);
+
+pub fn set_picture(id: EndpointId, picture: Option<gdk::Texture>) {
+    PICTURES.with(|p| match picture {
+        Some(t) => p.borrow_mut().insert(id, t),
+        None => p.borrow_mut().remove(&id),
+    });
+}
+
+/// Settings → Appearance → Pictures: GNOME-style initials instead of key patterns.
+pub fn set_initials_style(on: bool) {
+    INITIALS.store(on, Ordering::Relaxed);
+}
+
+/// What someone looks like: the picture chosen for them, else their key's pattern, or
+/// initials on a colour if that's the chosen style.
+pub fn apply(a: &adw::Avatar, name: &str, id: &EndpointId) {
+    a.set_text(Some(name));
+    a.set_show_initials(true);
+    match PICTURES.with(|p| p.borrow().get(id).cloned()) {
+        Some(t) => a.set_custom_image(Some(&t)),
+        None if INITIALS.load(Ordering::Relaxed) => a.set_custom_image(None::<&gdk::Paintable>),
+        None => a.set_custom_image(Some(&identicon(id))),
+    }
+}
+
 pub fn avatar(size: i32, name: &str, id: &EndpointId) -> adw::Avatar {
     let a = adw::Avatar::new(size, Some(name), true);
-    a.set_custom_image(Some(&identicon(id)));
+    apply(&a, name, id);
     a
 }
 

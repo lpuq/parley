@@ -1,26 +1,56 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <gresources>
   <gresource prefix="/io/github/parley/Parley/icons/scalable/actions">
+    <file>parley-airplane-mode-symbolic.svg</file>
+    <file>parley-applications-engineering-symbolic.svg</file>
+    <file>parley-applications-games-symbolic.svg</file>
+    <file>parley-applications-graphics-symbolic.svg</file>
+    <file>parley-applications-science-symbolic.svg</file>
     <file>parley-audio-headphones-symbolic.svg</file>
     <file>parley-audio-input-microphone-symbolic.svg</file>
     <file>parley-audio-volume-high-symbolic.svg</file>
     <file>parley-audio-volume-muted-symbolic.svg</file>
+    <file>parley-audio-x-generic-symbolic.svg</file>
+    <file>parley-avatar-default-symbolic.svg</file>
     <file>parley-call-start-symbolic.svg</file>
     <file>parley-call-stop-symbolic.svg</file>
     <file>parley-camera-disabled-symbolic.svg</file>
+    <file>parley-camera-photo-symbolic.svg</file>
     <file>parley-camera-web-symbolic.svg</file>
     <file>parley-chat-message-new-symbolic.svg</file>
     <file>parley-crown-symbolic.svg</file>
     <file>parley-edit-copy-symbolic.svg</file>
     <file>parley-emblem-system-symbolic.svg</file>
+    <file>parley-emoji-activities-symbolic.svg</file>
+    <file>parley-emoji-flags-symbolic.svg</file>
+    <file>parley-emoji-food-symbolic.svg</file>
+    <file>parley-emoji-nature-symbolic.svg</file>
+    <file>parley-emoji-objects-symbolic.svg</file>
+    <file>parley-emoji-symbols-symbolic.svg</file>
+    <file>parley-emoji-travel-symbolic.svg</file>
+    <file>parley-face-angel-symbolic.svg</file>
+    <file>parley-face-cool-symbolic.svg</file>
+    <file>parley-face-devilish-symbolic.svg</file>
+    <file>parley-face-glasses-symbolic.svg</file>
+    <file>parley-face-kiss-symbolic.svg</file>
+    <file>parley-face-laugh-symbolic.svg</file>
+    <file>parley-face-monkey-symbolic.svg</file>
+    <file>parley-face-raspberry-symbolic.svg</file>
+    <file>parley-face-smile-big-symbolic.svg</file>
+    <file>parley-face-surprise-symbolic.svg</file>
+    <file>parley-face-wink-symbolic.svg</file>
+    <file>parley-input-gaming-symbolic.svg</file>
     <file>parley-list-add-symbolic.svg</file>
     <file>parley-microphone-disabled-symbolic.svg</file>
     <file>parley-open-menu-symbolic.svg</file>
     <file>parley-sidebar-show-symbolic.svg</file>
+    <file>parley-starred-symbolic.svg</file>
     <file>parley-system-users-symbolic.svg</file>
     <file>parley-video-display-symbolic.svg</file>
     <file>parley-view-fullscreen-symbolic.svg</file>
     <file>parley-view-grid-symbolic.svg</file>
     <file>parley-view-more-symbolic.svg</file>
+    <file>parley-weather-clear-night-symbolic.svg</file>
+    <file>parley-weather-clear-symbolic.svg</file>
   </gresource>
 </gresources>

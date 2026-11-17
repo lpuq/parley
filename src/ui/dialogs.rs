@@ -639,6 +639,18 @@ pub fn settings(app: &Rc<App>) {
     let copy = gtk::Button::builder().icon_name("parley-edit-copy-symbolic").valign(gtk::Align::Center).css_classes(["flat"]).action_name("app.copy-my-code").build();
     code_row.add_suffix(&copy);
     prof.add(&code_row);
+    let pic_row = adw::ActionRow::builder().title("Your picture").subtitle("Only on this computer").build();
+    let my_name = app.store.borrow().my_name.clone();
+    pic_row.add_prefix(&super::identity::avatar(32, &my_name, &app.me()));
+    let pic_btn = gtk::Button::builder().label("Change…").valign(gtk::Align::Center).build();
+    let (a, dd) = (app.clone(), d.clone());
+    pic_btn.connect_clicked(move |_| {
+        dd.close();
+        let me = a.me();
+        a.edit_picture(me);
+    });
+    pic_row.add_suffix(&pic_btn);
+    prof.add(&pic_row);
     gen_.add(&prof);
     let look = adw::PreferencesGroup::new();
     look.set_title("Appearance");
@@ -653,7 +665,18 @@ pub fn settings(app: &Rc<App>) {
         .subtitle("The end of each person's key, telling apart people with the same name. Strangers calling always show theirs.")
         .active(s.show_tags)
         .build();
+    let pictures = adw::ComboRow::builder()
+        .title("Pictures")
+        .subtitle("For people you haven't chosen a picture for")
+        .model(&gtk::StringList::new(&["Patterns from each key", "Initials (GNOME style)"]))
+        .build();
+    pictures.set_selected(if s.picture_style == crate::store::PictureStyle::Initials { 1 } else { 0 });
+    let a = app.clone();
+    pictures.connect_selected_notify(move |r| {
+        a.set_picture_style(if r.selected() == 1 { crate::store::PictureStyle::Initials } else { crate::store::PictureStyle::Pattern });
+    });
     look.add(&style_row);
+    look.add(&pictures);
     look.add(&tags);
     gen_.add(&look);
     let a = app.clone();
@@ -905,6 +928,8 @@ pub fn user_info(app: &Rc<App>, id: iroh::EndpointId) {
     title.set_markup(&identity::tagged_markup_always(&c.name, &id));
     title.add_css_class("title-2");
     top.append(&title);
+    let pic = gtk::Button::builder().label("Change picture…").halign(gtk::Align::Center).css_classes(["flat"]).build();
+    top.append(&pic);
     let status = gtk::Label::new(Some(match app.presence_of(&id) {
         crate::proto::Presence::Online => "Online",
         crate::proto::Presence::DoNotDisturb => "Do not disturb",
@@ -959,6 +984,11 @@ pub fn user_info(app: &Rc<App>, id: iroh::EndpointId) {
     g.add(&adw::ActionRow::builder().title("Version").subtitle(&version).css_classes(["property"]).build());
     page.add(&g);
 
+    let (a, dd) = (app.clone(), d.clone());
+    pic.connect_clicked(move |_| {
+        dd.close();
+        a.edit_picture(id);
+    });
     tv.set_content(Some(&page));
     d.set_child(Some(&tv));
     d.present(Some(&app.window));

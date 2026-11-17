@@ -4,6 +4,7 @@ mod callview;
 mod chat;
 mod dialogs;
 pub mod identity;
+mod picture;
 mod qr;
 mod sidebar;
 mod tray;
@@ -150,6 +151,8 @@ impl App {
         let store = Store::load();
         apply_appearance(store.settings.appearance);
         identity::set_show_tags(store.settings.show_tags);
+        identity::set_initials_style(store.settings.picture_style == crate::store::PictureStyle::Initials);
+        picture::load_all(&store);
         let (pw_tx, pw_rx) = async_channel::unbounded();
         let app_audio = AppAudio::start(pw_tx);
 
@@ -677,6 +680,10 @@ impl App {
         add("new-group", Box::new(|t| dialogs::new_group(t)));
         add("settings", Box::new(|t| dialogs::settings(t)));
         add("rename-me", Box::new(|t| dialogs::ask_name(t, false)));
+        add("edit-my-picture", Box::new(|t| {
+            let name = t.store.borrow().my_name.clone();
+            picture::edit(t, t.me(), if name.is_empty() { "You" } else { &name })
+        }));
         add("accept-call", Box::new(|t| t.answer(true)));
         add("decline-call", Box::new(|t| t.answer(false)));
         add("show", Box::new(|t| t.present()));
@@ -1292,6 +1299,36 @@ impl App {
         self.presence.borrow().get(id).copied().unwrap_or(Presence::Offline)
     }
 
+    /// Redraws everyone's pictures (one was chosen or cleared, or the style changed).
+    pub fn refresh_pictures(self: &Rc<Self>) {
+        self.sidebar.refresh(self);
+        if let Some(c) = self.chat_view.conv() {
+            self.chat_view.show(self, c);
+        }
+        self.call_view.rebuild(self);
+    }
+
+    pub fn edit_picture(self: &Rc<Self>, id: EndpointId) {
+        let name = if id == self.me() { self.store.borrow().my_name.clone() } else { self.known_name(&id) };
+        picture::edit(self, id, &name);
+    }
+
+    /// Settings → Appearance → Pictures.
+    pub fn set_picture_style(self: &Rc<Self>, style: crate::store::PictureStyle) {
+        self.store.borrow_mut().settings.picture_style = style;
+        self.store.borrow().save();
+        identity::set_initials_style(style == crate::store::PictureStyle::Initials);
+        self.refresh_pictures();
+    }
+
+    /// Someone's name: as a friend, else as their group knows them, else their short ID.
+    pub fn known_name(&self, id: &EndpointId) -> String {
+        let st = self.store.borrow();
+        st.name_for(id)
+            .or_else(|| st.groups.iter().flat_map(|g| g.members.iter()).find(|m| m.id == *id).map(|m| m.name.clone()))
+            .unwrap_or_else(|| id.fmt_short().to_string())
+    }
+
     /// Shows or hides #tags everywhere at once.
     pub fn set_show_tags(self: &Rc<Self>, on: bool) {
         self.store.borrow_mut().settings.show_tags = on;
@@ -1461,6 +1498,7 @@ impl App {
             st.moves.push(notice);
             st.move_pending = st.known_peers(&new_id);
             st.save();
+            picture::load_all(&st);
         }
         if let Err(e) = crate::store::commit_identity() {
             tracing::error!("switching identity: {e:#}");
@@ -1544,6 +1582,7 @@ impl App {
         }
         if changed {
             self.save();
+            picture::load_all(&self.store.borrow());
         }
         // An open conversation shows them under their new identity.
         match self.chat_view.conv() {

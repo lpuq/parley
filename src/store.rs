@@ -389,6 +389,39 @@ pub struct Settings {
     pub appearance: Appearance,
     /// Show the #tag after names (the end of each person's key).
     pub show_tags: bool,
+    /// What people look like without a picture you chose.
+    pub picture_style: PictureStyle,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PictureStyle {
+    /// A pattern drawn from the person's key (no two identities alike).
+    #[default]
+    Pattern,
+    /// Initials on a colour, GNOME style.
+    Initials,
+}
+
+/// A picture chosen for someone (or ourselves). It stays on this computer.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Picture {
+    pub id: EndpointId,
+    pub kind: PictureKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum PictureKind {
+    /// An image, kept as [`picture_path`].
+    Image,
+    /// Letters, or a symbolic icon, on a colour or a gradient between two (#rrggbb).
+    Made { letters: String, icon: Option<String>, from: String, to: Option<String> },
+}
+
+/// Where an image picture is kept (a 256 px square PNG).
+pub fn picture_path(id: &EndpointId) -> PathBuf {
+    data_dir().join("pictures").join(format!("{id}.png"))
 }
 
 /// Light or dark, or whatever the system prefers (dark when it has no preference).
@@ -426,6 +459,7 @@ impl Default for Settings {
             sidebar_hidden: false,
             appearance: Appearance::System,
             show_tags: true,
+            picture_style: PictureStyle::Pattern,
         }
     }
 }
@@ -444,6 +478,8 @@ pub struct Store {
     pub move_pending: Vec<EndpointId>,
     /// Group members still to hear about removals from a group.
     pub group_news_pending: Vec<PendingNews>,
+    /// Pictures chosen for people (only on this computer).
+    pub pictures: Vec<Picture>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -497,6 +533,16 @@ impl Store {
     /// keeping names and when they were added. Returns whether anything changed.
     pub fn replace_id(&mut self, old: &EndpointId, new: &EndpointId) -> bool {
         let mut changed = false;
+        // A picture chosen for them follows (unless the new identity has one already).
+        if !self.pictures.iter().any(|p| &p.id == new) {
+            if let Some(p) = self.pictures.iter_mut().find(|p| &p.id == old) {
+                p.id = *new;
+                if p.kind == PictureKind::Image {
+                    let _ = fs::rename(picture_path(old), picture_path(new));
+                }
+                changed = true;
+            }
+        }
         if self.contacts.iter().any(|c| &c.id == new) {
             let before = self.contacts.len();
             self.contacts.retain(|c| &c.id != old);
@@ -532,6 +578,10 @@ impl Store {
         }
         v.retain(|id| id != me);
         v
+    }
+
+    pub fn picture(&self, id: &EndpointId) -> Option<&Picture> {
+        self.pictures.iter().find(|p| &p.id == id)
     }
 
     pub fn contact(&self, id: &EndpointId) -> Option<&Contact> {
