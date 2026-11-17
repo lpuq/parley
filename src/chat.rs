@@ -52,6 +52,20 @@ pub struct Message {
     /// Sender's clock, Unix milliseconds.
     pub ts: u64,
     pub text: String,
+    /// Not a message but a call `from` started (kept locally, never sent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call: Option<CallRecord>,
+}
+
+/// How a call went, filled in when it ends.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CallRecord {
+    /// How long it lasted, once over (if anyone answered).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lasted_s: Option<u64>,
+    /// Someone called us and we didn't answer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub missed: bool,
 }
 
 /// One of our messages still owed to some recipients.
@@ -130,6 +144,27 @@ impl ChatStore {
             v.remove(0);
         }
         true
+    }
+
+    /// Fills in how a call went (rewriting its line in the history file).
+    pub fn finish_call(&mut self, conv: &Conv, id: &str, record: CallRecord) {
+        self.messages(conv);
+        let Some(m) = self.history.get_mut(conv).and_then(|v| v.iter_mut().find(|m| m.id == id)) else { return };
+        m.call = Some(record);
+        let m = m.clone();
+        let path = self.file(conv);
+        let Ok(text) = std::fs::read_to_string(&path) else { return };
+        let lines: Vec<String> = text
+            .lines()
+            .map(|l| match serde_json::from_str::<Message>(l) {
+                Ok(x) if x.id == m.id => serde_json::to_string(&m).unwrap_or_else(|_| l.to_string()),
+                _ => l.to_string(),
+            })
+            .collect();
+        let tmp = path.with_extension("jsonl.tmp");
+        if std::fs::write(&tmp, lines.join("\n") + "\n").is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
 
     /// Our messages in `conv` that haven't reached everyone yet, and whether any
@@ -283,7 +318,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut c = ChatStore { dir: dir.clone(), history: HashMap::new(), ids: HashMap::new(), outbox: Vec::new(), unread: HashMap::new() };
         let (me, old, new) = (iroh::SecretKey::generate().public(), iroh::SecretKey::generate().public(), iroh::SecretKey::generate().public());
-        let msg = |id: &str, from| Message { id: id.into(), from, ts: 1, text: "hi".into() };
+        let msg = |id: &str, from| Message { id: id.into(), from, ts: 1, text: "hi".into(), call: None };
         let (d, g) = (Conv::Direct(old), Conv::Group([7; 32]));
         c.add(&d, msg("a", old));
         c.add(&d, msg("b", me));
@@ -299,6 +334,12 @@ mod tests {
         assert_eq!(c.outbox[0].to, [new]);
         assert_eq!(c.outbox[0].conv_key, nd.key());
         assert_eq!((c.unread(&d), c.unread(&nd)), (0, 2));
+
+        // A call record is filled in when the call ends, on disk too.
+        c.add(&nd, Message { id: "call".into(), from: new, ts: 2, text: String::new(), call: Some(CallRecord::default()) });
+        c.finish_call(&nd, "call", CallRecord { lasted_s: Some(95), missed: false });
+        c.history.clear();
+        assert_eq!(c.messages(&nd).last().unwrap().call.as_ref().unwrap().lasted_s, Some(95));
         let _ = std::fs::remove_dir_all(dir);
     }
 

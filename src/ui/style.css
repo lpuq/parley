@@ -167,3 +167,8 @@ row.conv-open { background-color: alpha(currentColor, 0.08); }
 
 /* The group owner's crown in the members list. */
 .owner-crown { color: #f0b232; }
+
+/* Call records in the chat ("Bob started a call that lasted 5 minutes."). */
+.chat-call image { color: alpha(currentColor, 0.55); }
+.chat-call image.ongoing { color: @speak_green; }
+.chat-call image.missed { color: #f23f42; }

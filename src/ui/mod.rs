@@ -133,6 +133,25 @@ pub struct App {
     chat_inflight: RefCell<std::collections::HashSet<EndpointId>>,
     /// Home page: "Return to call", shown while in a call.
     home_return: gtk::Button,
+    /// Calls ringing or under way, by conversation, for their record in the chat.
+    open_calls: RefCell<HashMap<crate::chat::Conv, OpenCall>>,
+}
+
+/// A call's record in its conversation ("Bob started a call"), until it's over.
+struct OpenCall {
+    id: String,
+    started: Instant,
+    connected: Option<Instant>,
+    incoming: bool,
+    /// A group call we've seen people in (it's over once they've all left).
+    seen_active: bool,
+}
+
+fn conv_of(room: RoomKey) -> crate::chat::Conv {
+    match room {
+        RoomKey::Direct(id) => crate::chat::Conv::Direct(id),
+        RoomKey::Group(r) => crate::chat::Conv::Group(r),
+    }
 }
 
 impl App {
@@ -231,6 +250,7 @@ impl App {
                 .css_classes(["pill", "join-btn"])
                 .visible(false)
                 .build(),
+            open_calls: RefCell::new(HashMap::new()),
         });
 
         // ----- layout -----
@@ -473,7 +493,8 @@ impl App {
 
     fn start_tray(self: &Rc<Self>) {
         let (tx, rx) = async_channel::unbounded();
-        let tray = tray::ParleyTray { tx, in_call: false, muted: false, icons: tray::icon_pixmaps() };
+        let icons = tray::icon_pixmaps();
+        let tray = tray::ParleyTray { tx, in_call: false, muted: false, unread: self.any_unread(), icons_unread: tray::with_dot(&icons), icons };
         let sandboxed = std::path::Path::new("/.flatpak-info").exists();
         let rt = self.rt.clone();
         let t = self.clone();
@@ -501,14 +522,19 @@ impl App {
     /// Mirror call state into the tray menu.
     fn update_tray(&self) {
         let Some(h) = self.tray.borrow().clone() else { return };
-        let (in_call, st) = (self.room.get().is_some(), self.state.get());
+        let (in_call, st, unread) = (self.room.get().is_some(), self.state.get(), self.any_unread());
         self.rt.spawn(async move {
             h.update(|t| {
                 t.in_call = in_call;
                 t.muted = st.mic_muted || st.deafened;
+                t.unread = unread;
             })
             .await;
         });
+    }
+
+    fn any_unread(&self) -> bool {
+        self.chat.borrow().unread.values().any(|n| *n > 0)
     }
 
     pub fn me(&self) -> EndpointId {
@@ -752,6 +778,8 @@ impl App {
         self.outgoing.set_child(Some(&cancel));
         self.content.set_visible_child_name("outgoing");
         self.net.send(NetCmd::CallDirect(id));
+        let me = self.me();
+        self.call_record_start(crate::chat::Conv::Direct(id), me, false);
         self.set_ringer(Some(RingKind::Outgoing));
     }
 
@@ -802,6 +830,10 @@ impl App {
             }
         } else {
             self.net.send(NetCmd::Decline(inc.room));
+            // A declined direct call is over; a group call goes on without us.
+            if let RoomKey::Direct(_) = inc.room {
+                self.call_record_end(conv_of(inc.room));
+            }
         }
     }
 
@@ -872,6 +904,10 @@ impl App {
                     }
                     self.set_ringer(None);
                     self.withdraw_notification();
+                }
+                // They gave up ringing: a missed call (group calls end when they empty).
+                if let RoomKey::Direct(_) = room {
+                    self.call_record_end(conv_of(room));
                 }
             }
             UiEvent::OutgoingRinging => {
@@ -999,6 +1035,7 @@ impl App {
                     Some(c) => self.call_presence.borrow_mut().insert(id, c),
                     None => self.call_presence.borrow_mut().remove(&id),
                 };
+                self.check_group_call_records();
                 self.sidebar.refresh_soon();
             }
         }
@@ -1133,6 +1170,7 @@ impl App {
     fn mark_read(&self, conv: crate::chat::Conv) {
         if self.chat.borrow().unread(&conv) > 0 {
             self.chat.borrow_mut().set_unread(&conv, 0);
+            self.update_tray();
             self.sidebar.refresh_soon();
         }
     }
@@ -1180,7 +1218,7 @@ impl App {
 
     pub fn send_chat(self: &Rc<Self>, conv: crate::chat::Conv, text: String) {
         let wire = crate::proto::WireMsg { id: crate::chat::new_id(), ts: crate::chat::now_ms(), text };
-        let msg = crate::chat::Message { id: wire.id.clone(), from: self.me(), ts: wire.ts, text: wire.text.clone() };
+        let msg = crate::chat::Message { id: wire.id.clone(), from: self.me(), ts: wire.ts, text: wire.text.clone(), call: None };
         let to = self.chat_recipients(&conv);
         {
             let mut c = self.chat.borrow_mut();
@@ -1253,7 +1291,7 @@ impl App {
         }
         let mut fresh = Vec::new();
         for m in msgs {
-            let msg = crate::chat::Message { id: m.id, from, ts: m.ts, text: m.text };
+            let msg = crate::chat::Message { id: m.id, from, ts: m.ts, text: m.text, call: None };
             if self.chat.borrow_mut().add(&conv, msg.clone()) {
                 fresh.push(msg);
             }
@@ -1271,6 +1309,7 @@ impl App {
         }
         let unread = self.chat.borrow().unread(&conv) + fresh.len() as u32;
         self.chat.borrow_mut().set_unread(&conv, unread);
+        self.update_tray();
         self.sidebar.refresh_soon();
         if self.dnd() {
             return;
@@ -1339,6 +1378,79 @@ impl App {
             self.chat_view.show(self, c);
         }
         self.call_view.rebuild(self);
+    }
+
+    // ------------------------------------------------------------ call records
+
+    /// "X started a call" in the conversation (kept locally, never sent).
+    fn call_record_start(self: &Rc<Self>, conv: crate::chat::Conv, from: EndpointId, incoming: bool) {
+        if self.open_calls.borrow().contains_key(&conv) {
+            return;
+        }
+        let call = Some(crate::chat::CallRecord::default());
+        let msg = crate::chat::Message { id: crate::chat::new_id(), from, ts: crate::chat::now_ms(), text: String::new(), call };
+        self.chat.borrow_mut().add(&conv, msg.clone());
+        self.open_calls
+            .borrow_mut()
+            .insert(conv, OpenCall { id: msg.id.clone(), started: Instant::now(), connected: None, incoming, seen_active: false });
+        if self.chat_view.conv() == Some(conv) {
+            self.chat_view.append(self, &msg, None);
+        }
+    }
+
+    /// The call is over: how long it lasted, or that we missed it.
+    fn call_record_end(self: &Rc<Self>, conv: crate::chat::Conv) {
+        let Some(o) = self.open_calls.borrow_mut().remove(&conv) else { return };
+        let record = match (conv, o.connected) {
+            // A group call's length is the whole call's, from when it started.
+            (crate::chat::Conv::Group(_), _) => crate::chat::CallRecord { lasted_s: Some(o.started.elapsed().as_secs()), missed: false },
+            (_, Some(c)) => crate::chat::CallRecord { lasted_s: Some(c.elapsed().as_secs()), missed: false },
+            (_, None) => crate::chat::CallRecord { lasted_s: None, missed: o.incoming },
+        };
+        let missed = record.missed;
+        self.chat.borrow_mut().finish_call(&conv, &o.id, record);
+        if missed && !self.chat_visible(conv) {
+            let n = self.chat.borrow().unread(&conv) + 1;
+            self.chat.borrow_mut().set_unread(&conv, n);
+            self.update_tray();
+            self.sidebar.refresh_soon();
+        }
+        if self.chat_view.conv() == Some(conv) {
+            self.chat_view.show(self, conv);
+        }
+    }
+
+    /// Group calls we're not in are over once nobody's left in them.
+    fn check_group_call_records(self: &Rc<Self>) {
+        let mine = self.room.get();
+        let groups: Vec<crate::store::RoomId> = self
+            .open_calls
+            .borrow()
+            .keys()
+            .filter_map(|c| match c {
+                crate::chat::Conv::Group(r) if mine != Some(RoomKey::Group(*r)) => Some(*r),
+                _ => None,
+            })
+            .collect();
+        for r in groups {
+            let active = !self.group_call_members(&r).is_empty();
+            let conv = crate::chat::Conv::Group(r);
+            let over = {
+                let mut open = self.open_calls.borrow_mut();
+                let Some(o) = open.get_mut(&conv) else { continue };
+                o.seen_active |= active;
+                // (Right after the ring, the caller's status may not have arrived yet.)
+                !active && (o.seen_active || o.started.elapsed() > std::time::Duration::from_secs(60))
+            };
+            if over {
+                self.call_record_end(conv);
+            }
+        }
+    }
+
+    /// Whether this call record is for a call still going on.
+    pub fn call_ongoing(&self, id: &str) -> bool {
+        self.open_calls.borrow().values().any(|o| o.id == id)
     }
 
     // ------------------------------------------------------------ group owners
@@ -1612,6 +1724,7 @@ impl App {
     }
 
     fn show_incoming(self: &Rc<Self>, room: RoomKey, from: EndpointId, name: String, group_name: Option<String>) {
+        self.call_record_start(conv_of(room), from, true);
         // Take it out first: closing fires the response handler, which reads `incoming`.
         let old = self.incoming.borrow_mut().take();
         if let Some(old) = old {
@@ -1636,7 +1749,11 @@ impl App {
             );
         }
         let dialog = adw::AlertDialog::new(Some(&heading), Some(&body));
-        dialog.add_responses(&[("decline", "Decline"), ("accept", "Answer")]);
+        if group_name.is_some() {
+            dialog.add_responses(&[("decline", "Not now"), ("accept", "Join")]);
+        } else {
+            dialog.add_responses(&[("decline", "Decline"), ("accept", "Answer")]);
+        }
         dialog.set_response_appearance("decline", adw::ResponseAppearance::Destructive);
         dialog.set_response_appearance("accept", adw::ResponseAppearance::Suggested);
         dialog.set_default_response(Some("accept"));
@@ -1658,20 +1775,26 @@ impl App {
             None => name,
         };
         *self.incoming.borrow_mut() = Some(Incoming { room, from, name: plain, dialog: dialog.clone() });
-        self.present();
+        // Shown inside Parley; only a direct call brings the window forward. A group call
+        // just rings (whoever starts one rings everyone, and joining is optional).
         dialog.present(Some(&self.window));
-        // Do Not Disturb: the call still shows up, but silently.
+        // Do Not Disturb: no sound, nothing pops up; the call is there in Parley (and in
+        // the chat, as a missed call).
         if self.dnd() {
             return;
+        }
+        let group = group_name.is_some();
+        if !group {
+            self.present();
         }
         self.set_ringer(Some(RingKind::Incoming));
 
         if !self.window.is_active() {
             let n = gio::Notification::new(&heading);
-            n.set_body(Some("Parley call"));
-            n.set_priority(gio::NotificationPriority::Urgent);
-            n.add_button("Decline", "app.decline-call");
-            n.add_button("Answer", "app.accept-call");
+            n.set_body(Some(if group { "Group call — join if you like" } else { "Parley call" }));
+            n.set_priority(if group { gio::NotificationPriority::Normal } else { gio::NotificationPriority::Urgent });
+            n.add_button(if group { "Not now" } else { "Decline" }, "app.decline-call");
+            n.add_button(if group { "Join" } else { "Answer" }, "app.accept-call");
             n.set_default_action("app.show");
             self.app.send_notification(Some("incoming"), &n);
         }
@@ -1690,6 +1813,21 @@ impl App {
             return;
         }
         self.room.set(Some(room));
+        // A record if there isn't one yet: we started this group call, or joined one
+        // without being rung (then whoever's in it started it, as far as we know).
+        let conv = conv_of(room);
+        if !self.open_calls.borrow().contains_key(&conv) {
+            let me = self.me();
+            let from = match room {
+                RoomKey::Group(r) => self.group_call_members(&r).into_iter().map(|(id, _)| id).find(|id| *id != me).unwrap_or(me),
+                RoomKey::Direct(_) => me,
+            };
+            self.call_record_start(conv, from, false);
+        }
+        if let Some(o) = self.open_calls.borrow_mut().get_mut(&conv) {
+            o.connected.get_or_insert_with(Instant::now);
+            o.seen_active = true;
+        }
         self.call_started.set(Some(Instant::now()));
         self.participants.borrow_mut().clear();
         let mut st = self.state.get();
@@ -1709,7 +1847,22 @@ impl App {
         self.update_tray();
     }
 
-    fn end_call_media(&self) {
+    fn end_call_media(self: &Rc<Self>) {
+        // Our call's record: a direct call is over; a group call is over once empty.
+        let ended = self.room.get();
+        let me = self.me();
+        let open: Vec<crate::chat::Conv> = self.open_calls.borrow().keys().copied().collect();
+        for conv in open {
+            match conv {
+                crate::chat::Conv::Direct(_) => self.call_record_end(conv),
+                crate::chat::Conv::Group(r) if ended == Some(RoomKey::Group(r)) => {
+                    if !self.group_call_members(&r).iter().any(|(id, _)| *id != me) {
+                        self.call_record_end(conv);
+                    }
+                }
+                _ => {}
+            }
+        }
         self.set_ringer(None);
         self.unwatched.borrow_mut().clear();
         self.room.set(None);
@@ -2267,7 +2420,7 @@ impl App {
                 if r.as_ref().is_some_and(|x| x.kind == k) {
                     return;
                 }
-                *r = Ringer::start(k);
+                *r = self.sound_sink().and_then(|sink| Ringer::start(k, sink));
             }
         }
     }
@@ -2344,6 +2497,14 @@ thread_local! {
 
 impl App {
     /// A short two-note chime: rising when someone joins, falling when someone leaves.
+    /// Where chimes and ringing go: the chosen speaker, else the default one.
+    fn sound_sink(&self) -> Option<gst::Element> {
+        use gst::prelude::*;
+        let name = self.store.borrow().settings.speaker.clone();
+        let speaker = devices::find(&devices::speakers(), &name).and_then(|d| d.device.create_element(None).ok());
+        speaker.map(Ok).unwrap_or_else(|| gst::ElementFactory::make("autoaudiosink").build()).ok()
+    }
+
     fn play_cue(&self, cue: Cue) {
         use gst::prelude::*;
         // Several people arriving at once (joining a group) get one chime.
@@ -2372,11 +2533,7 @@ impl App {
             note(a, 6_000).chain(note(b, 12_000)).flat_map(|s| s.to_le_bytes()).collect()
         };
 
-        let speaker = {
-            let name = self.store.borrow().settings.speaker.clone();
-            devices::find(&devices::speakers(), &name).and_then(|d| d.device.create_element(None).ok())
-        };
-        let Ok(sink) = speaker.map(Ok).unwrap_or_else(|| gst::ElementFactory::make("autoaudiosink").build()) else { return };
+        let Some(sink) = self.sound_sink() else { return };
         let src = gst_app::AppSrc::builder()
             .caps(&gst::Caps::builder("audio/x-raw").field("format", "S16LE").field("layout", "interleaved").field("rate", 48_000i32).field("channels", 1i32).build())
             .format(gst::Format::Time)
@@ -2406,44 +2563,90 @@ impl App {
 struct Ringer {
     kind: RingKind,
     pipeline: gst::Pipeline,
-    timer: Option<glib::SourceId>,
+}
+
+const SR: usize = 48_000;
+
+/// Adds a soft struck-bell note (marimba-like: quick attack, smooth decay, gentle
+/// overtones that fade first) to `out` at `at` seconds.
+fn bell(out: &mut [f32], at: f64, freq: f64, gain: f64, decay: f64) {
+    use std::f64::consts::TAU;
+    let start = (at * SR as f64) as usize;
+    for (i, o) in out.iter_mut().skip(start).enumerate() {
+        let t = i as f64 / SR as f64;
+        let env = (1.0 - (-t * 500.0).exp()) * (-t * decay).exp();
+        if t > 0.05 && env < 1e-4 {
+            break;
+        }
+        let tone = (TAU * freq * t).sin() + 0.18 * (-t * decay * 2.0).exp() * (TAU * 2.0 * freq * t).sin() + 0.06 * (-t * decay * 4.0).exp() * (TAU * 3.0 * freq * t).sin();
+        *o += (gain * env * tone) as f32;
+    }
+}
+
+/// One period of a ring, as 48 kHz mono S16LE.
+fn ring_pcm(kind: RingKind) -> Vec<u8> {
+    const C5: f64 = 523.25;
+    const E5: f64 = 659.25;
+    const G5: f64 = 783.99;
+    const C6: f64 = 1046.5;
+    let (period, notes, gain, decay): (f64, &[(f64, f64)], f64, f64) = match kind {
+        // A rising chime, then a softer answer, then quiet.
+        RingKind::Incoming => (3.2, &[(0.0, C5), (0.16, E5), (0.32, G5), (0.48, C6), (1.15, E5), (1.31, G5), (1.47, C6)], 0.16, 4.5),
+        // A quiet double tap while it rings at the other end.
+        RingKind::Outgoing => (3.5, &[(0.0, E5), (0.32, E5)], 0.07, 5.5),
+    };
+    let mut out = vec![0f32; (period * SR as f64) as usize];
+    for &(at, f) in notes {
+        bell(&mut out, at, f, gain, decay);
+    }
+    out.iter().flat_map(|s| ((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes()).collect()
+}
+
+/// One period of the incoming (or outgoing) ring, 48 kHz mono S16LE, for listening
+/// to it outside a call (`cargo run --example ring_preview`).
+pub fn ring_preview(incoming: bool) -> Vec<u8> {
+    ring_pcm(if incoming { RingKind::Incoming } else { RingKind::Outgoing })
 }
 
 impl Ringer {
-    fn start(kind: RingKind) -> Option<Self> {
+    fn start(kind: RingKind, sink: gst::Element) -> Option<Self> {
         use gst::prelude::*;
-        let (freq, vol, on_ms, period_ms) = match kind {
-            RingKind::Incoming => (880.0, 0.18, 1000, 2500),
-            RingKind::Outgoing => (440.0, 0.08, 1200, 4000),
-        };
-        let pipeline = gst::parse::launch(&format!(
-            "audiotestsrc wave=sine freq={freq} is-live=true ! volume name=v volume={vol} mute=true ! audioconvert ! autoaudiosink"
-        ))
-        .ok()?
-        .downcast::<gst::Pipeline>()
-        .ok()?;
+        let period = std::sync::Arc::new(ring_pcm(kind));
+        let dur = gst::ClockTime::from_nseconds((period.len() / 2) as u64 * 1_000_000_000 / SR as u64);
+        let src = gst_app::AppSrc::builder()
+            .caps(&gst::Caps::builder("audio/x-raw").field("format", "S16LE").field("layout", "interleaved").field("rate", SR as i32).field("channels", 1i32).build())
+            .format(gst::Format::Time)
+            .build();
+        // Loops the period for as long as it rings.
+        let n = std::sync::atomic::AtomicU64::new(0);
+        src.set_callbacks(
+            gst_app::AppSrcCallbacks::builder()
+                .need_data(move |src, _| {
+                    let i = n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let mut buf = gst::Buffer::from_slice(period.as_ref().clone());
+                    if let Some(b) = buf.get_mut() {
+                        b.set_pts(dur * i);
+                        b.set_duration(dur);
+                    }
+                    let _ = src.push_buffer(buf);
+                })
+                .build(),
+        );
+        let pipeline = gst::Pipeline::new();
+        let conv = gst::ElementFactory::make("audioconvert").build().ok()?;
+        let resample = gst::ElementFactory::make("audioresample").build().ok()?;
+        pipeline.add_many([src.upcast_ref(), &conv, &resample, &sink]).ok()?;
+        gst::Element::link_many([src.upcast_ref(), &conv, &resample, &sink]).ok()?;
         pipeline.call_async(|p| {
             let _ = p.set_state(gst::State::Playing);
         });
-        let v = pipeline.by_name("v")?;
-        let start = Instant::now();
-        let timer = glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
-            let t = start.elapsed().as_millis() as u64 % period_ms;
-            // Two short pulses at the start of each period.
-            let on = t < on_ms && (t / 250) % 2 == 0;
-            v.set_property("mute", !on);
-            glib::ControlFlow::Continue
-        });
-        Some(Self { kind, pipeline, timer: Some(timer) })
+        Some(Self { kind, pipeline })
     }
 }
 
 impl Drop for Ringer {
     fn drop(&mut self) {
         use gst::prelude::*;
-        if let Some(t) = self.timer.take() {
-            t.remove();
-        }
         self.pipeline.call_async(|p| {
             let _ = p.set_state(gst::State::Null);
         });

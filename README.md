@@ -28,7 +28,9 @@ have to run or pay for.
   your processed mic back a second later.
 - **Text chat.** Message friends and groups in a Discord-like view: messages grouped
   under each person's picture and name, day separators, clickable links, unread
-  counts and notifications. Chat during a call in a side panel. Messages travel
+  counts and notifications (and a red dot on the tray icon). Calls show up in the
+  conversation, Discord-style: "Bob started a call that lasted 5 minutes", or a
+  missed call. Chat during a call in a side panel. Messages travel
   directly between you, encrypted; with no server to hold them, a message to someone
   offline waits on your computer (greyed out) and is delivered as soon as you're both
   online. History stays on each person's computer.
@@ -43,7 +45,8 @@ have to run or pay for.
   or the menu → *Change my picture*). Pictures stay on your computer; nobody else sees
   them.
 - **Online status.** See which friends are online or on Do Not Disturb (calls arrive
-  silently), and go Invisible to look offline. Group calls list who's in them under
+  without a sound and nothing pops up), and go Invisible to look offline. A group
+  call rings but doesn't pull Parley to the front; joining is up to you. Group calls list who's in them under
   the group, with a red LIVE badge for anyone sharing their screen and their
   mute/deafen state, so you can see who's there before joining.
 - **Screen share with app audio.** Share all desktop audio or only chosen apps.

@@ -381,6 +381,12 @@ impl ChatView {
                 self.list.append(&sep);
             }
         }
+        if let Some(call) = &m.call {
+            // Messages after it start a fresh group.
+            self.last.set(Some((m.from, 0, day)));
+            self.list.append(&call_row(app, &conv, m, call, when.as_ref()));
+            return;
+        }
         let continues = last.is_some_and(|(from, ts, d)| from == m.from && d == day && m.ts.saturating_sub(ts) < GROUP_MS);
         self.last.set(Some((m.from, m.ts, day)));
 
@@ -432,6 +438,58 @@ impl ChatView {
     }
 }
 
+/// "Bob started a call that lasted 5 minutes.", like Discord.
+fn call_row(app: &Rc<App>, conv: &Conv, m: &Message, call: &crate::chat::CallRecord, when: Option<&glib::DateTime>) -> gtk::Box {
+    let who = if m.from == app.me() {
+        "You".to_string()
+    } else {
+        identity::tagged_markup(&app.name_in(conv, &m.from), &m.from)
+    };
+    let soft = |t: &str| format!("<span alpha=\"70%\">{}</span>", glib::markup_escape_text(t));
+    let (text, state) = if call.missed {
+        (format!("{}<b>{who}</b>{}", soft("You missed a call from "), soft(".")), "missed")
+    } else if let Some(s) = call.lasted_s {
+        (format!("<b>{who}</b>{}", soft(&format!(" started a call that lasted {}.", lasted(s)))), "ended")
+    } else if app.call_ongoing(&m.id) {
+        (format!("<b>{who}</b>{}", soft(" started a call.")), "ongoing")
+    } else {
+        (format!("<b>{who}</b>{}", soft(" started a call.")), "ended")
+    };
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    row.add_css_class("chat-msg");
+    row.add_css_class("first");
+    row.add_css_class("chat-call");
+    let icon = gtk::Image::from_icon_name("parley-call-start-symbolic");
+    icon.add_css_class(state);
+    icon.set_margin_start(12);
+    icon.set_margin_end(8);
+    let label = gtk::Label::new(None);
+    label.set_markup(&text);
+    label.set_wrap(true);
+    label.set_xalign(0.0);
+    let ts = gtk::Label::new(Some(&when.map(stamp).unwrap_or_default()));
+    ts.add_css_class("caption");
+    ts.add_css_class("dim-label");
+    row.append(&icon);
+    row.append(&label);
+    row.append(&ts);
+    if let Some(d) = when {
+        row.set_tooltip_text(Some(&d.format("%A, %B %e, %Y %H:%M").map(|s| s.to_string()).unwrap_or_default()));
+    }
+    row
+}
+
+/// Discord's wording: "a few seconds", "a minute", "12 minutes", "an hour", "3 hours".
+fn lasted(s: u64) -> String {
+    match s {
+        0..=44 => "a few seconds".into(),
+        45..=89 => "a minute".into(),
+        90..=3599 => format!("{} minutes", (s + 30) / 60),
+        3600..=5399 => "an hour".into(),
+        _ => format!("{} hours", (s + 1800) / 3600),
+    }
+}
+
 /// "Today at 14:03", "Yesterday at 09:12", or "14/11/2026 14:03".
 fn stamp(d: &glib::DateTime) -> String {
     let now = glib::DateTime::now_local().ok();
@@ -474,6 +532,12 @@ fn set_class(w: &gtk::Widget, class: &str, on: bool) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn call_lengths_read_like_discord() {
+        let l = super::lasted;
+        assert_eq!([l(5), l(60), l(150), l(59 * 60), l(3700), l(3 * 3600)], ["a few seconds", "a minute", "3 minutes", "59 minutes", "an hour", "3 hours"]);
+    }
+
     #[test]
     fn links_are_escaped_and_clickable() {
         assert_eq!(super::linkify("a <b> & c"), "a &lt;b&gt; &amp; c");

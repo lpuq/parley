@@ -31,6 +31,16 @@
     <content_attribute id="social-audio">intense</content_attribute>
   </content_rating>
   <releases>
+    <release version="0.10.0" date="2026-11-17">
+      <description>
+        <ul>
+          <li>A softer ringtone: a gentle chime instead of a beeping tone</li>
+          <li>Group calls ring without bringing Parley to the front; on Do Not Disturb, calls make no sound and nothing pops up</li>
+          <li>A red dot on the tray icon while there are unread messages</li>
+          <li>Calls show in the conversation: "Bob started a call that lasted 5 minutes", or a missed call</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.9.0" date="2026-11-17">
       <description>
         <ul>
