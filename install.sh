@@ -47,6 +47,38 @@ pkg_install() { # offer to install distro packages (the only step that may need 
   ask "Parley needs: $*. Install now with '$cmd'?" && eval "$cmd"
 }
 
+# Native (./install.sh --native) and Flatpak installs keep identity and contacts in
+# different places, and a native launcher in ~/.local/share/applications hides the
+# Flatpak's. When switching, carry the identity over and clear out the other install.
+NATIVE_DATA="${XDG_DATA_HOME:-$HOME/.local/share}/parley"
+NATIVE_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/parley"
+FLATPAK_DATA="$HOME/.var/app/$APP_ID/data/parley"
+FLATPAK_CONFIG="$HOME/.var/app/$APP_ID/config/parley"
+
+# copy_identity FROM_DATA FROM_CONFIG TO_DATA TO_CONFIG
+copy_identity() {
+  if [[ -f "$1/identity.key" && ! -f "$3/identity.key" ]]; then
+    mkdir -p "$3" "$4"
+    cp -rn "$1/." "$3/"
+    [[ -d "$2" ]] && cp -rn "$2/." "$4/"
+    say "Moved your identity and contacts over from the other Parley install"
+  fi
+}
+
+leave_native() {
+  local launcher="$HOME/.local/share/applications/$APP_ID.desktop"
+  copy_identity "$NATIVE_DATA" "$NATIVE_CONFIG" "$FLATPAK_DATA" "$FLATPAK_CONFIG"
+  if [[ -f "$HOME/.local/bin/parley" ]] || { [[ -f "$launcher" ]] && ! grep -q flatpak "$launcher"; }; then
+    # Stop a running native Parley (it would hold the app's name and answer for the
+    # Flatpak); never the Flatpak one.
+    for pid in $(pgrep -x parley); do
+      [[ "$(readlink "/proc/$pid/exe")" == "$HOME/.local/bin/parley" ]] && kill "$pid" 2>/dev/null
+    done
+    rm -f "$HOME/.local/bin/parley" "$launcher" "$HOME/.local/share/icons/hicolor/scalable/apps/$APP_ID.svg"
+    say "Removed the old native build so the app menu opens this Flatpak"
+  fi
+}
+
 # ---------------------------------------------------------------- uninstall
 if [[ $MODE == uninstall ]]; then
   flatpak uninstall --user -y "$APP_ID" 2>/dev/null || true
@@ -72,6 +104,10 @@ if [[ $MODE == native ]]; then
     fi
   fi
   cargo build --release
+  copy_identity "$FLATPAK_DATA" "$FLATPAK_CONFIG" "$NATIVE_DATA" "$NATIVE_CONFIG"
+  if flatpak info --user "$APP_ID" >/dev/null 2>&1; then
+    say "Note: the Flatpak version is installed too. Remove it with: flatpak uninstall --user $APP_ID"
+  fi
   install -Dm755 target/release/parley "$HOME/.local/bin/parley"
   install -Dm644 data/$APP_ID.desktop "$HOME/.local/share/applications/$APP_ID.desktop"
   install -Dm644 data/icons/$APP_ID.svg "$HOME/.local/share/icons/hicolor/scalable/apps/$APP_ID.svg"
@@ -93,6 +129,7 @@ need() { # install a runtime/extension for this user unless any installation has
 }
 
 finish() {
+  leave_native
   say "Installed! Open Parley from your app menu (or: flatpak run $APP_ID)."
   if flatpak ps --columns=application 2>/dev/null | grep -qx "$APP_ID"; then
     # It may be hidden in the background (tray icon) waiting for calls.
