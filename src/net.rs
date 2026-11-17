@@ -54,6 +54,8 @@ pub enum NetCmd {
     SendChat { to: EndpointId, group: Option<RoomId>, name: String, msgs: Vec<WireMsg> },
     /// Our identity moves (oldest first), and who still has to be told.
     Moves { chain: Vec<MoveNotice>, pending: Vec<EndpointId> },
+    /// Tell `to` who the group's owner removed.
+    GroupNews { to: EndpointId, news: GroupNews },
     /// Test hook: drop every connection abruptly, as a crash or network loss would.
     #[cfg(test)]
     SimulateDropout,
@@ -89,6 +91,10 @@ pub enum UiEvent {
     IdentityMoved { old: Vec<EndpointId>, new: EndpointId },
     /// `to` was told about our new identity (`known`: and followed it).
     MoveDelivered { to: EndpointId, known: bool },
+    /// A group member passed on the owner's removals (already checked).
+    GroupNews { from: EndpointId, news: GroupNews },
+    /// Our group news reached `to` (or not).
+    GroupNewsDelivered { to: EndpointId, room: RoomId, ok: bool },
     Notice(String),
 }
 
@@ -125,7 +131,7 @@ pub async fn start(
         .build();
     let ep = Endpoint::builder(presets::N0)
         .secret_key(secret)
-        .alpns(vec![ALPN.to_vec(), PRESENCE_ALPN.to_vec(), CHAT_ALPN.to_vec(), MOVE_ALPN.to_vec()])
+        .alpns(vec![ALPN.to_vec(), PRESENCE_ALPN.to_vec(), CHAT_ALPN.to_vec(), MOVE_ALPN.to_vec(), GROUP_ALPN.to_vec()])
         .transport_config(transport)
         .bind()
         .await
@@ -219,6 +225,16 @@ async fn handle_incoming(
         let _ = itx.send(Internal::MoveIn { conn, send, msg });
         return Ok(());
     }
+    if conn.alpn() == GROUP_ALPN {
+        let (send, mut recv) = tokio::time::timeout(Duration::from_secs(10), conn.accept_bi())
+            .await
+            .context("group news timeout")??;
+        let news: GroupNews = tokio::time::timeout(Duration::from_secs(10), read_limited(&mut recv, 256 * 1024))
+            .await
+            .context("group news timeout")??;
+        let _ = itx.send(Internal::GroupIn { conn, send, news });
+        return Ok(());
+    }
     if conn.alpn() != ALPN {
         conn.close(CLOSE_DECLINE.into(), b"alpn");
         return Ok(());
@@ -255,6 +271,8 @@ enum Internal {
     MoveIn { conn: Connection, send: SendStream, msg: MoveMsg },
     /// Telling `peer` about our new identity finished; None = unreachable (retry).
     MoveResult { peer: EndpointId, known: Option<bool> },
+    /// A member passed on group news.
+    GroupIn { conn: Connection, send: SendStream, news: GroupNews },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -478,6 +496,21 @@ impl Engine {
                 self.move_tried.clear();
                 self.deliver_moves();
             }
+            NetCmd::GroupNews { to, news } => {
+                let (ep, ui, room) = (self.ep.clone(), self.ui.clone(), news.room);
+                tokio::spawn(async move {
+                    let res = tokio::time::timeout(Duration::from_secs(20), async {
+                        let conn = ep.connect(EndpointAddr::from(to), GROUP_ALPN).await?;
+                        let (mut send, mut recv) = conn.open_bi().await?;
+                        write_small(&mut send, &news).await?;
+                        let _: bool = read_small(&mut recv).await?;
+                        conn.close(0u32.into(), b"");
+                        anyhow::Ok(())
+                    })
+                    .await;
+                    let _ = ui.send(UiEvent::GroupNewsDelivered { to, room, ok: matches!(res, Ok(Ok(()))) }).await;
+                });
+            }
             NetCmd::SetStatus(st) => {
                 if st != self.status {
                     info!("status now {st:?}");
@@ -553,7 +586,7 @@ impl Engine {
         if let RoomKey::Group(room_id) = room {
             if !self.groups.contains_key(&room_id) {
                 if let Some(inv) = live.iter().find_map(|s| self.sessions[s].invite.clone()) {
-                    let g = Group { name: inv.name, secret: inv.secret, members: inv.members };
+                    let g = inv.group();
                     self.groups.insert(room_id, g.clone());
                     self.emit(UiEvent::GroupUpdate { group: g });
                 }
@@ -614,7 +647,7 @@ impl Engine {
             RoomKey::Direct(_) => (None, None, None),
             RoomKey::Group(r) => {
                 let Some(g) = self.groups.get(&r) else { return };
-                let inv = Invite { name: g.name.clone(), secret: g.secret, members: g.members.clone() };
+                let inv = Invite { name: g.name.clone(), secret: g.secret, members: g.members.clone(), owner: g.owner, removed: g.removed.clone() };
                 (Some(r), Some(join_proof(&g.secret, &self.me, &peer)), Some(inv))
             }
         };
@@ -690,7 +723,7 @@ impl Engine {
                             // Keep a missed group's invite (from a contact) so it can be joined later.
                             if let (RoomKey::Group(r), Some(inv)) = (room, s.invite.take()) {
                                 if !self.groups.contains_key(&r) && self.contacts.contains_key(&s.peer) {
-                                    let g = Group { name: inv.name, secret: inv.secret, members: inv.members };
+                                    let g = inv.group();
                                     self.groups.insert(r, g.clone());
                                     self.emit(UiEvent::GroupUpdate { group: g });
                                 }
@@ -710,6 +743,28 @@ impl Engine {
             Internal::PresenceProbe { conn, send, theirs } => self.on_presence_probe(conn, send, theirs),
             Internal::ChatIn { conn, send, env } => self.on_chat_in(conn, send, env),
             Internal::MoveIn { conn, send, msg } => self.on_move_in(conn, send, msg),
+            Internal::GroupIn { conn, mut send, news } => {
+                // Only from people in the group (the removed included: they may pass on
+                // their own removal); the signatures are what count.
+                let peer = conn.remote_id();
+                let mut learned = None;
+                if let Some(g) = self.groups.get_mut(&news.room) {
+                    let member = g.members.iter().any(|m| m.id == peer) || g.is_removed(&peer) || g.owner == Some(peer);
+                    if member && g.merge_removals(&news.removed) {
+                        learned = Some(g.removed.clone());
+                    }
+                }
+                if let Some(removed) = learned {
+                    info!("group news from {}: {} removed", peer.fmt_short(), removed.len());
+                    self.emit(UiEvent::GroupNews { from: peer, news: GroupNews { room: news.room, removed } });
+                }
+                // Answered either way, so the sender stops retrying.
+                tokio::spawn(async move {
+                    let _ = write_small(&mut send, &true).await;
+                    let _ = send.finish();
+                    let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+                });
+            }
             Internal::MoveResult { peer, known } => match known {
                 Some(known) => {
                     self.move_pending.remove(&peer);
@@ -768,7 +823,9 @@ impl Engine {
                     (Some(sec), Some(p)) => verify_proof(&sec, &peer, &self.me, &p),
                     _ => false,
                 };
-                if !ok {
+                // The owner took them out of the group: the secret alone isn't enough.
+                let removed = self.groups.get(&r).is_some_and(|g| g.is_removed(&peer));
+                if !ok || removed {
                     spawn_decline(send, conn, DeclineReason::NotAllowed);
                     return;
                 }
@@ -932,7 +989,7 @@ impl Engine {
                 }
                 if let RoomKey::Group(r) = s.room {
                     let ok = match (self.groups.get(&r), proof) {
-                        (Some(g), Some(p)) => verify_proof(&g.secret, &peer, &self.me, &p),
+                        (Some(g), Some(p)) => verify_proof(&g.secret, &peer, &self.me, &p) && !g.is_removed(&peer),
                         _ => false,
                     };
                     if !ok {
@@ -1030,10 +1087,11 @@ impl Engine {
                             c.left.get(id).is_some_and(|t| t.elapsed() < Duration::from_secs(15))
                         })
                     };
+                    let removed = |id: &EndpointId| self.groups.get(&r).is_some_and(|g| g.is_removed(id));
                     let to_dial: Vec<EndpointId> = members
                         .iter()
                         .map(|m| m.id)
-                        .filter(|id| *id != self.me && !self.has_session_with(id) && !recently_left(id))
+                        .filter(|id| *id != self.me && !self.has_session_with(id) && !recently_left(id) && !removed(id))
                         .collect();
                     for id in to_dial {
                         self.dial(id, room);
@@ -1719,6 +1777,48 @@ mod tests {
         })
         .await;
         assert!(seen.is_err(), "a non-contact learned Bob's status: {seen:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs internet (n0 relays + discovery)"]
+    async fn removed_members_stay_out() {
+        let _ = tracing_subscriber::fmt().with_env_filter("parley=debug").try_init();
+        let ka = SecretKey::generate();
+        let (a, b, c) = tokio::join!(node_with("alice", ka.clone()), node("bob"), node("carol"));
+        let m = |n: &Node| Member { id: n.id, name: n.name.clone() };
+        let g = Group::new("trip".into(), vec![m(&a), m(&b), m(&c)]);
+        let room = g.room_id();
+        for n in [&a, &b, &c] {
+            n.directory(&[], vec![g.clone()]);
+        }
+        // Before: Carol can join Bob in the group's call.
+        b.net.send(NetCmd::JoinGroup(room));
+        c.net.send(NetCmd::JoinGroup(room));
+        b.expect("carol joins", |e| matches!(e, UiEvent::PeerJoined { id, .. } if *id == c.id).then_some(())).await;
+        b.net.send(NetCmd::Hangup);
+        c.net.send(NetCmd::Hangup);
+        tokio::time::sleep(Duration::from_secs(16)).await; // past the "just left" grace
+
+        // Alice (the owner) removes Carol and tells Bob.
+        let removal = crate::store::Removal::sign(&ka, &room, c.id, 1);
+        let mut ga = g.clone();
+        ga.merge_removals(std::slice::from_ref(&removal));
+        a.directory(&[], vec![ga]);
+        a.net.send(NetCmd::GroupNews { to: b.id, news: GroupNews { room, removed: vec![removal.clone()] } });
+        let got = b
+            .expect("bob hears of the removal", |e| match e {
+                UiEvent::GroupNews { news, .. } => Some(news.removed.clone()),
+                _ => None,
+            })
+            .await;
+        assert_eq!(got, [removal]);
+        a.expect("delivered", |e| matches!(e, UiEvent::GroupNewsDelivered { ok: true, .. }).then_some(())).await;
+
+        // Carol still has the secret, but nobody lets her into the group's call.
+        b.net.send(NetCmd::JoinGroup(room));
+        c.net.send(NetCmd::JoinGroup(room));
+        let res = tokio::time::timeout(Duration::from_secs(10), b.expect("carol", |e| matches!(e, UiEvent::PeerJoined { id, .. } if *id == c.id).then_some(()))).await;
+        assert!(res.is_err(), "a removed member got into the call");
     }
 
     #[tokio::test(flavor = "multi_thread")]

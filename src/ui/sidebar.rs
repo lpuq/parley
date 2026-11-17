@@ -45,10 +45,10 @@ impl Sidebar {
         sec.append(Some("Settings"), Some("app.settings"));
         sec.append(Some("Quit"), Some("app.quit"));
         menu.append_section(None, &sec);
-        let menu_btn = gtk::MenuButton::builder().icon_name("open-menu-symbolic").menu_model(&menu).build();
+        let menu_btn = gtk::MenuButton::builder().icon_name("parley-open-menu-symbolic").menu_model(&menu).build();
         header.pack_end(&menu_btn);
         let add_btn = gtk::Button::builder()
-            .icon_name("list-add-symbolic")
+            .icon_name("parley-list-add-symbolic")
             .tooltip_text("Add a friend's code")
             .action_name("app.add-contact")
             .build();
@@ -60,14 +60,14 @@ impl Sidebar {
         me_avatar.set_valign(gtk::Align::Center);
         me_row.add_prefix(&me_avatar);
         let copy = gtk::Button::builder()
-            .icon_name("edit-copy-symbolic")
+            .icon_name("parley-edit-copy-symbolic")
             .tooltip_text("Copy my code")
             .valign(gtk::Align::Center)
             .css_classes(["flat"])
             .action_name("app.copy-my-code")
             .build();
         let qr = gtk::Button::builder()
-            .icon_name("view-grid-symbolic")
+            .icon_name("parley-view-grid-symbolic")
             .tooltip_text("Show my QR code")
             .valign(gtk::Align::Center)
             .css_classes(["flat"])
@@ -117,7 +117,7 @@ impl Sidebar {
         members_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
 
         let new_group = gtk::Button::builder()
-            .icon_name("list-add-symbolic")
+            .icon_name("parley-list-add-symbolic")
             .tooltip_text("New group")
             .css_classes(["flat", "circular"])
             .action_name("app.new-group")
@@ -240,7 +240,7 @@ impl Sidebar {
             avatar.set_valign(gtk::Align::Center);
             row.add_prefix(&avatar);
             let call = gtk::Button::builder()
-                .icon_name("call-start-symbolic")
+                .icon_name("parley-call-start-symbolic")
                 .tooltip_text(format!("Call {}", c.name))
                 .valign(gtk::Align::Center)
                 .css_classes(["circular", "call-row-btn"])
@@ -302,7 +302,7 @@ impl Sidebar {
                 .title_lines(1)
                 .subtitle(glib::markup_escape_text(&subtitle))
                 .build();
-            let icon = gtk::Image::from_icon_name("system-users-symbolic");
+            let icon = gtk::Image::from_icon_name("parley-system-users-symbolic");
             icon.set_pixel_size(20);
             icon.add_css_class("group-icon");
             let group_icon = gtk::Overlay::new();
@@ -393,9 +393,12 @@ impl Sidebar {
             // Online first, then by name.
             rows.sort_by_key(|(name, _, cls, ..)| (*cls == "offline", name.to_lowercase()));
             self.members_label.set_label(&format!("Members of {} — {}", g.name, rows.len()));
+            let i_own = g.owner == Some(app.me());
             for (name, id, cls, text, me) in rows {
                 let friend = st.contact(&id).is_some();
-                self.members.append(&self.member_row(&id, &name, cls, text, me, friend));
+                let owner = g.owner == Some(id);
+                let removable = (i_own && !me).then(|| (g.room_id(), g.name.clone()));
+                self.members.append(&self.member_row(&id, &name, cls, text, me, friend, owner, removable));
             }
         }
         self.members_title.set_visible(open_group.is_some());
@@ -409,7 +412,18 @@ impl Sidebar {
 
     /// Someone in the open group: status, and for people who aren't your friends a
     /// button to add them. Clicking shows their info.
-    fn member_row(&self, id: &iroh::EndpointId, name: &str, cls: &str, status: &str, me: bool, friend: bool) -> adw::ActionRow {
+    #[allow(clippy::too_many_arguments)]
+    fn member_row(
+        &self,
+        id: &iroh::EndpointId,
+        name: &str,
+        cls: &str,
+        status: &str,
+        me: bool,
+        friend: bool,
+        owner: bool,
+        removable: Option<(crate::store::RoomId, String)>,
+    ) -> adw::ActionRow {
         let title = identity::tagged_markup(name, id) + if me { " (you)" } else { "" };
         let row = adw::ActionRow::builder().title(title).title_lines(1).subtitle(status).build();
         let avatar = gtk::Overlay::new();
@@ -421,12 +435,22 @@ impl Sidebar {
         avatar.add_overlay(&dot);
         avatar.set_valign(gtk::Align::Center);
         row.add_prefix(&avatar);
+        if owner {
+            // Like Discord: a crown at the end of the owner's row.
+            let crown = gtk::Image::from_icon_name("parley-crown-symbolic");
+            crown.add_css_class("owner-crown");
+            crown.set_tooltip_text(Some("Group owner (made the group)"));
+            row.add_suffix(&crown);
+        }
         if me {
             return row;
         }
+        if let Some((room, gname)) = removable {
+            self.add_member_menu(&row, *id, name.to_string(), room, gname);
+        }
         if !friend {
             let add = gtk::Button::builder()
-                .icon_name("list-add-symbolic")
+                .icon_name("parley-list-add-symbolic")
                 .tooltip_text(format!("Add {name} as a friend"))
                 .valign(gtk::Align::Center)
                 .css_classes(["flat", "circular"])
@@ -450,10 +474,52 @@ impl Sidebar {
         row
     }
 
+    /// The owner's menu on a member, on right-click (or long-press), so nobody is
+    /// removed by a stray click: take them out of the group.
+    fn add_member_menu(&self, row: &adw::ActionRow, id: iroh::EndpointId, name: String, room: crate::store::RoomId, gname: String) {
+        let show = {
+            let (a, row) = (self.app.clone(), row.clone());
+            Rc::new(move |x: f64, y: f64| {
+                let pop = gtk::Popover::new();
+                let remove = flat_button("Remove from group…");
+                remove.add_css_class("error");
+                pop.set_child(Some(&remove));
+                pop.set_parent(&row);
+                pop.set_has_arrow(false);
+                pop.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+                pop.connect_closed(|p| {
+                    let p = p.clone();
+                    glib::idle_add_local_once(move || p.unparent());
+                });
+                let (a, p, name, gname) = (a.clone(), pop.clone(), name.clone(), gname.clone());
+                remove.connect_clicked(move |_| {
+                    p.popdown();
+                    let Some(a) = a.upgrade() else { return };
+                    confirm_removal(&a, id, &name, room, &gname);
+                });
+                pop.popup();
+            })
+        };
+        let rclick = gtk::GestureClick::builder().button(gtk::gdk::BUTTON_SECONDARY).build();
+        let s = show.clone();
+        rclick.connect_pressed(move |g, _, x, y| {
+            g.set_state(gtk::EventSequenceState::Claimed);
+            s(x, y);
+        });
+        row.add_controller(rclick);
+        let press = gtk::GestureLongPress::new();
+        press.set_touch_only(true);
+        press.connect_pressed(move |g, x, y| {
+            g.set_state(gtk::EventSequenceState::Claimed);
+            show(x, y);
+        });
+        row.add_controller(press);
+    }
+
     /// Opens the conversation (no call needed).
     fn chat_button(&self, conv: crate::chat::Conv, tip: &str) -> gtk::Button {
         let b = gtk::Button::builder()
-            .icon_name("chat-message-new-symbolic")
+            .icon_name("parley-chat-message-new-symbolic")
             .tooltip_text(tip)
             .valign(gtk::Align::Center)
             .css_classes(["circular", "chat-row-btn"])
@@ -508,7 +574,7 @@ impl Sidebar {
             }
         });
         gtk::MenuButton::builder()
-            .icon_name("view-more-symbolic")
+            .icon_name("parley-view-more-symbolic")
             .valign(gtk::Align::Center)
             .css_classes(["flat", "circular"])
             .popover(&pop)
@@ -564,7 +630,7 @@ impl Sidebar {
             }
         });
         gtk::MenuButton::builder()
-            .icon_name("view-more-symbolic")
+            .icon_name("parley-view-more-symbolic")
             .valign(gtk::Align::Center)
             .css_classes(["flat", "circular"])
             .popover(&pop)
@@ -649,13 +715,13 @@ fn call_member_row(name: &str, id: &iroh::EndpointId, ms: &MediaState) -> gtk::L
         b.append(&live);
     }
     if ms.mic_muted && !ms.deafened {
-        let i = gtk::Image::from_icon_name("microphone-disabled-symbolic");
+        let i = gtk::Image::from_icon_name("parley-microphone-disabled-symbolic");
         i.add_css_class("call-member-off");
         i.set_tooltip_text(Some("Muted"));
         b.append(&i);
     }
     if ms.deafened {
-        let i = gtk::Image::from_icon_name("audio-volume-muted-symbolic");
+        let i = gtk::Image::from_icon_name("parley-audio-volume-muted-symbolic");
         i.add_css_class("call-member-off");
         i.set_tooltip_text(Some("Deafened"));
         b.append(&i);
@@ -663,6 +729,23 @@ fn call_member_row(name: &str, id: &iroh::EndpointId, ms: &MediaState) -> gtk::L
     let row = gtk::ListBoxRow::builder().child(&b).activatable(false).selectable(false).build();
     row.add_css_class("call-member");
     row
+}
+
+fn confirm_removal(a: &Rc<App>, id: iroh::EndpointId, name: &str, room: crate::store::RoomId, gname: &str) {
+    let d = adw::AlertDialog::new(
+        Some(&format!("Remove {name} from {gname}?")),
+        Some(&format!(
+            "{name} is taken out of the group for everyone in it: they can't join its calls or send to its chat any more, even with the group code. Use this for old accounts or people who shouldn't be here."
+        )),
+    );
+    d.add_response("cancel", "Cancel");
+    d.add_response("remove", "Remove");
+    d.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+    d.set_default_response(Some("cancel"));
+    d.set_close_response("cancel");
+    let a2 = a.clone();
+    d.connect_response(Some("remove"), move |_, _| a2.remove_from_group(room, id));
+    d.present(Some(&a.window));
 }
 
 /// A red unread-count pill, if there's anything unread.

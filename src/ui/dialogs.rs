@@ -148,8 +148,8 @@ pub fn add_code(app: &Rc<App>, prefill: Option<String>) {
             Ok(ShareCode::Contact { n, k }) => {
                 a.add_contact(k, if name.is_empty() { &n } else { &name });
             }
-            Ok(ShareCode::Group { n, s, m }) => {
-                let mut g = Group { name: if name.is_empty() { n } else { name }, secret: s, members: m };
+            Ok(ShareCode::Group { n, s, m, o, r }) => {
+                let mut g = Group::learned(if name.is_empty() { n } else { name }, s, m, o, &r);
                 let me = a.store.borrow().my_name.clone();
                 g.add_member(a.me(), &me);
                 let gname = g.name.clone();
@@ -427,7 +427,7 @@ pub fn settings(app: &Rc<App>) {
     // ----- Voice & video -----
     let page = adw::PreferencesPage::new();
     page.set_title("Voice & Video");
-    page.set_icon_name(Some("audio-input-microphone-symbolic"));
+    page.set_icon_name(Some("parley-audio-input-microphone-symbolic"));
 
     let dev = adw::PreferencesGroup::new();
     dev.set_title("Devices");
@@ -630,16 +630,45 @@ pub fn settings(app: &Rc<App>) {
     // ----- General -----
     let gen_ = adw::PreferencesPage::new();
     gen_.set_title("General");
-    gen_.set_icon_name(Some("emblem-system-symbolic"));
+    gen_.set_icon_name(Some("parley-emblem-system-symbolic"));
     let prof = adw::PreferencesGroup::new();
     prof.set_title("Profile");
     let name = adw::EntryRow::builder().title("Your name").text(&app.store.borrow().my_name).show_apply_button(true).build();
     prof.add(&name);
     let code_row = adw::ActionRow::builder().title("Your code").subtitle(app.my_code().chars().take(32).collect::<String>() + "…").build();
-    let copy = gtk::Button::builder().icon_name("edit-copy-symbolic").valign(gtk::Align::Center).css_classes(["flat"]).action_name("app.copy-my-code").build();
+    let copy = gtk::Button::builder().icon_name("parley-edit-copy-symbolic").valign(gtk::Align::Center).css_classes(["flat"]).action_name("app.copy-my-code").build();
     code_row.add_suffix(&copy);
     prof.add(&code_row);
     gen_.add(&prof);
+    let look = adw::PreferencesGroup::new();
+    look.set_title("Appearance");
+    let style_row = adw::ComboRow::builder().title("Style").model(&gtk::StringList::new(&["Follow system", "Light", "Dark"])).build();
+    style_row.set_selected(match s.appearance {
+        crate::store::Appearance::System => 0,
+        crate::store::Appearance::Light => 1,
+        crate::store::Appearance::Dark => 2,
+    });
+    let tags = adw::SwitchRow::builder()
+        .title("Show #tags after names")
+        .subtitle("The end of each person's key, telling apart people with the same name. Strangers calling always show theirs.")
+        .active(s.show_tags)
+        .build();
+    look.add(&style_row);
+    look.add(&tags);
+    gen_.add(&look);
+    let a = app.clone();
+    style_row.connect_selected_notify(move |r| {
+        let v = match r.selected() {
+            1 => crate::store::Appearance::Light,
+            2 => crate::store::Appearance::Dark,
+            _ => crate::store::Appearance::System,
+        };
+        a.store.borrow_mut().settings.appearance = v;
+        a.store.borrow().save();
+        super::apply_appearance(v);
+    });
+    let a = app.clone();
+    tags.connect_active_notify(move |r| a.set_show_tags(r.is_active()));
     let beh = adw::PreferencesGroup::new();
     beh.set_title("Behavior");
     let bg = adw::SwitchRow::builder().title("Keep running when closed").subtitle("So friends can still call you").active(s.run_in_background).build();
@@ -682,7 +711,7 @@ pub fn settings(app: &Rc<App>) {
     diag.set_title("Troubleshooting");
     let log = crate::store::log_path();
     let log_row = adw::ActionRow::builder().title("Diagnostics log").subtitle(log.display().to_string()).subtitle_selectable(true).build();
-    let copy_log = gtk::Button::builder().icon_name("edit-copy-symbolic").tooltip_text("Copy path").valign(gtk::Align::Center).css_classes(["flat"]).build();
+    let copy_log = gtk::Button::builder().icon_name("parley-edit-copy-symbolic").tooltip_text("Copy path").valign(gtk::Align::Center).css_classes(["flat"]).build();
     let (a, lp) = (app.clone(), log.display().to_string());
     copy_log.connect_clicked(move |_| a.copy(&lp, "Log path"));
     log_row.add_suffix(&copy_log);
@@ -873,7 +902,7 @@ pub fn user_info(app: &Rc<App>, id: iroh::EndpointId) {
     top.set_margin_bottom(12);
     top.append(&identity::avatar(96, &c.name, &id));
     let title = gtk::Label::new(None);
-    title.set_markup(&identity::tagged_markup(&c.name, &id));
+    title.set_markup(&identity::tagged_markup_always(&c.name, &id));
     title.add_css_class("title-2");
     top.append(&title);
     let status = gtk::Label::new(Some(match app.presence_of(&id) {
@@ -895,7 +924,7 @@ pub fn user_info(app: &Rc<App>, id: iroh::EndpointId) {
         .subtitle_selectable(true)
         .build();
     key_row.add_css_class("property");
-    let copy_key = gtk::Button::builder().icon_name("edit-copy-symbolic").tooltip_text("Copy key").valign(gtk::Align::Center).css_classes(["flat"]).build();
+    let copy_key = gtk::Button::builder().icon_name("parley-edit-copy-symbolic").tooltip_text("Copy key").valign(gtk::Align::Center).css_classes(["flat"]).build();
     let (a, k) = (app.clone(), key.clone());
     copy_key.connect_clicked(move |_| a.copy(&k, "Identity key"));
     key_row.add_suffix(&copy_key);
@@ -903,7 +932,7 @@ pub fn user_info(app: &Rc<App>, id: iroh::EndpointId) {
 
     let code = ShareCode::Contact { n: c.name.clone(), k: id }.encode();
     let code_row = adw::ActionRow::builder().title("Contact code").subtitle(code.chars().take(32).collect::<String>() + "…").build();
-    let copy_code = gtk::Button::builder().icon_name("edit-copy-symbolic").tooltip_text("Copy contact code").valign(gtk::Align::Center).css_classes(["flat"]).build();
+    let copy_code = gtk::Button::builder().icon_name("parley-edit-copy-symbolic").tooltip_text("Copy contact code").valign(gtk::Align::Center).css_classes(["flat"]).build();
     let a = app.clone();
     copy_code.connect_clicked(move |_| a.copy(&code, "Contact code"));
     code_row.add_suffix(&copy_code);

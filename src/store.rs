@@ -139,16 +139,102 @@ pub struct Group {
     pub secret: [u8; 32],
     #[serde(default)]
     pub members: Vec<Member>,
+    /// Who made the group, and may remove people from it. Groups from before 0.8.0
+    /// take their first member (the creator, in every copy of the group).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<EndpointId>,
+    /// People the owner took out of the group (each signed by the owner).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed: Vec<Removal>,
+}
+
+/// The group's owner taking someone out of it, signed so every member can check.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Removal {
+    pub id: EndpointId,
+    pub by: EndpointId,
+    pub ts: u64,
+    pub sig: iroh::Signature,
+}
+
+impl Removal {
+    fn signed_bytes(room: &RoomId, id: &EndpointId, by: &EndpointId, ts: u64) -> Vec<u8> {
+        let mut m = b"parley-group-remove/1:".to_vec();
+        m.extend_from_slice(room);
+        m.extend_from_slice(id.as_bytes());
+        m.extend_from_slice(by.as_bytes());
+        m.extend_from_slice(&ts.to_be_bytes());
+        m
+    }
+
+    pub fn sign(owner: &SecretKey, room: &RoomId, id: EndpointId, ts: u64) -> Self {
+        let by = owner.public();
+        Self { id, by, ts, sig: owner.sign(&Self::signed_bytes(room, &id, &by, ts)) }
+    }
+
+    fn verify(&self, room: &RoomId) -> bool {
+        self.by.verify(&Self::signed_bytes(room, &self.id, &self.by, self.ts), &self.sig).is_ok()
+    }
 }
 
 impl Group {
+    /// A new group, owned by its first member (whoever creates it).
     pub fn new(name: String, members: Vec<Member>) -> Self {
-        Self { name, secret: random_bytes32(), members }
+        let owner = members.first().map(|m| m.id);
+        Self { name, secret: random_bytes32(), members, owner, removed: Vec::new() }
+    }
+
+    /// A group as learned from a code or an invite.
+    pub fn learned(name: String, secret: [u8; 32], members: Vec<Member>, owner: Option<EndpointId>, removed: &[Removal]) -> Self {
+        let owner = owner.or_else(|| members.first().map(|m| m.id));
+        let mut g = Self { name, secret, members, owner, removed: Vec::new() };
+        g.merge_removals(removed);
+        g
+    }
+
+    /// The owner, for groups saved before owners were recorded: their first member.
+    pub fn settle_owner(&mut self) {
+        if self.owner.is_none() {
+            self.owner = self.members.first().map(|m| m.id);
+        }
+    }
+
+    pub fn is_removed(&self, id: &EndpointId) -> bool {
+        self.removed.iter().any(|r| &r.id == id)
+    }
+
+    /// Takes in removals signed by this group's owner (others are ignored, as is any
+    /// removal of the owner). Returns whether anything changed.
+    pub fn merge_removals(&mut self, incoming: &[Removal]) -> bool {
+        let (room, Some(owner)) = (self.room_id(), self.owner) else { return false };
+        let mut changed = false;
+        for r in incoming.iter().filter(|r| r.by == owner && r.id != owner && r.verify(&room)) {
+            match self.removed.iter_mut().find(|x| x.id == r.id) {
+                // Re-signed by the owner's current identity (after they replaced it).
+                Some(x) if x.by != owner => {
+                    *x = r.clone();
+                    changed = true;
+                }
+                Some(_) => {}
+                None => {
+                    self.removed.push(r.clone());
+                    changed = true;
+                }
+            }
+        }
+        let before = self.members.len();
+        let removed = std::mem::take(&mut self.removed);
+        self.members.retain(|m| !removed.iter().any(|r| r.id == m.id));
+        self.removed = removed;
+        changed || self.members.len() != before
     }
     pub fn room_id(&self) -> RoomId {
         room_id_for(&self.secret)
     }
     pub fn add_member(&mut self, id: EndpointId, name: &str) -> bool {
+        if self.is_removed(&id) {
+            return false;
+        }
         if let Some(m) = self.members.iter_mut().find(|m| m.id == id) {
             if !name.is_empty() && m.name != name {
                 m.name = name.to_string();
@@ -300,6 +386,19 @@ pub struct Settings {
     pub allow_bluetooth_mic: bool,
     /// The user hid the sidebar (it stays docked and shown otherwise).
     pub sidebar_hidden: bool,
+    pub appearance: Appearance,
+    /// Show the #tag after names (the end of each person's key).
+    pub show_tags: bool,
+}
+
+/// Light or dark, or whatever the system prefers (dark when it has no preference).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Appearance {
+    #[default]
+    System,
+    Light,
+    Dark,
 }
 
 impl Default for Settings {
@@ -325,6 +424,8 @@ impl Default for Settings {
             background_hint_shown: false,
             allow_bluetooth_mic: false,
             sidebar_hidden: false,
+            appearance: Appearance::System,
+            show_tags: true,
         }
     }
 }
@@ -341,6 +442,15 @@ pub struct Store {
     pub moves: Vec<crate::proto::MoveNotice>,
     /// Friends and group members still to be told about our latest identity.
     pub move_pending: Vec<EndpointId>,
+    /// Group members still to hear about removals from a group.
+    pub group_news_pending: Vec<PendingNews>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PendingNews {
+    #[serde(with = "hex32")]
+    pub room: RoomId,
+    pub to: EndpointId,
 }
 
 impl Store {
@@ -349,13 +459,17 @@ impl Store {
     }
 
     pub fn load() -> Self {
-        match fs::read(Self::path()) {
+        let mut st: Self = match fs::read(Self::path()) {
             Ok(b) => serde_json::from_slice(&b).unwrap_or_else(|e| {
                 tracing::warn!("state.json unreadable ({e}); starting fresh");
                 Self::default()
             }),
             Err(_) => Self::default(),
+        };
+        for g in &mut st.groups {
+            g.settle_owner();
         }
+        st
     }
 
     pub fn save(&self) {
@@ -392,6 +506,10 @@ impl Store {
             changed = true;
         }
         for g in &mut self.groups {
+            if g.owner.as_ref() == Some(old) {
+                g.owner = Some(*new);
+                changed = true;
+            }
             if g.members.iter().any(|m| &m.id == new) {
                 let before = g.members.len();
                 g.members.retain(|m| &m.id != old);
@@ -454,6 +572,11 @@ pub enum ShareCode {
         s: [u8; 32],
         #[serde(default)]
         m: Vec<Member>,
+        /// The owner (0.8.0+; older codes: the first member).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        o: Option<EndpointId>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        r: Vec<Removal>,
     },
 }
 
@@ -480,7 +603,7 @@ impl ShareCode {
     }
 
     pub fn for_group(g: &Group) -> Self {
-        ShareCode::Group { n: g.name.clone(), s: g.secret, m: g.members.clone() }
+        ShareCode::Group { n: g.name.clone(), s: g.secret, m: g.members.clone(), o: g.owner, r: g.removed.clone() }
     }
 }
 
@@ -499,6 +622,43 @@ mod hex32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_owner_removes_people_and_they_stay_out() {
+        let (owner, bob, mallory) = (SecretKey::generate(), SecretKey::generate(), SecretKey::generate());
+        let m = |k: &SecretKey, n: &str| Member { id: k.public(), name: n.into() };
+        let mut g = Group::new("trip".into(), vec![m(&owner, "o"), m(&bob, "b"), m(&mallory, "m")]);
+        let room = g.room_id();
+        assert_eq!(g.owner, Some(owner.public()));
+
+        // A member can't remove anyone, nor can a removal of the owner count.
+        assert!(!g.merge_removals(&[Removal::sign(&mallory, &room, bob.public(), 1)]));
+        assert!(!g.merge_removals(&[Removal::sign(&owner, &room, owner.public(), 1)]));
+        // Signed for another group, or tampered with: ignored.
+        assert!(!g.merge_removals(&[Removal::sign(&owner, &[0; 32], mallory.public(), 1)]));
+        let mut bent = Removal::sign(&owner, &room, bob.public(), 1);
+        bent.id = mallory.public();
+        assert!(!g.merge_removals(&[bent]));
+        assert_eq!(g.members.len(), 3);
+
+        // The owner can, and the removed person can't come back in through a roster.
+        let r = Removal::sign(&owner, &room, mallory.public(), 2);
+        assert!(g.merge_removals(std::slice::from_ref(&r)));
+        assert!(!g.members.iter().any(|x| x.id == mallory.public()));
+        assert!(!g.add_member(mallory.public(), "m"));
+        assert!(!g.merge_removals(&[r.clone()]), "already known");
+
+        // The code carries the owner and removals to people who join later.
+        let ShareCode::Group { n, s, m: mem, o, r: rem } = ShareCode::decode(&ShareCode::for_group(&g).encode()).unwrap() else { panic!() };
+        let joined = Group::learned(n, s, mem, o, &rem);
+        assert_eq!((joined.owner, joined.removed.len()), (Some(owner.public()), 1));
+        assert!(joined.is_removed(&mallory.public()));
+
+        // A group saved before owners were recorded: its first member (the creator).
+        let mut old = Group { owner: None, removed: Vec::new(), ..Group::new("old".into(), vec![m(&bob, "b"), m(&owner, "o")]) };
+        old.settle_owner();
+        assert_eq!(old.owner, Some(bob.public()));
+    }
 
     #[test]
     fn code_roundtrip_survives_wrapping() {

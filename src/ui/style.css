@@ -1,8 +1,22 @@
-/* Parley — Discord-like call styling on top of libadwaita's dark scheme. */
+/* Parley — Discord-like call styling on top of libadwaita. These colours are for the
+   dark appearance; style-light.css redefines them (and only them) while light. */
 @define-color parley_bg #111214;
 @define-color tile_bg #232428;
 @define-color speak_green #23a55a;
 @define-color danger_red #da373c;
+@define-color controls_bg #1e1f22;
+@define-color call_btn_bg #383a40;
+@define-color call_btn_hover #45474e;
+@define-color call_btn_fg white;
+@define-color call_btn_menu_bg #2e3035;
+@define-color group_icon_fg #b5bac1;
+@define-color chat_bg #313338;
+@define-color chat_line alpha(black, 0.3);
+@define-color chat_hover alpha(black, 0.08);
+@define-color composer_bg #383a40;
+@define-color chat_btn_bg #4e5058;
+@define-color chat_btn_hover #5c5f66;
+@define-color chat_btn_fg white;
 
 .call-view { background-color: @parley_bg; }
 
@@ -54,7 +68,7 @@
 }
 
 .call-controls {
-  background-color: #1e1f22;
+  background-color: @controls_bg;
   border-radius: 999px;
   padding: 8px 14px;
 }
@@ -62,13 +76,13 @@
   min-width: 48px;
   min-height: 48px;
   border-radius: 999px;
-  background-color: #383a40;
-  color: white;
+  background-color: @call_btn_bg;
+  color: @call_btn_fg;
 }
 splitbutton.call-btn { background: none; padding: 0; }
 splitbutton.call-btn > button:first-child { border-radius: 999px 0 0 999px; min-width: 44px; }
-splitbutton.call-btn > menubutton > button { border-radius: 0 999px 999px 0; min-width: 22px; background-color: #2e3035; }
-.call-btn:hover, .call-btn > button:hover { background-color: #45474e; }
+splitbutton.call-btn > menubutton > button { border-radius: 0 999px 999px 0; min-width: 22px; background-color: @call_btn_menu_bg; }
+.call-btn:hover, .call-btn > button:hover { background-color: @call_btn_hover; }
 .call-btn.off, .call-btn.off > button:first-child { background-color: #f23f42; color: white; }
 .call-btn.on, .call-btn.on > button:first-child { background-color: #248046; color: white; }
 .call-btn.hangup { background-color: @danger_red; color: white; min-width: 60px; }
@@ -79,7 +93,7 @@ splitbutton.call-btn > menubutton > button { border-radius: 0 999px 999px 0; min
 .call-row-btn:disabled { background-color: alpha(#248046, 0.3); }
 .join-btn { background-color: #248046; color: white; padding: 2px 14px; }
 .join-btn:disabled { background-color: alpha(#248046, 0.3); }
-.group-icon { color: #b5bac1; }
+.group-icon { color: @group_icon_fg; }
 
 /* Narrow windows (see the breakpoint in ui/mod.rs): smaller call controls so the
    whole window, close button included, fits in 360 px. */
@@ -121,23 +135,23 @@ levelbar.voice-meter.open block.filled { background-color: #23a55a; }
 .call-view.immersive:not(.idle) .tile.idle .tile-chrome { opacity: 1; }
 
 /* ---------- Chat (Discord-like) ---------- */
-.chat-view { background-color: #313338; }
-.chat-panel .chat-view { border-left: 1px solid alpha(black, 0.35); }
-.chat-header { padding: 10px 16px; border-bottom: 1px solid alpha(black, 0.3); min-height: 32px; }
+.chat-view { background-color: @chat_bg; }
+.chat-panel .chat-view { border-left: 1px solid @chat_line; }
+.chat-header { padding: 10px 16px; border-bottom: 1px solid @chat_line; min-height: 32px; }
 .chat-list { padding: 8px 0 12px 0; }
 .chat-msg { padding: 2px 16px; }
 .chat-msg.first { margin-top: 14px; }
-.chat-msg:hover { background-color: alpha(black, 0.08); }
+.chat-msg:hover { background-color: @chat_hover; }
 .chat-author { font-weight: 600; }
 .chat-text { font-size: 15px; }
 .chat-text.pending { opacity: 0.5; }
 .chat-text.refused { color: #f23f42; }
 .chat-day { margin: 18px 16px 4px 16px; }
 .chat-notice { margin: 0 16px 6px 16px; font-size: 13px; color: alpha(currentColor, 0.7); }
-.chat-composer { margin: 0 16px 18px 16px; border-radius: 8px; background-color: #383a40; }
+.chat-composer { margin: 0 16px 18px 16px; border-radius: 8px; background-color: @composer_bg; }
 .chat-input, .chat-input text { background: none; font-size: 15px; }
-.chat-row-btn { background-color: #4e5058; color: white; }
-.chat-row-btn:hover { background-color: #5c5f66; }
+.chat-row-btn { background-color: @chat_btn_bg; color: @chat_btn_fg; }
+.chat-row-btn:hover { background-color: @chat_btn_hover; }
 .unread-badge {
   background-color: @danger_red;
   color: white;
@@ -150,3 +164,6 @@ levelbar.voice-meter.open block.filled { background-color: #23a55a; }
 }
 row.conv-open { background-color: alpha(currentColor, 0.08); }
 .chat-header.clickable:hover { background-color: alpha(currentColor, 0.04); }
+
+/* The group owner's crown in the members list. */
+.owner-crown { color: #f0b232; }

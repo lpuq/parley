@@ -293,19 +293,19 @@ impl ChatView {
                     Presence::DoNotDisturb => "Do not disturb",
                     Presence::Offline => "Offline",
                 });
-                self.call_btn.set_icon_name("call-start-symbolic");
+                self.call_btn.set_icon_name("parley-call-start-symbolic");
                 self.call_btn.set_tooltip_text(Some("Call"));
                 self.placeholder.set_label(&format!("Message @{name}"));
             }
             Conv::Group(r) => {
-                let icon = gtk::Image::from_icon_name("system-users-symbolic");
+                let icon = gtk::Image::from_icon_name("parley-system-users-symbolic");
                 icon.set_pixel_size(24);
                 icon.add_css_class("group-icon");
                 self.avatar_slot.append(&icon);
                 let (name, members) = app.group_summary(&r);
                 self.title.set_markup(&glib::markup_escape_text(&name));
                 self.subtitle.set_label(&members);
-                self.call_btn.set_icon_name("call-start-symbolic");
+                self.call_btn.set_icon_name("parley-call-start-symbolic");
                 self.call_btn.set_tooltip_text(Some("Join the group call"));
                 self.placeholder.set_label(&format!("Message {name}"));
             }

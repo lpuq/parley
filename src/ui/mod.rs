@@ -144,11 +144,12 @@ impl App {
         ui_tx: async_channel::Sender<UiEvent>,
         ui_rx: async_channel::Receiver<UiEvent>,
     ) -> Rc<Self> {
-        let style = adw::StyleManager::default();
-        style.set_color_scheme(adw::ColorScheme::PreferDark);
         load_css();
+        load_icons();
 
         let store = Store::load();
+        apply_appearance(store.settings.appearance);
+        identity::set_show_tags(store.settings.show_tags);
         let (pw_tx, pw_rx) = async_channel::unbounded();
         let app_audio = AppAudio::start(pw_tx);
 
@@ -164,10 +165,10 @@ impl App {
         content.set_hhomogeneous(false);
         content.set_interpolate_size(false);
         let home = adw::StatusPage::builder()
-            .icon_name("call-start-symbolic")
+            .icon_name("parley-call-start-symbolic")
             .title("Ready to call")
             .build();
-        let outgoing = adw::StatusPage::builder().icon_name("call-start-symbolic").build();
+        let outgoing = adw::StatusPage::builder().icon_name("parley-call-start-symbolic").build();
         outgoing.add_css_class("outgoing");
 
         let window = adw::ApplicationWindow::builder()
@@ -236,7 +237,7 @@ impl App {
         // The sidebar stays docked beside the content, like Discord's: it only goes
         // away when you hide it with this button (remembered across restarts).
         let sidebar_toggle = gtk::ToggleButton::builder()
-            .icon_name("sidebar-show-symbolic")
+            .icon_name("parley-sidebar-show-symbolic")
             .tooltip_text("Show or hide the sidebar")
             .build();
         split.set_show_sidebar(!this.store.borrow().settings.sidebar_hidden);
@@ -329,6 +330,7 @@ impl App {
             let t = this.clone();
             glib::timeout_add_seconds_local(60, move || {
                 t.deliver_all_chat();
+                t.send_group_news(None);
                 glib::ControlFlow::Continue
             });
             let t = this.clone();
@@ -819,15 +821,31 @@ impl App {
         {
             let mut st = self.store.borrow_mut();
             let room = g.room_id();
+            let mut newcomers = Vec::new();
             if let Some(existing) = st.group_by_room_mut(&room) {
+                if existing.owner.is_none() {
+                    existing.owner = g.owner;
+                }
+                existing.merge_removals(&g.removed);
                 for m in &g.members {
-                    existing.add_member(m.id, &m.name);
+                    if existing.add_member(m.id, &m.name) {
+                        newcomers.push(m.id);
+                    }
+                }
+                // Someone new in the group: tell them who the owner removed.
+                if existing.removed.is_empty() {
+                    newcomers.clear();
                 }
             } else {
                 st.groups.push(g);
             }
+            let me = self.me();
+            for to in newcomers.into_iter().filter(|id| *id != me) {
+                queue_news(&mut st, room, to);
+            }
         }
         self.save();
+        self.send_group_news(None);
         self.sidebar.refresh(self);
         self.update_home();
     }
@@ -948,6 +966,14 @@ impl App {
             UiEvent::ChatReceived { from, name, group, msgs } => self.on_chat_received(from, name, group, msgs),
             UiEvent::IdentityMoved { old, new } => self.on_identity_moved(old, new),
             UiEvent::MoveDelivered { to, known } => self.on_move_delivered(to, known),
+            UiEvent::GroupNews { from, news } => self.on_group_news(from, news),
+            UiEvent::GroupNewsDelivered { to, room, ok } => {
+                if ok {
+                    let mut st = self.store.borrow_mut();
+                    st.group_news_pending.retain(|p| !(p.to == to && p.room == room));
+                    st.save();
+                }
+            }
             UiEvent::ChatDelivered { to, ids, refused } => self.on_chat_delivered(to, ids, refused),
             UiEvent::Presence { id, presence, call, app } => {
                 if let Some(v) = app {
@@ -956,6 +982,7 @@ impl App {
                 // They're reachable: hand over anything waiting for them.
                 if presence != Presence::Offline {
                     self.deliver_chat(id);
+                    self.send_group_news(Some(id));
                 }
                 if self.chat_view.conv() == Some(crate::chat::Conv::Direct(id)) {
                     self.chat_view.refresh_header(self);
@@ -1265,6 +1292,119 @@ impl App {
         self.presence.borrow().get(id).copied().unwrap_or(Presence::Offline)
     }
 
+    /// Shows or hides #tags everywhere at once.
+    pub fn set_show_tags(self: &Rc<Self>, on: bool) {
+        self.store.borrow_mut().settings.show_tags = on;
+        self.store.borrow().save();
+        identity::set_show_tags(on);
+        self.sidebar.refresh(self);
+        if let Some(c) = self.chat_view.conv() {
+            self.chat_view.show(self, c);
+        }
+        self.call_view.rebuild(self);
+    }
+
+    // ------------------------------------------------------------ group owners
+
+    /// The owner takes `id` out of the group: signed with our key, applied here, and
+    /// passed to everyone in the group (them included, so their Parley lets go of it).
+    pub fn remove_from_group(self: &Rc<Self>, room: crate::store::RoomId, id: EndpointId) {
+        let me = self.me();
+        let key = match crate::store::load_identity() {
+            Ok(k) if k.public() == me => k,
+            _ => {
+                self.toast("Couldn't read your identity; nobody was removed.");
+                return;
+            }
+        };
+        let name = self.display_name(&id);
+        let gname = {
+            let mut st = self.store.borrow_mut();
+            let Some(g) = st.group_by_room_mut(&room) else { return };
+            if g.owner != Some(me) || id == me {
+                return;
+            }
+            let r = crate::store::Removal::sign(&key, &room, id, crate::chat::now_ms() / 1000);
+            g.merge_removals(&[r]);
+            let to: Vec<EndpointId> = g.members.iter().map(|m| m.id).chain(std::iter::once(id)).filter(|x| *x != me).collect();
+            let gname = g.name.clone();
+            for t in to {
+                queue_news(&mut st, room, t);
+            }
+            gname
+        };
+        tracing::info!("removed {} from a group", id.fmt_short());
+        self.save();
+        self.send_group_news(None);
+        self.sidebar.refresh(self);
+        if self.chat_view.conv() == Some(crate::chat::Conv::Group(room)) {
+            self.chat_view.refresh_header(self);
+        }
+        self.toast(&format!("Removed {name} from {gname}."));
+    }
+
+    /// Sends what's waiting for group members (all of them, or just `only`).
+    fn send_group_news(&self, only: Option<EndpointId>) {
+        let st = self.store.borrow();
+        for p in st.group_news_pending.iter().filter(|p| only.is_none_or(|o| o == p.to)) {
+            if let Some(g) = st.group_by_room(&p.room) {
+                let news = crate::proto::GroupNews { room: p.room, removed: g.removed.clone() };
+                self.net.send(NetCmd::GroupNews { to: p.to, news });
+            }
+        }
+    }
+
+    /// A member passed on the owner's removals (checked against the owner's key).
+    fn on_group_news(self: &Rc<Self>, from: EndpointId, news: crate::proto::GroupNews) {
+        let me = self.me();
+        let room = news.room;
+        let (gname, owner, we_were_removed, newly) = {
+            let mut st = self.store.borrow_mut();
+            let Some(g) = st.group_by_room_mut(&room) else { return };
+            let before: Vec<EndpointId> = g.removed.iter().map(|r| r.id).collect();
+            if !g.merge_removals(&news.removed) {
+                return;
+            }
+            let newly: Vec<EndpointId> = g.removed.iter().map(|r| r.id).filter(|id| !before.contains(id)).collect();
+            let info = (g.name.clone(), g.owner, g.is_removed(&me), newly);
+            if info.2 {
+                st.groups.retain(|g| g.room_id() != room);
+                st.group_news_pending.retain(|p| p.room != room);
+            } else {
+                // Pass it on, so it reaches everyone even if the owner goes offline.
+                let g = st.group_by_room(&room).unwrap();
+                let to: Vec<EndpointId> = g.members.iter().map(|m| m.id).chain(g.removed.iter().map(|r| r.id)).filter(|x| *x != me && *x != from).collect();
+                for t in to {
+                    queue_news(&mut st, room, t);
+                }
+            }
+            info
+        };
+        self.save();
+        if we_were_removed {
+            let by = owner.map(|o| self.display_name(&o)).unwrap_or_else(|| "The owner".into());
+            if self.chat_view.conv() == Some(crate::chat::Conv::Group(room)) {
+                self.chat_view.close();
+                if self.content.visible_child_name().as_deref() == Some("chat") {
+                    self.show_home();
+                }
+            }
+            self.toast(&format!("{by} removed you from {gname}."));
+        } else {
+            self.send_group_news(None);
+            let names: Vec<String> = newly.iter().map(|id| self.display_name(id)).collect();
+            if !names.is_empty() {
+                self.toast(&format!("{} removed from {gname} by its owner.", names.join(", ")));
+            }
+            if let Some(c) = self.chat_view.conv() {
+                if self.chat_open() == Some(c) {
+                    self.chat_view.refresh_header(self);
+                }
+            }
+        }
+        self.sidebar.refresh(self);
+    }
+
     // ------------------------------------------------------------ identity
 
     /// Tells the network engine about our identity moves still to be delivered.
@@ -1307,6 +1447,17 @@ impl App {
         {
             let mut st = self.store.borrow_mut();
             st.replace_id(&old_id, &new_id);
+            // Removals in groups we own are re-signed by the new identity (so people who
+            // join later can check them) and passed on again.
+            let mut resend = Vec::new();
+            for g in st.groups.iter_mut().filter(|g| g.owner == Some(new_id) && !g.removed.is_empty()) {
+                let room = g.room_id();
+                g.removed = g.removed.iter().map(|r| crate::store::Removal::sign(&new, &room, r.id, r.ts)).collect();
+                resend.extend(g.members.iter().map(|m| (room, m.id)).filter(|(_, id)| *id != new_id));
+            }
+            for (room, to) in resend {
+                queue_news(&mut st, room, to);
+            }
             st.moves.push(notice);
             st.move_pending = st.known_peers(&new_id);
             st.save();
@@ -1433,7 +1584,8 @@ impl App {
         let shown = match self.store.borrow().contact(&from) {
             Some(c) => identity::tagged(&c.name, &from),
             None if name.is_empty() => from.fmt_short().to_string(),
-            None => identity::tagged(&name, &from),
+            // A stranger always shows their tag, so they can't pass as a contact.
+            None => identity::tagged_always(&name, &from),
         };
         let (heading, mut body) = match &group_name {
             Some(g) => (format!("{shown} is calling “{g}”"), "Group call".to_string()),
@@ -2082,14 +2234,53 @@ impl App {
     }
 }
 
+/// Remembers that `to` should hear the group's removals (until they confirm).
+fn queue_news(st: &mut Store, room: crate::store::RoomId, to: EndpointId) {
+    let p = crate::store::PendingNews { room, to };
+    if !st.group_news_pending.contains(&p) {
+        st.group_news_pending.push(p);
+    }
+}
+
 fn load_css() {
+    let display = gtk::gdk::Display::default().expect("display");
     let provider = gtk::CssProvider::new();
     provider.load_from_string(include_str!("style.css"));
-    gtk::style_context_add_provider_for_display(
-        &gtk::gdk::Display::default().expect("display"),
-        &provider,
-        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
+    gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+    // Light appearance: Parley's own (Discord-like) colours, swapped in while light.
+    let light = gtk::CssProvider::new();
+    light.load_from_string(include_str!("style-light.css"));
+    let apply = move |sm: &adw::StyleManager| {
+        gtk::style_context_remove_provider_for_display(&display, &light);
+        if !sm.is_dark() {
+            gtk::style_context_add_provider_for_display(&display, &light, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1);
+        }
+    };
+    let sm = adw::StyleManager::default();
+    apply(&sm);
+    sm.connect_dark_notify(apply);
+}
+
+/// Parley's icons are built in (Adwaita's, renamed), so a desktop's own icon theme
+/// (KDE's Breeze, say) can't swap them; GTK's own icons (menus, window buttons) are
+/// taken from Adwaita too.
+fn load_icons() {
+    gio::resources_register_include!("parley.gresource").expect("built-in icons");
+    let display = gtk::gdk::Display::default().expect("display");
+    gtk::IconTheme::for_display(&display).add_resource_path("/io/github/parley/Parley/icons");
+    if let Some(s) = gtk::Settings::default() {
+        s.set_gtk_icon_theme_name(Some("Adwaita"));
+    }
+}
+
+/// Settings → Appearance. "Follow system" is dark unless the system asks for light.
+pub fn apply_appearance(a: crate::store::Appearance) {
+    use crate::store::Appearance;
+    adw::StyleManager::default().set_color_scheme(match a {
+        Appearance::System => adw::ColorScheme::PreferDark,
+        Appearance::Light => adw::ColorScheme::ForceLight,
+        Appearance::Dark => adw::ColorScheme::ForceDark,
+    });
 }
 
 // ------------------------------------------------------------ ringtone

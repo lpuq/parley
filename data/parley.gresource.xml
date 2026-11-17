@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/io/github/parley/Parley/icons/scalable/actions">
+    <file>parley-audio-headphones-symbolic.svg</file>
+    <file>parley-audio-input-microphone-symbolic.svg</file>
+    <file>parley-audio-volume-high-symbolic.svg</file>
+    <file>parley-audio-volume-muted-symbolic.svg</file>
+    <file>parley-call-start-symbolic.svg</file>
+    <file>parley-call-stop-symbolic.svg</file>
+    <file>parley-camera-disabled-symbolic.svg</file>
+    <file>parley-camera-web-symbolic.svg</file>
+    <file>parley-chat-message-new-symbolic.svg</file>
+    <file>parley-crown-symbolic.svg</file>
+    <file>parley-edit-copy-symbolic.svg</file>
+    <file>parley-emblem-system-symbolic.svg</file>
+    <file>parley-list-add-symbolic.svg</file>
+    <file>parley-microphone-disabled-symbolic.svg</file>
+    <file>parley-open-menu-symbolic.svg</file>
+    <file>parley-sidebar-show-symbolic.svg</file>
+    <file>parley-system-users-symbolic.svg</file>
+    <file>parley-video-display-symbolic.svg</file>
+    <file>parley-view-fullscreen-symbolic.svg</file>
+    <file>parley-view-grid-symbolic.svg</file>
+    <file>parley-view-more-symbolic.svg</file>
+  </gresource>
+</gresources>

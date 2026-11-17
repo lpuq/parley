@@ -135,7 +135,7 @@ impl CallView {
         focus_layout.append(&focus_main);
         focus_layout.append(&strip_scroll);
         let waiting = adw::StatusPage::builder()
-            .icon_name("system-users-symbolic")
+            .icon_name("parley-system-users-symbolic")
             .title("Waiting for others to join…")
             .description("Everyone in the group was called. Anyone can join later from the group's Join button.")
             .build();
@@ -146,16 +146,16 @@ impl CallView {
         root.append(&stage_overlay);
 
         // Controls.
-        let mic_btn = adw::SplitButton::builder().icon_name("audio-input-microphone-symbolic").tooltip_text("Mute (M)").build();
+        let mic_btn = adw::SplitButton::builder().icon_name("parley-audio-input-microphone-symbolic").tooltip_text("Mute (M)").build();
         mic_btn.add_css_class("call-btn");
-        let deaf_btn = round_button("audio-headphones-symbolic", "Deafen");
-        let cam_btn = adw::SplitButton::builder().icon_name("camera-web-symbolic").tooltip_text("Turn on camera").build();
+        let deaf_btn = round_button("parley-audio-headphones-symbolic", "Deafen");
+        let cam_btn = adw::SplitButton::builder().icon_name("parley-camera-web-symbolic").tooltip_text("Turn on camera").build();
         cam_btn.add_css_class("call-btn");
-        let screen_btn = round_button("video-display-symbolic", "Share your screen");
-        let chat_btn = round_button("chat-message-new-symbolic", "Chat");
-        let settings_btn = round_button("emblem-system-symbolic", "Settings");
+        let screen_btn = round_button("parley-video-display-symbolic", "Share your screen");
+        let chat_btn = round_button("parley-chat-message-new-symbolic", "Chat");
+        let settings_btn = round_button("parley-emblem-system-symbolic", "Settings");
         settings_btn.set_action_name(Some("app.settings"));
-        let hang = round_button("call-stop-symbolic", "Leave call");
+        let hang = round_button("parley-call-stop-symbolic", "Leave call");
         hang.add_css_class("hangup");
 
         let bar = gtk::Box::new(gtk::Orientation::Horizontal, 10);
@@ -475,9 +475,9 @@ impl CallView {
                         t.status.set_visible(p.reconnecting);
                         t.status.set_label("Reconnecting…");
                         t.muted.set_icon_name(Some(if p.state.deafened {
-                            "audio-volume-muted-symbolic"
+                            "parley-audio-volume-muted-symbolic"
                         } else {
-                            "microphone-disabled-symbolic"
+                            "parley-microphone-disabled-symbolic"
                         }));
                     }
                     TileKey::Screen(Some(id)) => {
@@ -585,7 +585,7 @@ impl CallView {
         let name = gtk::Label::new(None);
         name.add_css_class("tile-name");
         name.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        let muted = gtk::Image::from_icon_name("microphone-disabled-symbolic");
+        let muted = gtk::Image::from_icon_name("parley-microphone-disabled-symbolic");
         muted.add_css_class("tile-muted");
         let nb = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         nb.set_halign(gtk::Align::Start);
@@ -612,7 +612,7 @@ impl CallView {
         tr.append(&link);
         if let TileKey::Screen(_) = key {
             let fs = gtk::Button::builder()
-                .icon_name("view-fullscreen-symbolic")
+                .icon_name("parley-view-fullscreen-symbolic")
                 .tooltip_text("Fill window (F) · F11 for full screen")
                 .css_classes(["osd", "circular", "tile-menu"])
                 .build();
@@ -872,7 +872,7 @@ impl CallView {
 
     fn tile_menu(&self, id: EndpointId, track: Track) -> gtk::MenuButton {
         gtk::MenuButton::builder()
-            .icon_name("audio-volume-high-symbolic")
+            .icon_name("parley-audio-volume-high-symbolic")
             .tooltip_text(if track == Track::ScreenAudio { "Stream volume, mute, stop watching" } else { "Volume" })
             .css_classes(["osd", "circular", "tile-menu"])
             .popover(&self.tile_popover(id, track))
@@ -882,13 +882,13 @@ impl CallView {
     fn update_controls(&self, app: &Rc<App>) {
         let st = app.state.get();
         let muted = st.mic_muted || st.deafened;
-        self.mic_btn.set_icon_name(if muted { "microphone-disabled-symbolic" } else { "audio-input-microphone-symbolic" });
+        self.mic_btn.set_icon_name(if muted { "parley-microphone-disabled-symbolic" } else { "parley-audio-input-microphone-symbolic" });
         self.mic_btn.set_tooltip_text(Some(if muted { "Unmute (M)" } else { "Mute (M)" }));
         toggle_class(self.mic_btn.upcast_ref(), "off", muted);
-        self.deaf_btn.set_icon_name(if st.deafened { "audio-volume-muted-symbolic" } else { "audio-headphones-symbolic" });
+        self.deaf_btn.set_icon_name(if st.deafened { "parley-audio-volume-muted-symbolic" } else { "parley-audio-headphones-symbolic" });
         self.deaf_btn.set_tooltip_text(Some(if st.deafened { "Undeafen (D)" } else { "Deafen (D)" }));
         toggle_class(self.deaf_btn.upcast_ref(), "off", st.deafened);
-        self.cam_btn.set_icon_name(if st.camera { "camera-web-symbolic" } else { "camera-disabled-symbolic" });
+        self.cam_btn.set_icon_name(if st.camera { "parley-camera-web-symbolic" } else { "parley-camera-disabled-symbolic" });
         self.cam_btn.set_tooltip_text(Some(if st.camera { "Turn off camera" } else { "Turn on camera" }));
         toggle_class(self.cam_btn.upcast_ref(), "on", st.camera);
         self.screen_btn.set_tooltip_text(Some(if st.screen { "Stop sharing" } else { "Share your screen" }));
@@ -910,7 +910,7 @@ impl CallView {
                     TileKey::Screen(Some(id)) => (*id, Track::ScreenAudio),
                     _ => continue,
                 };
-                m.set_icon_name(if app.track_muted(&id, track) { "audio-volume-muted-symbolic" } else { "audio-volume-high-symbolic" });
+                m.set_icon_name(if app.track_muted(&id, track) { "parley-audio-volume-muted-symbolic" } else { "parley-audio-volume-high-symbolic" });
             }
         }
         for (k, t) in self.tiles.borrow().iter() {

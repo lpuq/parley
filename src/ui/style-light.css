@@ -1,0 +1,17 @@
+/* Parley in the light appearance: style.css's colours, redefined (loaded only while
+   light, above style.css; full-screen streams and video letterboxing stay black). */
+@define-color parley_bg #f2f3f5;
+@define-color tile_bg #e3e5e8;
+@define-color controls_bg #e3e5e8;
+@define-color call_btn_bg #ffffff;
+@define-color call_btn_hover #d4d7dc;
+@define-color call_btn_fg #2e3338;
+@define-color call_btn_menu_bg #f2f3f5;
+@define-color group_icon_fg #5c5e66;
+@define-color chat_bg #ffffff;
+@define-color chat_line alpha(black, 0.1);
+@define-color chat_hover alpha(black, 0.04);
+@define-color composer_bg #ebedef;
+@define-color chat_btn_bg #e3e5e8;
+@define-color chat_btn_hover #d4d7dc;
+@define-color chat_btn_fg #2e3338;

@@ -35,7 +35,8 @@ have to run or pay for.
 - **Tell people apart.** Everyone has a picture (identicon) and a name tag like
   `alice#f3a7`, both derived from their identity key, so two people (or two identities
   on one computer) with the same name never look alike. A contact's ⋮ → *User info*
-  shows their full key, when you added them, and their Parley version.
+  shows their full key, when you added them, and their Parley version. Settings →
+  *Appearance* can hide the tags (strangers calling always show theirs).
 - **Online status.** See which friends are online or on Do Not Disturb (calls arrive
   silently), and go Invisible to look offline. Group calls list who's in them under
   the group, with a red LIVE badge for anyone sharing their screen and their
@@ -47,6 +48,13 @@ have to run or pay for.
 - **Resilient groups.** Someone dropping out doesn't end the call for everyone else.
   Parley reconnects automatically after network blips, and anyone can rejoin with one
   click.
+- **Group owners.** Whoever creates a group owns it (a crown in its member list) and
+  can right-click a member → *Remove from group*, for old accounts or people who
+  shouldn't be there. They're out for everyone, and the group code no longer gets them
+  back in.
+- **Looks the same everywhere.** Light, dark, or follow the system (Settings →
+  *Appearance*), with GNOME's Adwaita icons built in, so KDE and other desktops show
+  Parley as designed.
 
 ## Install
 
@@ -191,6 +199,13 @@ automatically.
   it with an HMAC bound to both participants' keys. A member who rings a contact for
   the group includes the invite inside the encrypted connection, so contacts can join
   without ever seeing the code.
+- **Group owners and removals:** a group records its creator as owner, carried in its
+  code and invites (groups from before 0.8.0 take their first member, which is the
+  creator in every copy). A removal is signed by the owner's key ("remove X from room
+  R"); members accept only removals signed by the owner they recorded, then refuse X's
+  group calls, group chat and status checks even though X still knows the secret. Each
+  member passes removals on to the others over `parley-group/1` (retrying every minute
+  until confirmed), and they travel with codes and invites to people who join later.
 - **Media transport** (one QUIC connection per pair of people):
   - Audio: Opus (20 ms frames, in-band FEC) in RTP over unreliable QUIC datagrams.
     Playback is scheduled from the sender's RTP timestamps (anchored to the fastest
@@ -274,7 +289,8 @@ PARLEY_LOG=parley=debug cargo run           # verbose logs
 The network tests cover a direct call, a 3-person group mesh where two members only
 know the creator, leaving, rejoining without ringing, automatic reconnection after a
 dropout, in-order delivery of video GOPs plus audio datagrams, chat delivery and
-refusal, and identity moves (followed by friends, ignored by strangers).
+refusal, identity moves (followed by friends, ignored by strangers), and a removed
+group member being refused by the group (after joining fine before the removal).
 
 ## Known limitations / next steps
 
@@ -289,3 +305,7 @@ refusal, and identity moves (followed by friends, ignored by strangers).
 Copyright © 2026 lpuq. Parley is free software under the [GNU General Public License v3.0 or later](LICENSE):
 you can use, study, change and share it, and anyone who distributes a modified version
 must publish its source under the same terms.
+
+The built-in icons in `data/icons` are GNOME's Adwaita icons (adwaita-icon-theme by the
+GNOME Project, LGPL-3.0-only or CC-BY-SA-3.0), renamed, with the call icon turned a
+quarter turn; the crown was drawn for Parley.

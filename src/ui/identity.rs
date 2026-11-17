@@ -2,6 +2,8 @@
 //! Discord's discriminators) and an identicon (a symmetric pattern and colour derived
 //! from the key), so two identities with the same name never look alike.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use adw::prelude::*;
 use gtk::{gdk, glib};
 use iroh::EndpointId;
@@ -13,13 +15,31 @@ pub fn tag(id: &EndpointId) -> String {
     hex[hex.len().saturating_sub(4)..].to_string()
 }
 
-/// `name#tag`, as plain text.
+static SHOW_TAGS: AtomicBool = AtomicBool::new(true);
+
+/// Settings → Appearance: whether names carry their #tag.
+pub fn set_show_tags(on: bool) {
+    SHOW_TAGS.store(on, Ordering::Relaxed);
+}
+
+/// `name#tag` (or just the name, if tags are hidden), as plain text.
 pub fn tagged(name: &str, id: &EndpointId) -> String {
+    if SHOW_TAGS.load(Ordering::Relaxed) { tagged_always(name, id) } else { name.to_string() }
+}
+
+/// `name#tag` whatever the setting: where telling identities apart is the point
+/// (someone unknown calling, user info).
+pub fn tagged_always(name: &str, id: &EndpointId) -> String {
     format!("{name}#{}", tag(id))
 }
 
-/// `name#tag` as Pango markup, with the tag dimmed. `name` is escaped here.
+/// `name#tag` as Pango markup, with the tag dimmed (or just the name, if tags are
+/// hidden). `name` is escaped here.
 pub fn tagged_markup(name: &str, id: &EndpointId) -> String {
+    if SHOW_TAGS.load(Ordering::Relaxed) { tagged_markup_always(name, id) } else { glib::markup_escape_text(name).to_string() }
+}
+
+pub fn tagged_markup_always(name: &str, id: &EndpointId) -> String {
     format!("{}<span alpha=\"55%\">#{}</span>", glib::markup_escape_text(name), tag(id))
 }
 

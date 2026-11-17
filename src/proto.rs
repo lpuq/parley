@@ -22,6 +22,15 @@ pub const CHAT_ALPN: &[u8] = b"parley-chat/1";
 /// Identity moves: "my old key handed over to this new one", told to friends and
 /// group members. Answered with a [`MoveAck`].
 pub const MOVE_ALPN: &[u8] = b"parley-move/1";
+/// Group news: the owner's removals, passed on by every member until all have them.
+pub const GROUP_ALPN: &[u8] = b"parley-group/1";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GroupNews {
+    #[serde(with = "hex_room")]
+    pub room: RoomId,
+    pub removed: Vec<crate::store::Removal>,
+}
 
 /// Longest chat message we send or accept, in characters.
 pub const MAX_CHAT_CHARS: usize = 4000;
@@ -300,6 +309,17 @@ pub struct Invite {
     #[serde(with = "hex_room")]
     pub secret: [u8; 32],
     pub members: Vec<Member>,
+    /// The group's owner and the people they removed (0.8.0+).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<EndpointId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed: Vec<crate::store::Removal>,
+}
+
+impl Invite {
+    pub fn group(self) -> crate::store::Group {
+        crate::store::Group::learned(self.name, self.secret, self.members, self.owner, &self.removed)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

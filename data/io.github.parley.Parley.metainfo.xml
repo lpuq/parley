@@ -31,6 +31,16 @@
     <content_attribute id="social-audio">intense</content_attribute>
   </content_rating>
   <releases>
+    <release version="0.8.0" date="2026-11-17">
+      <description>
+        <ul>
+          <li>Group owners: whoever creates a group owns it (crown in its member list) and can right-click a member to remove them; removed people can't rejoin with the group code</li>
+          <li>Light, dark, or follow the system: Settings → General → Appearance</li>
+          <li>Option to hide the #tags after names</li>
+          <li>Adwaita icons built in, so Parley looks the same on KDE and other desktops; the phone icon now faces the familiar way</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.7.0" date="2026-11-17">
       <description>
         <ul>
