@@ -114,6 +114,11 @@ levelbar.voice-meter.open block.filled { background-color: #23a55a; }
 /* Overlay controls fade out when the pointer rests, like a video player. */
 .tile .tile-chrome { transition: opacity 200ms ease-out; }
 .tile.idle .tile-chrome { opacity: 0; transition: opacity 700ms ease-in; }
+/* Fill-window mode: the controls float over the stream, and everything fades together. */
+.call-view.immersive .call-controls { transition: opacity 200ms ease-out; box-shadow: 0 4px 18px alpha(black, 0.5); }
+.call-view.immersive.idle .call-controls,
+.call-view.immersive.idle .tile-chrome { opacity: 0; transition: opacity 700ms ease-in; }
+.call-view.immersive:not(.idle) .tile.idle .tile-chrome { opacity: 1; }
 
 /* ---------- Chat (Discord-like) ---------- */
 .chat-view { background-color: #313338; }
@@ -144,3 +149,4 @@ levelbar.voice-meter.open block.filled { background-color: #23a55a; }
   margin: -4px -6px 0 0;
 }
 row.conv-open { background-color: alpha(currentColor, 0.08); }
+.chat-header.clickable:hover { background-color: alpha(currentColor, 0.04); }

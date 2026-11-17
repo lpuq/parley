@@ -262,6 +262,8 @@ pub struct Settings {
     pub background_hint_shown: bool,
     /// Allow "system default" to pick a Bluetooth headset mic (switches earbuds to headset mode).
     pub allow_bluetooth_mic: bool,
+    /// The user hid the sidebar (it stays docked and shown otherwise).
+    pub sidebar_hidden: bool,
 }
 
 impl Default for Settings {
@@ -286,6 +288,7 @@ impl Default for Settings {
             autostart: false,
             background_hint_shown: false,
             allow_bluetooth_mic: false,
+            sidebar_hidden: false,
         }
     }
 }

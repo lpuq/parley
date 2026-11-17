@@ -26,6 +26,7 @@ pub const WAIT_NOTICE_MS: u64 = 5000;
 pub struct ChatView {
     app: Weak<App>,
     pub root: gtk::Box,
+    header: gtk::Box,
     avatar_slot: gtk::Box,
     title: gtk::Label,
     subtitle: gtk::Label,
@@ -117,6 +118,7 @@ impl ChatView {
         let this = Rc::new(Self {
             app,
             root,
+            header: header.clone(),
             avatar_slot,
             title,
             subtitle,
@@ -160,6 +162,29 @@ impl ChatView {
                 Conv::Group(r) => a.join_group(r),
             }
         });
+        // A group's header shows who's in it: the members who aren't your friends are
+        // listed at the bottom of the sidebar (friends are already above them).
+        let click = gtk::GestureClick::new();
+        let w = Rc::downgrade(&this);
+        click.connect_released(move |g, _, x, y| {
+            let Some(v) = w.upgrade() else { return };
+            if !matches!(v.conv.get(), Some(Conv::Group(_))) {
+                return;
+            }
+            // Not when it's one of the header's buttons being pressed.
+            let mut hit = v.header.pick(x, y, gtk::PickFlags::DEFAULT);
+            while let Some(h) = hit {
+                if h.is::<gtk::Button>() {
+                    return;
+                }
+                hit = h.parent();
+            }
+            g.set_state(gtk::EventSequenceState::Claimed);
+            if let Some(a) = v.app.upgrade() {
+                a.show_group_members();
+            }
+        });
+        this.header.add_controller(click);
         let w = Rc::downgrade(&this);
         this.back_to_call.connect_clicked(move |_| {
             if let Some(a) = w.upgrade().and_then(|v| v.app.upgrade()) {
@@ -171,6 +196,17 @@ impl ChatView {
 
     pub fn conv(&self) -> Option<Conv> {
         self.conv.get()
+    }
+
+    /// No conversation open (going home).
+    pub fn close(&self) {
+        self.conv.set(None);
+        self.input.buffer().set_text("");
+        while let Some(c) = self.list.first_child() {
+            self.list.remove(&c);
+        }
+        self.labels.borrow_mut().clear();
+        self.last.set(None);
     }
 
     pub fn set_panel(&self, panel: bool) {
@@ -243,6 +279,10 @@ impl ChatView {
             self.avatar_slot.remove(&c);
         }
         let in_call = app.room().is_some();
+        let group = matches!(conv, Conv::Group(_));
+        set_class(self.header.upcast_ref(), "clickable", group);
+        self.header.set_cursor_from_name(group.then_some("pointer"));
+        self.header.set_tooltip_text(group.then_some("Show the group's members"));
         match conv {
             Conv::Direct(id) => {
                 let name = app.display_name(&id);

@@ -808,7 +808,15 @@ fn set_autostart(on: bool) -> std::io::Result<()> {
 /// added, their status and Parley version.
 pub fn user_info(app: &Rc<App>, id: iroh::EndpointId) {
     use super::identity;
-    let Some(c) = app.store.borrow().contact(&id).cloned() else { return };
+    // Friends, and people we only share a group with.
+    let c = {
+        let st = app.store.borrow();
+        st.contact(&id).cloned().or_else(|| {
+            st.groups.iter().flat_map(|g| g.members.iter()).find(|m| m.id == id).map(|m| crate::store::Contact { id, name: m.name.clone(), added: None })
+        })
+    };
+    let Some(c) = c else { return };
+    let friend = app.store.borrow().contact(&id).is_some();
     let d = adw::Dialog::new();
     d.set_title("User info");
     d.set_content_width(440);
@@ -860,7 +868,19 @@ pub fn user_info(app: &Rc<App>, id: iroh::EndpointId) {
         Some(dt) => dt.format("%e %B %Y").map(|s| s.trim().to_string()).unwrap_or_default(),
         None => "Before Parley 0.4.3 (not recorded)".to_string(),
     };
-    g.add(&adw::ActionRow::builder().title("Added").subtitle(&added).css_classes(["property"]).build());
+    if friend {
+        g.add(&adw::ActionRow::builder().title("Added").subtitle(&added).css_classes(["property"]).build());
+    } else {
+        let row = adw::ActionRow::builder().title("Not your friend").subtitle("You're in a group together").build();
+        let add = gtk::Button::builder().label("Add friend").valign(gtk::Align::Center).css_classes(["pill", "suggested-action"]).build();
+        let (a, n, dd) = (app.clone(), c.name.clone(), d.clone());
+        add.connect_clicked(move |_| {
+            a.add_contact(id, &n);
+            dd.close();
+        });
+        row.add_suffix(&add);
+        g.add(&row);
+    }
     let version = app.version_of(&id).map(|v| format!("Parley {v}")).unwrap_or_else(|| "Unknown (not seen yet, or older than 0.4.3)".into());
     g.add(&adw::ActionRow::builder().title("Version").subtitle(&version).css_classes(["property"]).build());
     page.add(&g);

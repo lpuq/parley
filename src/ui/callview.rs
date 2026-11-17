@@ -18,6 +18,9 @@ use crate::{
     proto::{RoomKey, Track},
 };
 
+/// Pointer rest before overlays (names, LIVE, controls) fade out.
+const IDLE_MS: u64 = 4000;
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum TileKey {
     /// `None` = me.
@@ -53,6 +56,14 @@ pub struct CallView {
     root: gtk::Box,
     head: gtk::Box,
     bar: gtk::Box,
+    /// Holds the stage; in fill-window mode the controls float over it.
+    stage_overlay: gtk::Overlay,
+    /// Fill-window mode: controls, names and badges fade after a while without
+    /// pointer movement.
+    idle_timer: RefCell<Option<glib::SourceId>>,
+    bar_hovered: Cell<bool>,
+    /// Call shortcuts, for the window to install.
+    pub keys: RefCell<Option<gtk::EventControllerKey>>,
     strip_scroll: gtk::ScrolledWindow,
     /// Full screen showing only the focused tile.
     immersive: Cell<bool>,
@@ -130,7 +141,9 @@ impl CallView {
             .build();
         waiting.add_css_class("compact");
         stage.append(&grid);
-        root.append(&stage);
+        let stage_overlay = gtk::Overlay::new();
+        stage_overlay.set_child(Some(&stage));
+        root.append(&stage_overlay);
 
         // Controls.
         let mic_btn = adw::SplitButton::builder().icon_name("audio-input-microphone-symbolic").tooltip_text("Mute (M)").build();
@@ -165,6 +178,10 @@ impl CallView {
             root,
             head,
             bar: bar.clone(),
+            stage_overlay,
+            idle_timer: RefCell::new(None),
+            bar_hovered: Cell::new(false),
+            keys: RefCell::new(None),
             strip_scroll: strip_scroll.clone(),
             immersive: Cell::new(false),
             sidebar_before: Cell::new(true),
@@ -225,7 +242,9 @@ impl CallView {
         this.mic_btn.set_popover(Some(&device_popover(app.clone(), DeviceKind::Mic)));
         this.cam_btn.set_popover(Some(&device_popover(app.clone(), DeviceKind::Camera)));
 
-        // Keyboard: M mute, D deafen (when no text entry has focus).
+        // Keyboard: M mute, D deafen, F fill window. Listened for on the whole window
+        // (focus is often still on the sidebar's Call button), but only while the call
+        // is on screen; text fields keep the keys they type.
         let keys = gtk::EventControllerKey::new();
         let a = app.clone();
         keys.connect_key_pressed(move |_, key, _, mods| {
@@ -233,6 +252,10 @@ impl CallView {
                 return glib::Propagation::Proceed;
             }
             let Some(a) = a.upgrade() else { return glib::Propagation::Proceed };
+            let typing = gtk::prelude::GtkWindowExt::focus(&a.window).is_some_and(|w| w.is::<gtk::Text>() || w.is::<gtk::TextView>());
+            if typing || a.room().is_none() || a.content.visible_child_name().as_deref() != Some("call") {
+                return glib::Propagation::Proceed;
+            }
             match key {
                 gtk::gdk::Key::m => a.toggle_mute(),
                 gtk::gdk::Key::d => a.toggle_deafen(),
@@ -243,8 +266,77 @@ impl CallView {
             }
             glib::Propagation::Stop
         });
-        this.root.add_controller(keys);
+        this.keys.replace(Some(keys));
+
+        // Fill-window mode: any real pointer movement brings the controls back. (GTK
+        // also reports "motion" when the layout changes under a resting pointer.)
+        let motion = gtk::EventControllerMotion::new();
+        let last = Rc::new(Cell::new((f64::NAN, f64::NAN)));
+        let (a, l) = (app.clone(), last.clone());
+        motion.connect_motion(move |_, x, y| {
+            let (lx, ly) = l.get();
+            // (The first position is NaN, which compares false: written so it counts.)
+            if !((x - lx).abs() <= 2.0 && (y - ly).abs() <= 2.0) {
+                l.set((x, y));
+                if let Some(a) = a.upgrade() {
+                    a.call_view.wake();
+                }
+            }
+        });
+        this.root.add_controller(motion);
+        // Never fade the controls out from under the pointer.
+        let hover = gtk::EventControllerMotion::new();
+        let a = app.clone();
+        hover.connect_enter(move |_, _, _| {
+            if let Some(a) = a.upgrade() {
+                a.call_view.bar_hovered.set(true);
+            }
+        });
+        let a = app.clone();
+        hover.connect_leave(move |_| {
+            if let Some(a) = a.upgrade() {
+                a.call_view.bar_hovered.set(false);
+            }
+        });
+        this.bar.add_controller(hover);
         this
+    }
+
+    /// Shows the controls (fill-window mode), and fades them again after 4 s of rest.
+    fn wake(&self) {
+        if let Some(t) = self.idle_timer.borrow_mut().take() {
+            t.remove();
+        }
+        self.root.remove_css_class("idle");
+        self.root.set_cursor_from_name(None);
+        self.bar.set_can_target(true);
+        if !self.immersive.get() {
+            return;
+        }
+        let a = self.app.clone();
+        let id = glib::timeout_add_local_once(std::time::Duration::from_millis(IDLE_MS), move || {
+            let Some(a) = a.upgrade() else { return };
+            a.call_view.idle_timer.borrow_mut().take();
+            a.call_view.go_idle();
+        });
+        *self.idle_timer.borrow_mut() = Some(id);
+    }
+
+    fn go_idle(&self) {
+        if !self.immersive.get() {
+            return;
+        }
+        let menu_open = self.bar_hovered.get()
+            || [&self.mic_btn, &self.cam_btn].iter().any(|b| b.popover().is_some_and(|p| p.is_visible()))
+            || self.tiles.borrow().values().any(|t| t.menu.as_ref().is_some_and(|m| m.is_active()));
+        if menu_open {
+            self.wake();
+            return;
+        }
+        self.root.add_css_class("idle");
+        self.root.set_cursor_from_name(Some("none"));
+        // Invisible buttons mustn't catch clicks.
+        self.bar.set_can_target(false);
     }
 
     pub fn widget(&self) -> &gtk::Box {
@@ -262,18 +354,27 @@ impl CallView {
             return;
         }
         self.head.set_visible(!on);
-        self.bar.set_visible(!on);
         self.strip_scroll.set_visible(!on);
+        // The controls float over the picture (and fade) instead of taking a strip.
+        if on {
+            self.root.remove(&self.bar);
+            self.bar.set_valign(gtk::Align::End);
+            self.stage_overlay.add_overlay(&self.bar);
+        } else {
+            self.stage_overlay.remove_overlay(&self.bar);
+            self.bar.set_valign(gtk::Align::Fill);
+            self.root.append(&self.bar);
+        }
         app.content_page.set_reveal_top_bars(!on);
         toggle_class(self.root.upcast_ref(), "immersive", on);
         if on {
             self.sidebar_before.set(app.split.shows_sidebar());
             app.split.set_show_sidebar(false);
-            app.toast("Press F or Esc to exit · F11 for full screen");
+            app.brief_toast("Press F or Esc to exit · F11 for full screen", 2000);
         } else {
             app.split.set_show_sidebar(self.sidebar_before.get());
-            app.sync_sidebar();
         }
+        self.wake();
         self.relayout(app);
     }
 
@@ -621,7 +722,7 @@ impl CallView {
                         }
                         open
                     };
-                    if ov.has_css_class("has-video") && !busy {
+                    if ov.has_css_class("has-video") && !busy && !in_immersive(ov.upcast_ref()) {
                         ov.add_css_class("idle");
                         ov.set_cursor_from_name(Some("none"));
                     }
@@ -634,7 +735,7 @@ impl CallView {
             move || {
                 ov.remove_css_class("idle");
                 ov.set_cursor_from_name(None);
-                arm_idle(3000);
+                arm_idle(IDLE_MS);
             }
         };
         let motion = gtk::EventControllerMotion::new();
@@ -659,7 +760,7 @@ impl CallView {
             motion.connect_leave(move |_| a(800));
         }
         overlay.add_controller(motion);
-        arm_idle(3000);
+        arm_idle(IDLE_MS);
 
         // Right-click: the same menu as the tile's button, at the pointer.
         if let Some((_, id, track)) = &menu {
@@ -877,6 +978,19 @@ fn set_tile(t: &Tile, name: &str, label: &str, video: Option<gtk::gdk::Paintable
     if t.picture.paintable() != video {
         t.picture.set_paintable(video.as_ref());
     }
+}
+
+/// Whether `w` is inside the call view in fill-window mode (where the call view's own
+/// idle timer fades everything together).
+fn in_immersive(w: &gtk::Widget) -> bool {
+    let mut p = w.parent();
+    while let Some(x) = p {
+        if x.has_css_class("call-view") {
+            return x.has_css_class("immersive");
+        }
+        p = x.parent();
+    }
+    false
 }
 
 fn detach(w: &gtk::Widget) {

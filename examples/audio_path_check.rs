@@ -23,7 +23,7 @@ fn main() {
         (net::start(ka, ha.clone(), ta).await.unwrap(), net::start(kb, hb.clone(), tb).await.unwrap())
     });
     for (n, me, other) in [(&na, "A", idb), (&nb, "B", ida)] {
-        n.send(NetCmd::Directory { my_name: me.into(), contacts: vec![Contact { id: other, name: "x".into() }], groups: vec![], allow_unknown: true });
+        n.send(NetCmd::Directory { my_name: me.into(), contacts: vec![Contact::new(other, "x")], groups: vec![], allow_unknown: true });
     }
     std::thread::sleep(Duration::from_secs(2));
     na.send(NetCmd::CallDirect(idb));

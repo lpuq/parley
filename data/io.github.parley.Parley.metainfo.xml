@@ -31,6 +31,17 @@
     <content_attribute id="social-audio">intense</content_attribute>
   </content_rating>
   <releases>
+    <release version="0.6.0" date="2026-11-17">
+      <description>
+        <ul>
+          <li>The sidebar stays docked beside everything, calls and chats included; only its button hides it, and that choice is remembered</li>
+          <li>Your name at the top of the sidebar takes you to the home page; during a call the home page has Return to call</li>
+          <li>Group chats list the members who aren't your friends at the bottom of the sidebar, with their status; click the group's header to jump there, a member for their info, or + to add them</li>
+          <li>Fill-window mode: the call controls float over the stream and fade with its name and LIVE badge after 4 seconds without mouse movement; the "Press F or Esc" hint disappears after 2 seconds</li>
+          <li>The F, M and D shortcuts work in a call even when the sidebar has keyboard focus</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.5.2" date="2026-11-17">
       <description>
         <ul>

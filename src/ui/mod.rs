@@ -127,8 +127,8 @@ pub struct App {
     chat_panel: gtk::Box,
     /// Peers we're delivering chat to right now (one delivery at a time each).
     chat_inflight: RefCell<std::collections::HashSet<EndpointId>>,
-    /// The sidebar was hidden to fit the chat panel beside a call.
-    sidebar_hidden_for_chat: Cell<bool>,
+    /// Home page: "Return to call", shown while in a call.
+    home_return: gtk::Button,
 }
 
 impl App {
@@ -216,19 +216,34 @@ impl App {
             chat_reveal: gtk::Revealer::new(),
             chat_panel: gtk::Box::new(gtk::Orientation::Vertical, 0),
             chat_inflight: RefCell::new(Default::default()),
-            sidebar_hidden_for_chat: Cell::new(false),
+            home_return: gtk::Button::builder()
+                .label("Return to call")
+                .halign(gtk::Align::Center)
+                .css_classes(["pill", "join-btn"])
+                .visible(false)
+                .build(),
         });
 
         // ----- layout -----
         let content_page = this.content_page.clone();
         let content_header = adw::HeaderBar::new();
         content_header.set_show_title(false);
+        // The sidebar stays docked beside the content, like Discord's: it only goes
+        // away when you hide it with this button (remembered across restarts).
         let sidebar_toggle = gtk::ToggleButton::builder()
             .icon_name("sidebar-show-symbolic")
-            .tooltip_text("Toggle sidebar")
-            .active(true)
+            .tooltip_text("Show or hide the sidebar")
             .build();
-        split.bind_property("show-sidebar", &sidebar_toggle, "active").bidirectional().build();
+        split.set_show_sidebar(!this.store.borrow().settings.sidebar_hidden);
+        split.bind_property("show-sidebar", &sidebar_toggle, "active").bidirectional().sync_create().build();
+        {
+            // Only real clicks count as a choice (fill-window mode hides it for a while too).
+            let t = this.clone();
+            sidebar_toggle.connect_clicked(move |b| {
+                t.store.borrow_mut().settings.sidebar_hidden = !b.is_active();
+                t.store.borrow().save();
+            });
+        }
         content_header.pack_start(&sidebar_toggle);
         content_page.add_top_bar(&content_header);
         content_page.set_content(Some(&content));
@@ -257,17 +272,19 @@ impl App {
         split.set_content(Some(&content_page));
         toasts.set_child(Some(&split));
         window.set_content(Some(&toasts));
+        if let Some(k) = this.call_view.keys.take() {
+            window.add_controller(k);
+        }
 
-        // Narrow windows: sidebar overlays the content, and everything gets more compact
-        // so the window (and its close button) never needs more width than it has.
+        // Narrow windows: everything gets more compact so the window (and its close
+        // button) never needs more width than it has. The sidebar stays docked; hiding
+        // it (its button) is how to go narrower still.
         let bp = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
             adw::BreakpointConditionLengthType::MaxWidth,
             720.0,
             adw::LengthUnit::Sp,
         ));
-        bp.add_setter(&split, "collapsed", Some(&true.to_value()));
         bp.add_setter(&home_buttons, "orientation", Some(&gtk::Orientation::Vertical.to_value()));
-        // Leave a strip of the content (and its header's close button) uncovered.
         bp.add_setter(&split, "max-sidebar-width", Some(&280.0f64.to_value()));
         bp.add_setter(&split, "min-sidebar-width", Some(&260.0f64.to_value()));
         for w in &this.call_view.wide_only {
@@ -289,15 +306,15 @@ impl App {
         }
         window.add_breakpoint(bp);
 
-        // The sidebar (contacts and groups) is what you need when not in a call, so it
-        // shows whenever the home page does, narrow window or not. In a call it gets out
-        // of the way in narrow windows; the toggle button still shows it on demand.
-        split.set_pin_sidebar(true);
         {
+            // Your name in the sidebar is the way home: highlight it there.
             let t = this.clone();
-            split.connect_collapsed_notify(move |_| t.sync_sidebar());
+            content.connect_visible_child_name_notify(move |c| {
+                t.sidebar.set_home_shown(c.visible_child_name().as_deref() == Some("home"));
+            });
+            this.sidebar.set_home_shown(true);
             let t = this.clone();
-            content.connect_visible_child_name_notify(move |_| t.sync_sidebar());
+            this.home_return.connect_clicked(move |_| t.show_call());
         }
 
         this.install_actions();
@@ -489,14 +506,25 @@ impl App {
         self.window.present();
     }
 
-    /// Shows or hides the sidebar to suit the current page and window width.
-    pub(crate) fn sync_sidebar(&self) {
-        let home = self.content.visible_child_name().as_deref() == Some("home");
-        if home {
-            self.split.set_show_sidebar(true);
-        } else if self.split.is_collapsed() {
-            self.split.set_show_sidebar(false);
+    /// The home page (your name in the sidebar). A call carries on; the home page
+    /// offers the way back to it.
+    pub fn show_home(&self) {
+        if self.content.visible_child_name().as_deref() == Some("chat") {
+            self.chat_view.close();
         }
+        self.update_home();
+        self.content.set_visible_child_name("home");
+        self.sidebar.refresh_soon();
+    }
+
+    /// Shows the sidebar (if hidden) and scrolls it to the open group's other members.
+    pub fn show_group_members(&self) {
+        if !self.split.shows_sidebar() {
+            self.split.set_show_sidebar(true);
+            self.store.borrow_mut().settings.sidebar_hidden = false;
+            self.store.borrow().save();
+        }
+        self.sidebar.scroll_to_members();
     }
 
     /// The home page, and its row of buttons (stacked vertically in narrow windows).
@@ -526,6 +554,7 @@ impl App {
         top.append(&qr);
         b.append(&top);
         b.append(&add);
+        b.append(&self.home_return);
         self.home.set_child(Some(&b));
         (self.home.clone().upcast(), top)
     }
@@ -538,6 +567,7 @@ impl App {
             "Pick a friend or group on the left to call.\nCalls are end-to-end encrypted and go directly between you — no server, no account.".to_string()
         };
         self.home.set_description(Some(&desc));
+        self.home_return.set_visible(self.room.get().is_some());
         self.home.set_title(&if st.my_name.is_empty() {
             "Ready to call".to_string()
         } else {
@@ -549,6 +579,15 @@ impl App {
         let t = adw::Toast::new(&glib::markup_escape_text(msg));
         t.set_timeout(5);
         self.toasts.add_toast(t);
+    }
+
+    /// A short hint that goes away on its own after `ms`, whatever the window is doing
+    /// (libadwaita holds a toast while the pointer rests on it).
+    pub fn brief_toast(&self, msg: &str, ms: u64) {
+        let t = adw::Toast::new(&glib::markup_escape_text(msg));
+        t.set_timeout(0);
+        self.toasts.add_toast(t.clone());
+        glib::timeout_add_local_once(std::time::Duration::from_millis(ms), move || t.dismiss());
     }
 
     pub fn my_code(&self) -> String {
@@ -629,6 +668,7 @@ impl App {
         add("accept-call", Box::new(|t| t.answer(true)));
         add("decline-call", Box::new(|t| t.answer(false)));
         add("show", Box::new(|t| t.present()));
+        add("home", Box::new(|t| t.show_home()));
         add("quit", Box::new(|t| t.quit()));
         {
             let a = gio::SimpleAction::new("open-chat", Some(glib::VariantTy::STRING));
@@ -990,22 +1030,14 @@ impl App {
 
     /// Opens a conversation: beside the call if it's the call's own (and there's
     /// room), otherwise as a page.
-    /// Whether the chat panel fits beside the call, hiding the sidebar if that's what
-    /// it takes. (Without this check a too-narrow window would cut off its own edge.)
+    /// Whether the chat panel fits beside the call. (Without this check a too-narrow
+    /// window would cut off its own edge.) The sidebar is never hidden for it: only
+    /// the user hides the sidebar; the chat gets its own page instead.
     fn make_room_for_chat_panel(&self) -> bool {
         const PANEL: i32 = 340;
         let call_min = self.call_view.widget().measure(gtk::Orientation::Horizontal, -1).0;
-        let side = if self.split.shows_sidebar() && !self.split.is_collapsed() { self.sidebar.widget().width() } else { 0 };
-        let avail = self.window.width();
-        if avail >= call_min + PANEL + side {
-            return true;
-        }
-        if avail >= call_min + PANEL {
-            self.split.set_show_sidebar(false);
-            self.sidebar_hidden_for_chat.set(true);
-            return true;
-        }
-        false
+        let side = if self.split.shows_sidebar() { self.sidebar.widget().width() } else { 0 };
+        self.window.width() >= call_min + PANEL + side
     }
 
     /// In a call but no room beside it: the chat as a page, with "Return to call".
@@ -1035,10 +1067,7 @@ impl App {
         let Some(conv) = self.call_conv() else { return };
         if self.chat_reveal.reveals_child() && self.chat_view.conv() == Some(conv) {
             self.chat_reveal.set_reveal_child(false);
-            // Bring back the sidebar if the panel was what pushed it aside.
-            if self.sidebar_hidden_for_chat.replace(false) {
-                self.split.set_show_sidebar(true);
-            }
+            self.sidebar.refresh_soon();
         } else {
             self.open_chat(conv);
         }
@@ -1318,6 +1347,7 @@ impl App {
         self.state.set(st);
         self.start_audio();
         self.content.set_visible_child_name("call");
+        self.update_home();
         self.sidebar.refresh(self);
         self.call_view.rebuild(self);
         self.net.send(NetCmd::MediaState(self.state.get()));
@@ -1356,7 +1386,11 @@ impl App {
         st.screen_audio = false;
         self.state.set(st);
         self.chat_reveal.set_reveal_child(false);
-        self.show_idle();
+        // Leave the home page or a chat where it is; only the call's own page goes.
+        if matches!(self.content.visible_child_name().as_deref(), Some("call" | "outgoing")) {
+            self.show_idle();
+        }
+        self.update_home();
         self.call_view.rebuild_empty();
         self.update_tray();
         self.sidebar.refresh_soon();

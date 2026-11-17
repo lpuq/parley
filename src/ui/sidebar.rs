@@ -21,6 +21,12 @@ pub struct Sidebar {
     groups_empty: gtk::Label,
     me_row: adw::ActionRow,
     me_avatar: adw::Avatar,
+    /// The open group's members who aren't your friends, at the bottom.
+    others_title: gtk::Box,
+    others_label: gtk::Label,
+    others: gtk::ListBox,
+    others_empty: gtk::Label,
+    scroll: gtk::ScrolledWindow,
     status_dot: gtk::Box,
     status_label: gtk::Label,
 }
@@ -70,9 +76,13 @@ impl Sidebar {
             .build();
         me_row.add_suffix(&qr);
         me_row.add_suffix(&copy);
-        me_row.set_activatable_widget(Some(&copy));
+        // Your name is the way back to the home page (the buttons copy and show your code).
+        me_row.set_activatable(true);
+        me_row.set_tooltip_text(Some("Home"));
+        me_row.set_action_name(Some("app.home"));
         let me_list = gtk::ListBox::new();
         me_list.add_css_class("boxed-list");
+        me_list.set_selection_mode(gtk::SelectionMode::None);
         me_list.append(&me_row);
 
         // Status: Online / Do Not Disturb / Invisible.
@@ -102,6 +112,12 @@ impl Sidebar {
         let friends_empty = hint("No friends yet. Press + and paste a code a friend sent you.");
         let groups_empty = hint("Groups let 3 people call together. Create one from the menu.");
 
+        let others = list();
+        let others_empty = hint("Everyone in this group is already one of your friends.");
+        let others_title = section_title("", None);
+        let others_label = others_title.first_child().and_downcast::<gtk::Label>().unwrap();
+        others_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+
         let new_group = gtk::Button::builder()
             .icon_name("list-add-symbolic")
             .tooltip_text("New group")
@@ -121,6 +137,9 @@ impl Sidebar {
         col.append(&section_title("Groups", Some(&new_group)));
         col.append(&groups);
         col.append(&groups_empty);
+        col.append(&others_title);
+        col.append(&others);
+        col.append(&others_empty);
 
         let scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
@@ -129,7 +148,41 @@ impl Sidebar {
             .build();
         root.set_content(Some(&scroll));
 
-        Self { app, root, friends, groups, friends_empty, groups_empty, me_row, me_avatar, status_dot, status_label }
+        Self {
+            app,
+            root,
+            friends,
+            groups,
+            friends_empty,
+            groups_empty,
+            me_row,
+            me_avatar,
+            others_title,
+            others_label,
+            others,
+            others_empty,
+            scroll,
+            status_dot,
+            status_label,
+        }
+    }
+
+    /// Highlights your own row while the home page is showing.
+    pub fn set_home_shown(&self, on: bool) {
+        if on {
+            self.me_row.add_css_class("conv-open");
+        } else {
+            self.me_row.remove_css_class("conv-open");
+        }
+    }
+
+    /// Scrolls down to the open group's members (they're at the bottom).
+    pub fn scroll_to_members(&self) {
+        let s = self.scroll.clone();
+        glib::idle_add_local_once(move || {
+            let adj = s.vadjustment();
+            adj.set_value(adj.upper() - adj.page_size());
+        });
     }
 
     pub fn widget(&self) -> &adw::ToolbarView {
@@ -305,10 +358,82 @@ impl Sidebar {
                 self.groups.append(&call_member_row(&name, &id, &ms));
             }
         }
+        // The open group chat's members who aren't your friends, so everyone in it can
+        // be seen (with their status) somewhere.
+        while let Some(c) = self.others.first_child() {
+            self.others.remove(&c);
+        }
+        let open_group = match app.chat_open() {
+            Some(crate::chat::Conv::Group(r)) => st.groups.iter().find(|g| g.room_id() == r).cloned(),
+            _ => None,
+        };
+        let mut n_others = 0;
+        if let Some(g) = &open_group {
+            self.others_label.set_label(&format!("Others in {}", g.name));
+            let in_room = app.group_call_members(&g.room_id());
+            let mut members: Vec<_> = g.members.iter().filter(|m| m.id != app.me && st.contact(&m.id).is_none()).cloned().collect();
+            // Online first, then by name.
+            members.sort_by_key(|m| (app.presence_of(&m.id) == Presence::Offline, m.name.to_lowercase()));
+            for m in members {
+                n_others += 1;
+                let in_call = in_room.iter().any(|(id, _)| *id == m.id);
+                self.others.append(&self.other_member_row(&m.id, &m.name, app.presence_of(&m.id), in_call));
+            }
+        }
+        self.others_title.set_visible(open_group.is_some());
+        self.others.set_visible(n_others > 0);
+        self.others_empty.set_visible(open_group.is_some() && n_others == 0);
+
         self.friends_empty.set_visible(st.contacts.is_empty());
         self.friends.set_visible(!st.contacts.is_empty());
         self.groups_empty.set_visible(st.groups.is_empty());
         self.groups.set_visible(!st.groups.is_empty());
+    }
+
+    /// Someone in the open group who isn't your friend: status, and a button to add them.
+    fn other_member_row(&self, id: &iroh::EndpointId, name: &str, presence: Presence, in_call: bool) -> adw::ActionRow {
+        let (cls, text) = match presence {
+            _ if in_call => ("online", "In the group call"),
+            Presence::Online => ("online", "Online"),
+            Presence::DoNotDisturb => ("dnd", "Do not disturb"),
+            Presence::Offline => ("offline", "Offline"),
+        };
+        let row = adw::ActionRow::builder()
+            .title(identity::tagged_markup(name, id))
+            .title_lines(1)
+            .subtitle(text)
+            .tooltip_text("User info")
+            .build();
+        let avatar = gtk::Overlay::new();
+        avatar.set_child(Some(&identity::avatar(32, name, id)));
+        let dot = presence_dot();
+        set_presence_class(&dot, cls);
+        dot.set_halign(gtk::Align::End);
+        dot.set_valign(gtk::Align::End);
+        avatar.add_overlay(&dot);
+        avatar.set_valign(gtk::Align::Center);
+        row.add_prefix(&avatar);
+        let add = gtk::Button::builder()
+            .icon_name("list-add-symbolic")
+            .tooltip_text(format!("Add {name} as a friend"))
+            .valign(gtk::Align::Center)
+            .css_classes(["flat", "circular"])
+            .build();
+        let (a, id, n) = (self.app.clone(), *id, name.to_string());
+        add.connect_clicked(move |_| {
+            if let Some(a) = a.upgrade() {
+                a.add_contact(id, &n);
+            }
+        });
+        row.add_suffix(&add);
+        row.set_activatable(true);
+        let a = self.app.clone();
+        row.connect_activated(move |_| {
+            if let Some(a) = a.upgrade() {
+                dialogs::user_info(&a, id);
+            }
+        });
+        row
     }
 
     /// Opens the conversation (no call needed).
