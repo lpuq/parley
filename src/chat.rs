@@ -139,6 +139,13 @@ impl ChatStore {
         self.outbox.iter().filter(|p| p.conv_key == key).map(|p| (p.msg.id.clone(), !p.refused.is_empty())).collect()
     }
 
+    /// When the oldest message in `conv` still waiting for delivery (not refused) was
+    /// sent, if any.
+    pub fn oldest_waiting(&self, conv: &Conv) -> Option<u64> {
+        let key = conv.key();
+        self.outbox.iter().filter(|p| p.conv_key == key && p.refused.is_empty()).map(|p| p.msg.ts).min()
+    }
+
     /// What we still owe `peer`: (group, messages), grouped per conversation.
     pub fn owed_to(&self, peer: &EndpointId) -> Vec<(Option<RoomId>, Vec<WireMsg>)> {
         let mut by_conv: Vec<(Option<RoomId>, Vec<WireMsg>)> = Vec::new();

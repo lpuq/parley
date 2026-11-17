@@ -20,6 +20,8 @@ use crate::{
 
 /// Messages from the same person within this many ms share one header.
 const GROUP_MS: u64 = 7 * 60 * 1000;
+/// How long a message must wait undelivered before we explain why.
+pub const WAIT_NOTICE_MS: u64 = 5000;
 
 pub struct ChatView {
     app: Weak<App>,
@@ -277,7 +279,9 @@ impl ChatView {
         let Some(conv) = self.conv.get() else { return };
         let pending = app.chat.borrow().pending_in(&conv);
         let refused = pending.values().any(|r| *r);
-        let waiting = !pending.is_empty();
+        // Only once something has really been waiting: a note that pops up for the
+        // split second a normal delivery takes would make the chat jump.
+        let waiting = app.chat.borrow().oldest_waiting(&conv).is_some_and(|ts| crate::chat::now_ms().saturating_sub(ts) > WAIT_NOTICE_MS);
         let text = match conv {
             Conv::Direct(id) if refused => {
                 Some(format!("{} hasn't added you as a contact, so they can't receive your messages yet. They'll be delivered once they do.", app.display_name(&id)))

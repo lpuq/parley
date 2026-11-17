@@ -1103,7 +1103,13 @@ impl App {
         }
         if self.chat_view.conv() == Some(conv) {
             self.chat_view.append(self, &msg, (!to.is_empty()).then_some(false));
-            self.chat_view.refresh_pending(self);
+            // If it's still undelivered in a few seconds, explain why.
+            let w = Rc::downgrade(self);
+            glib::timeout_add_local_once(std::time::Duration::from_millis(chat::WAIT_NOTICE_MS + 500), move || {
+                if let Some(a) = w.upgrade() {
+                    a.chat_view.refresh_pending(&a);
+                }
+            });
         }
         for peer in to {
             self.deliver_chat(peer);
