@@ -162,8 +162,8 @@ impl ChatView {
                 Conv::Group(r) => a.join_group(r),
             }
         });
-        // A group's header shows who's in it: the members who aren't your friends are
-        // listed at the bottom of the sidebar (friends are already above them).
+        // A group's header shows who's in it: its members are listed at the bottom of
+        // the sidebar.
         let click = gtk::GestureClick::new();
         let w = Rc::downgrade(&this);
         click.connect_released(move |g, _, x, y| {
@@ -256,7 +256,7 @@ impl ChatView {
         let adj = self.scroller.vadjustment();
         let at_end = adj.value() + adj.page_size() >= adj.upper() - 40.0;
         self.add_row(app, m, pending);
-        if at_end || m.from == app.me {
+        if at_end || m.from == app.me() {
             self.scroll_to_end();
         }
     }

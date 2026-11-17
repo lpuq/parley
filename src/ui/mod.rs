@@ -85,7 +85,10 @@ pub struct App {
     pub store: RefCell<Store>,
     pub net: NetHandle,
     pub hub: Arc<Hub>,
-    pub me: EndpointId,
+    /// Our identity (it changes if the user replaces it).
+    me: Cell<EndpointId>,
+    /// Where network engines send their events (a new identity starts a new engine).
+    ui_tx: async_channel::Sender<UiEvent>,
     pub rt: tokio::runtime::Handle,
 
     /// Current call, if any.
@@ -138,6 +141,7 @@ impl App {
         hub: Arc<Hub>,
         me: EndpointId,
         rt: tokio::runtime::Handle,
+        ui_tx: async_channel::Sender<UiEvent>,
         ui_rx: async_channel::Receiver<UiEvent>,
     ) -> Rc<Self> {
         let style = adw::StyleManager::default();
@@ -187,7 +191,8 @@ impl App {
             store: RefCell::new(store),
             net,
             hub,
-            me,
+            me: Cell::new(me),
+            ui_tx,
             rt,
             room: Cell::new(None),
             call_started: Cell::new(None),
@@ -339,6 +344,7 @@ impl App {
         this.sidebar.refresh(&this);
         this.update_home();
         this.push_directory();
+        this.push_moves();
 
         {
             let t = this.clone();
@@ -500,6 +506,10 @@ impl App {
         });
     }
 
+    pub fn me(&self) -> EndpointId {
+        self.me.get()
+    }
+
     pub fn present(&self) {
         self.hold.borrow_mut().take();
         self.window.set_visible(true);
@@ -591,7 +601,7 @@ impl App {
     }
 
     pub fn my_code(&self) -> String {
-        ShareCode::Contact { n: self.store.borrow().my_name.clone(), k: self.me }.encode()
+        ShareCode::Contact { n: self.store.borrow().my_name.clone(), k: self.me() }.encode()
     }
 
     pub fn copy(&self, text: &str, what: &str) {
@@ -764,7 +774,7 @@ impl App {
             self.present();
             // Answering someone means you know them: save them so either of you can
             // call back, without a second code exchange.
-            let unknown = self.store.borrow().contact(&inc.from).is_none() && inc.from != self.me;
+            let unknown = self.store.borrow().contact(&inc.from).is_none() && inc.from != self.me();
             if unknown {
                 self.store.borrow_mut().contacts.push(Contact::new(inc.from, inc.name.clone()));
                 self.save();
@@ -787,7 +797,7 @@ impl App {
     }
 
     pub fn add_contact(self: &Rc<Self>, id: EndpointId, name: &str) {
-        if id == self.me {
+        if id == self.me() {
             self.toast("That's your own code.");
             return;
         }
@@ -936,6 +946,8 @@ impl App {
             }
             UiEvent::Notice(msg) => self.toast(&msg),
             UiEvent::ChatReceived { from, name, group, msgs } => self.on_chat_received(from, name, group, msgs),
+            UiEvent::IdentityMoved { old, new } => self.on_identity_moved(old, new),
+            UiEvent::MoveDelivered { to, known } => self.on_move_delivered(to, known),
             UiEvent::ChatDelivered { to, ids, refused } => self.on_chat_delivered(to, ids, refused),
             UiEvent::Presence { id, presence, call, app } => {
                 if let Some(v) = app {
@@ -966,7 +978,7 @@ impl App {
     /// in it, otherwise what members told us.
     pub fn group_call_members(&self, room: &crate::store::RoomId) -> Vec<(EndpointId, MediaState)> {
         if self.room.get() == Some(RoomKey::Group(*room)) {
-            let mut v = vec![(self.me, self.state.get())];
+            let mut v = vec![(self.me(), self.state.get())];
             v.extend(self.participants().iter().map(|p| (p.id, p.state)));
             return v;
         }
@@ -1094,7 +1106,7 @@ impl App {
     /// Someone's name as shown in a conversation: contact name, else the name the
     /// group knows them by, else their short ID.
     pub fn name_in(&self, conv: &crate::chat::Conv, id: &EndpointId) -> String {
-        if *id == self.me {
+        if *id == self.me() {
             let n = self.store.borrow().my_name.clone();
             return if n.is_empty() { "You".into() } else { n };
         }
@@ -1113,7 +1125,7 @@ impl App {
     pub fn group_summary(&self, room: &crate::store::RoomId) -> (String, String) {
         let st = self.store.borrow();
         let Some(g) = st.groups.iter().find(|g| g.room_id() == *room) else { return ("Group".into(), String::new()) };
-        let others: Vec<String> = g.members.iter().filter(|m| m.id != self.me).map(|m| st.name_for(&m.id).unwrap_or_else(|| m.name.clone())).collect();
+        let others: Vec<String> = g.members.iter().filter(|m| m.id != self.me()).map(|m| st.name_for(&m.id).unwrap_or_else(|| m.name.clone())).collect();
         (g.name.clone(), others.join(", "))
     }
 
@@ -1127,14 +1139,14 @@ impl App {
                 .groups
                 .iter()
                 .find(|g| g.room_id() == *r)
-                .map(|g| g.members.iter().map(|m| m.id).filter(|id| *id != self.me).collect())
+                .map(|g| g.members.iter().map(|m| m.id).filter(|id| *id != self.me()).collect())
                 .unwrap_or_default(),
         }
     }
 
     pub fn send_chat(self: &Rc<Self>, conv: crate::chat::Conv, text: String) {
         let wire = crate::proto::WireMsg { id: crate::chat::new_id(), ts: crate::chat::now_ms(), text };
-        let msg = crate::chat::Message { id: wire.id.clone(), from: self.me, ts: wire.ts, text: wire.text.clone() };
+        let msg = crate::chat::Message { id: wire.id.clone(), from: self.me(), ts: wire.ts, text: wire.text.clone() };
         let to = self.chat_recipients(&conv);
         {
             let mut c = self.chat.borrow_mut();
@@ -1198,7 +1210,7 @@ impl App {
             None => crate::chat::Conv::Direct(from),
         };
         // Someone with our code messaged us first: add them, like answering a call does.
-        if group.is_none() && self.store.borrow().contact(&from).is_none() && from != self.me {
+        if group.is_none() && self.store.borrow().contact(&from).is_none() && from != self.me() {
             let shown = if name.is_empty() { from.fmt_short().to_string() } else { name };
             self.store.borrow_mut().contacts.push(Contact::new(from, shown.clone()));
             self.save();
@@ -1251,6 +1263,155 @@ impl App {
     /// A contact's last known status (offline until we hear otherwise).
     pub fn presence_of(&self, id: &EndpointId) -> Presence {
         self.presence.borrow().get(id).copied().unwrap_or(Presence::Offline)
+    }
+
+    // ------------------------------------------------------------ identity
+
+    /// Tells the network engine about our identity moves still to be delivered.
+    fn push_moves(&self) {
+        let st = self.store.borrow();
+        if !st.moves.is_empty() && !st.move_pending.is_empty() {
+            self.net.send(NetCmd::Moves { chain: st.moves.clone(), pending: st.move_pending.clone() });
+        }
+    }
+
+    /// Replaces our identity (for when the code got out): a new key, signed over by the
+    /// old one, which is then deleted, so the old code reaches nobody from now on. Friends
+    /// and group members are moved over as they come online; nobody else learns the new
+    /// code.
+    pub fn replace_identity(self: &Rc<Self>) {
+        if self.room.get().is_some() {
+            self.toast("Hang up first to replace your identity.");
+            return;
+        }
+        let old = match crate::store::load_identity() {
+            Ok(k) if k.public() == self.me() => k,
+            _ => {
+                self.toast("Couldn't read your current identity; nothing was changed.");
+                return;
+            }
+        };
+        let new = iroh::SecretKey::generate();
+        let (old_id, new_id) = (old.public(), new.public());
+        let ts = crate::chat::now_ms() / 1000;
+        let notice = crate::proto::MoveNotice::sign(&old, new_id, ts);
+        drop(old);
+        if let Err(e) = crate::store::stage_identity(&new) {
+            tracing::error!("staging new identity: {e:#}");
+            self.toast("Couldn't save a new identity; nothing was changed.");
+            return;
+        }
+        // Our own messages and group memberships follow us; the move is recorded
+        // before the new key takes over (see store::load_identity).
+        self.chat.borrow_mut().rename_peer(old_id, new_id);
+        {
+            let mut st = self.store.borrow_mut();
+            st.replace_id(&old_id, &new_id);
+            st.moves.push(notice);
+            st.move_pending = st.known_peers(&new_id);
+            st.save();
+        }
+        if let Err(e) = crate::store::commit_identity() {
+            tracing::error!("switching identity: {e:#}");
+            self.toast("Couldn't switch to the new identity. Restart Parley to finish.");
+            return;
+        }
+        tracing::info!("identity replaced: {} is now {}", old_id.fmt_short(), new_id.fmt_short());
+
+        // A new endpoint for the new key; the old one shuts down (its code goes dark).
+        let (t, hub, tx, rt) = (self.clone(), self.hub.clone(), self.ui_tx.clone(), self.rt.clone());
+        glib::spawn_future_local(async move {
+            match rt.spawn(crate::net::start(new, hub, tx)).await {
+                Ok(Ok(handle)) => {
+                    t.net.replace(handle);
+                    t.me.set(new_id);
+                    t.presence.borrow_mut().clear();
+                    t.call_presence.borrow_mut().clear();
+                    t.push_directory();
+                    t.push_moves();
+                    t.sidebar.refresh(&t);
+                    t.update_home();
+                    if let Some(c) = t.chat_view.conv() {
+                        if t.chat_open() == Some(c) {
+                            t.chat_view.show(&t, c);
+                        }
+                    }
+                    t.toast(&format!(
+                        "You're now {}. Your friends and groups get your new code as they come online.",
+                        identity::tagged(&t.store.borrow().my_name, &new_id)
+                    ));
+                }
+                Ok(Err(e)) => t.network_restart_failed(&format!("{e:#}")),
+                Err(e) => t.network_restart_failed(&e.to_string()),
+            }
+        });
+    }
+
+    fn network_restart_failed(&self, why: &str) {
+        tracing::error!("starting the network as the new identity failed: {why}");
+        self.toast("Your new identity is saved, but the network didn't restart. Restart Parley.");
+    }
+
+    /// Who hasn't got our new identity yet (for Settings).
+    pub fn move_waiting(&self) -> Vec<String> {
+        let ids = self.store.borrow().move_pending.clone();
+        ids.iter().map(|id| identity::tagged(&self.display_name(id), id)).collect()
+    }
+
+    fn on_move_delivered(self: &Rc<Self>, to: EndpointId, known: bool) {
+        let done = {
+            let mut st = self.store.borrow_mut();
+            st.move_pending.retain(|id| *id != to);
+            st.save();
+            st.move_pending.is_empty()
+        };
+        tracing::info!("told {} about our new identity ({})", to.fmt_short(), if known { "followed" } else { "they don't know us" });
+        if known {
+            self.deliver_chat(to);
+        }
+        if done {
+            self.toast("Everyone you know now has your new identity.");
+        }
+    }
+
+    /// A friend or group member replaced their identity (proven by their old key):
+    /// `olds` is every identity they went by since the one we knew.
+    fn on_identity_moved(self: &Rc<Self>, olds: Vec<EndpointId>, new: EndpointId) {
+        let Some(&first) = olds.first() else { return };
+        let name = self.display_name(&first);
+        let open = self.chat_open();
+        let mut changed = false;
+        for old in &olds {
+            changed |= self.store.borrow_mut().replace_id(old, &new);
+            self.chat.borrow_mut().rename_peer(*old, new);
+            self.presence.borrow_mut().remove(old);
+            self.call_presence.borrow_mut().remove(old);
+            let version = self.versions.borrow_mut().remove(old);
+            if let Some(v) = version {
+                self.versions.borrow_mut().insert(new, v);
+            }
+        }
+        if changed {
+            self.save();
+        }
+        // An open conversation shows them under their new identity.
+        match self.chat_view.conv() {
+            Some(crate::chat::Conv::Direct(id)) if olds.contains(&id) => {
+                if open.is_some() {
+                    self.open_chat(crate::chat::Conv::Direct(new));
+                } else {
+                    self.chat_view.close();
+                }
+            }
+            Some(c) if open == Some(c) => self.chat_view.show(self, c),
+            _ => {}
+        }
+        self.sidebar.refresh(self);
+        self.deliver_chat(new);
+        self.toast(&format!(
+            "{name} replaced their identity code (now {}). Updated in your friends and groups.",
+            identity::tagged(&name, &new)
+        ));
     }
 
     pub fn set_status(self: &Rc<Self>, st: Status) {
@@ -1548,17 +1709,17 @@ impl App {
         // decoding and playback path a friend's voice takes.
         let hub = Hub::new();
         if self.mic_playback.get() {
-            hub.set_loopback(self.me, std::time::Duration::from_millis(1000));
+            hub.set_loopback(self.me(), std::time::Duration::from_millis(1000));
             let spk = devices::find(&devices::speakers(), &settings.speaker).map(|d| d.device.clone());
             match AudioOut::start(spk.as_ref(), |e| tracing::warn!("mic playback: {e}")) {
                 Ok(mut out) => {
-                    let _ = out.add(&hub, self.me, Track::Mic);
+                    let _ = out.add(&hub, self.me(), Track::Mic);
                     *self.mic_test_out.borrow_mut() = Some(out);
                 }
                 Err(e) => tracing::warn!("mic playback failed: {e:#}"),
             }
         }
-        match MicSender::start(hub, self.me, opts, false, |_| {}) {
+        match MicSender::start(hub, self.me(), opts, false, |_| {}) {
             Ok(m) => *self.mic_test.borrow_mut() = Some(m),
             Err(e) => tracing::warn!("mic test failed: {e:#}"),
         }
@@ -1634,7 +1795,7 @@ impl App {
             webrtc_ns: settings.voice_config().webrtc_ns,
             voice: self.voice.clone(),
         };
-        match MicSender::start(self.hub.clone(), self.me, opts, st.mic_muted || st.deafened, self.on_media_error()) {
+        match MicSender::start(self.hub.clone(), self.me(), opts, st.mic_muted || st.deafened, self.on_media_error()) {
             Ok(m) => self.media.borrow_mut().mic = Some(m),
             Err(e) => self.toast(&format!("Microphone failed: {e:#}")),
         }

@@ -31,6 +31,15 @@
     <content_attribute id="social-audio">intense</content_attribute>
   </content_rating>
   <releases>
+    <release version="0.7.0" date="2026-11-17">
+      <description>
+        <ul>
+          <li>Replace my identity (Settings → General → Privacy): for when your code got out. You get a new code and the old one stops working at once; friends and group members are moved over automatically as they come online, and nobody else learns the new code</li>
+          <li>Group chats list all their members at the bottom of the sidebar, friends included, with their status</li>
+          <li>User info works for group members who aren't your friends</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.6.0" date="2026-11-17">
       <description>
         <ul>

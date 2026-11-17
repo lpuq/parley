@@ -196,6 +196,66 @@ impl ChatStore {
         }
     }
 
+    /// Someone (or we) now goes by a new identity: their direct conversation, the
+    /// authorship of their messages everywhere, and anything waiting for them follow.
+    pub fn rename_peer(&mut self, old: EndpointId, new: EndpointId) {
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.extension().is_none_or(|x| x != "jsonl") {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else { continue };
+                let mut changed = false;
+                let lines: Vec<String> = text
+                    .lines()
+                    .map(|l| match serde_json::from_str::<Message>(l) {
+                        Ok(mut m) if m.from == old => {
+                            m.from = new;
+                            changed = true;
+                            serde_json::to_string(&m).unwrap_or_else(|_| l.to_string())
+                        }
+                        _ => l.to_string(),
+                    })
+                    .collect();
+                if changed {
+                    let tmp = path.with_extension("jsonl.tmp");
+                    if std::fs::write(&tmp, lines.join("\n") + "\n").is_ok() {
+                        let _ = std::fs::rename(&tmp, &path);
+                    }
+                }
+            }
+        }
+        // The direct conversation moves to the new identity's file (after anything
+        // already there, which can only be newer).
+        let (from, to) = (self.file(&Conv::Direct(old)), self.file(&Conv::Direct(new)));
+        if let Ok(mut old_text) = std::fs::read_to_string(&from) {
+            old_text.push_str(&std::fs::read_to_string(&to).unwrap_or_default());
+            if std::fs::write(&to, old_text).is_ok() {
+                let _ = std::fs::remove_file(&from);
+            }
+        }
+        self.history.clear();
+        self.ids.clear();
+
+        let (old_key, new_key) = (Conv::Direct(old).key(), Conv::Direct(new).key());
+        for p in &mut self.outbox {
+            if p.conv_key == old_key {
+                p.conv_key = new_key.clone();
+            }
+            for id in p.to.iter_mut().chain(p.refused.iter_mut()) {
+                if *id == old {
+                    *id = new;
+                }
+            }
+        }
+        self.save_outbox();
+        if let Some(n) = self.unread.remove(&Conv::Direct(old)) {
+            let n = n + self.unread(&Conv::Direct(new));
+            self.set_unread(&Conv::Direct(new), n);
+        }
+    }
+
     pub fn set_unread(&mut self, conv: &Conv, n: u32) {
         if n == 0 {
             self.unread.remove(conv);
@@ -216,6 +276,31 @@ impl ChatStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renaming_a_peer_moves_their_history() {
+        let dir = std::env::temp_dir().join(format!("parley-chat-test-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = ChatStore { dir: dir.clone(), history: HashMap::new(), ids: HashMap::new(), outbox: Vec::new(), unread: HashMap::new() };
+        let (me, old, new) = (iroh::SecretKey::generate().public(), iroh::SecretKey::generate().public(), iroh::SecretKey::generate().public());
+        let msg = |id: &str, from| Message { id: id.into(), from, ts: 1, text: "hi".into() };
+        let (d, g) = (Conv::Direct(old), Conv::Group([7; 32]));
+        c.add(&d, msg("a", old));
+        c.add(&d, msg("b", me));
+        c.add(&g, msg("c", old));
+        c.queue(&d, WireMsg { id: "b".into(), ts: 1, text: "hi".into() }, vec![old]);
+        c.set_unread(&d, 2);
+
+        c.rename_peer(old, new);
+        let nd = Conv::Direct(new);
+        assert_eq!(c.messages(&nd).iter().map(|m| (m.id.as_str(), m.from)).collect::<Vec<_>>(), [("a", new), ("b", me)]);
+        assert!(c.messages(&d).is_empty());
+        assert_eq!(c.messages(&g)[0].from, new);
+        assert_eq!(c.outbox[0].to, [new]);
+        assert_eq!(c.outbox[0].conv_key, nd.key());
+        assert_eq!((c.unread(&d), c.unread(&nd)), (0, 2));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn conv_keys_round_trip() {

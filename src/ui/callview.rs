@@ -454,7 +454,7 @@ impl CallView {
                 let t = &tiles[k];
                 match *k {
                     TileKey::User(None) => {
-                        set_tile(t, &my_name, &format!("{} (you)", identity::tagged_markup(&my_name, &app.me)), app.local_paintable(Track::Camera), st.mic_muted || st.deafened, false);
+                        set_tile(t, &my_name, &format!("{} (you)", identity::tagged_markup(&my_name, &app.me())), app.local_paintable(Track::Camera), st.mic_muted || st.deafened, false);
                         t.status.set_visible(false);
                         t.picture.set_content_fit(gtk::ContentFit::Cover);
                     }
@@ -570,7 +570,7 @@ impl CallView {
             None => app.store.borrow().my_name.clone(),
             Some(id) => app.display_name(&id),
         };
-        let avatar = identity::avatar(88, &label_name, &key.owner().unwrap_or(app.me));
+        let avatar = identity::avatar(88, &label_name, &key.owner().unwrap_or(app.me()));
         avatar.set_halign(gtk::Align::Center);
         avatar.set_valign(gtk::Align::Center);
         let base = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -916,7 +916,7 @@ impl CallView {
         for (k, t) in self.tiles.borrow().iter() {
             let TileKey::User(owner) = k else { continue };
             let (speaking, muted) = match owner {
-                None => (app.hub.is_speaking(&app.me), st.mic_muted || st.deafened),
+                None => (app.hub.is_speaking(&app.me()), st.mic_muted || st.deafened),
                 Some(id) => {
                     let p = parts.iter().find(|p| &p.id == id);
                     if let Some(p) = p {

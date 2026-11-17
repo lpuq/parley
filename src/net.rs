@@ -52,6 +52,8 @@ pub enum NetCmd {
     SetStatus(Status),
     /// Deliver chat messages to `to` (a direct message when `group` is None).
     SendChat { to: EndpointId, group: Option<RoomId>, name: String, msgs: Vec<WireMsg> },
+    /// Our identity moves (oldest first), and who still has to be told.
+    Moves { chain: Vec<MoveNotice>, pending: Vec<EndpointId> },
     /// Test hook: drop every connection abruptly, as a crash or network loss would.
     #[cfg(test)]
     SimulateDropout,
@@ -82,17 +84,30 @@ pub enum UiEvent {
     ChatDelivered { to: EndpointId, ids: Vec<String>, refused: bool },
     /// A contact's online status (and group call, if any) changed.
     Presence { id: EndpointId, presence: Presence, call: Option<CallPresence>, app: Option<String> },
+    /// A friend or group member replaced their identity (proven by the old key):
+    /// `old` is every identity they went by since the one we knew, oldest first.
+    IdentityMoved { old: Vec<EndpointId>, new: EndpointId },
+    /// `to` was told about our new identity (`known`: and followed it).
+    MoveDelivered { to: EndpointId, known: bool },
     Notice(String),
 }
 
+/// Commands for the network engine. Clones share it, so [`NetHandle::replace`] (a
+/// new identity means a new endpoint) switches everyone over at once.
 #[derive(Clone)]
 pub struct NetHandle {
-    tx: mpsc::UnboundedSender<NetCmd>,
+    tx: Arc<std::sync::Mutex<mpsc::UnboundedSender<NetCmd>>>,
 }
 
 impl NetHandle {
     pub fn send(&self, cmd: NetCmd) {
-        let _ = self.tx.send(cmd);
+        let _ = self.tx.lock().unwrap().send(cmd);
+    }
+
+    /// Hands over to another engine; the current one hangs up and shuts down.
+    pub fn replace(&self, other: NetHandle) {
+        let tx = other.tx.lock().unwrap().clone();
+        *self.tx.lock().unwrap() = tx;
     }
 }
 
@@ -110,7 +125,7 @@ pub async fn start(
         .build();
     let ep = Endpoint::builder(presets::N0)
         .secret_key(secret)
-        .alpns(vec![ALPN.to_vec(), PRESENCE_ALPN.to_vec(), CHAT_ALPN.to_vec()])
+        .alpns(vec![ALPN.to_vec(), PRESENCE_ALPN.to_vec(), CHAT_ALPN.to_vec(), MOVE_ALPN.to_vec()])
         .transport_config(transport)
         .bind()
         .await
@@ -160,9 +175,12 @@ pub async fn start(
         reprobe: std::collections::HashSet::new(),
         last_probe: None,
         probed_by: HashMap::new(),
+        moves: Vec::new(),
+        move_pending: std::collections::HashSet::new(),
+        move_tried: HashMap::new(),
     };
     tokio::spawn(engine.run(cmd_rx, irx));
-    Ok(NetHandle { tx })
+    Ok(NetHandle { tx: Arc::new(std::sync::Mutex::new(tx)) })
 }
 
 async fn handle_incoming(
@@ -189,6 +207,16 @@ async fn handle_incoming(
             .context("chat timeout")??;
         env.clean();
         let _ = itx.send(Internal::ChatIn { conn, send, env });
+        return Ok(());
+    }
+    if conn.alpn() == MOVE_ALPN {
+        let (send, mut recv) = tokio::time::timeout(Duration::from_secs(10), conn.accept_bi())
+            .await
+            .context("move timeout")??;
+        let msg: MoveMsg = tokio::time::timeout(Duration::from_secs(10), read_limited(&mut recv, 64 * 1024))
+            .await
+            .context("move timeout")??;
+        let _ = itx.send(Internal::MoveIn { conn, send, msg });
         return Ok(());
     }
     if conn.alpn() != ALPN {
@@ -223,6 +251,10 @@ enum Internal {
     ChatIn { conn: Connection, send: SendStream, env: ChatEnvelope },
     /// Our check of a contact finished; None = unreachable.
     PresenceResult { peer: EndpointId, presence: Option<PresenceMsg> },
+    /// Someone says they replaced their identity.
+    MoveIn { conn: Connection, send: SendStream, msg: MoveMsg },
+    /// Telling `peer` about our new identity finished; None = unreachable (retry).
+    MoveResult { peer: EndpointId, known: Option<bool> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -310,6 +342,10 @@ struct Engine {
     last_probe: Option<Instant>,
     /// When each peer last checked our status (rate limit).
     probed_by: HashMap<EndpointId, Instant>,
+    /// Our identity moves, the people still to tell, and when we last tried each.
+    moves: Vec<MoveNotice>,
+    move_pending: std::collections::HashSet<EndpointId>,
+    move_tried: HashMap<EndpointId, Instant>,
 }
 
 impl Engine {
@@ -435,6 +471,12 @@ impl Engine {
                     };
                     let _ = ui.send(ev).await;
                 });
+            }
+            NetCmd::Moves { chain, pending } => {
+                self.moves = chain;
+                self.move_pending = pending.into_iter().collect();
+                self.move_tried.clear();
+                self.deliver_moves();
             }
             NetCmd::SetStatus(st) => {
                 if st != self.status {
@@ -667,6 +709,21 @@ impl Engine {
             Internal::Tick => self.on_tick(),
             Internal::PresenceProbe { conn, send, theirs } => self.on_presence_probe(conn, send, theirs),
             Internal::ChatIn { conn, send, env } => self.on_chat_in(conn, send, env),
+            Internal::MoveIn { conn, send, msg } => self.on_move_in(conn, send, msg),
+            Internal::MoveResult { peer, known } => match known {
+                Some(known) => {
+                    self.move_pending.remove(&peer);
+                    self.move_tried.remove(&peer);
+                    self.emit(UiEvent::MoveDelivered { to: peer, known });
+                    if known {
+                        // They know who we are again: catch up on each other's status.
+                        self.probe(peer);
+                    }
+                }
+                None => {
+                    self.move_tried.insert(peer, Instant::now());
+                }
+            },
             Internal::PresenceResult { peer, presence } => {
                 self.probing.remove(&peer);
                 if self.knows(&peer) {
@@ -1261,7 +1318,75 @@ impl Engine {
         });
     }
 
+    /// Tells friends and group members who haven't heard yet about our new identity
+    /// (at most every 30 s each, like status checks, until they're reached).
+    fn deliver_moves(&mut self) {
+        if self.moves.is_empty() {
+            return;
+        }
+        let due: Vec<EndpointId> = self
+            .move_pending
+            .iter()
+            .filter(|id| self.knows(id) && self.move_tried.get(*id).is_none_or(|t| t.elapsed() >= PRESENCE_INTERVAL))
+            .copied()
+            .collect();
+        for peer in due {
+            // Marks it in flight too (a result clears or refreshes it).
+            self.move_tried.insert(peer, Instant::now());
+            let (ep, itx, msg) = (self.ep.clone(), self.itx.clone(), MoveMsg { chain: self.moves.clone() });
+            tokio::spawn(async move {
+                let res = tokio::time::timeout(Duration::from_secs(20), async {
+                    let conn = ep.connect(EndpointAddr::from(peer), MOVE_ALPN).await?;
+                    let (mut send, mut recv) = conn.open_bi().await?;
+                    write_small(&mut send, &msg).await?;
+                    let ack: MoveAck = read_small(&mut recv).await?;
+                    conn.close(0u32.into(), b"");
+                    anyhow::Ok(ack)
+                })
+                .await;
+                let known = match res {
+                    Ok(Ok(ack)) => Some(ack.known),
+                    _ => None,
+                };
+                let _ = itx.send(Internal::MoveResult { peer, known });
+            });
+        }
+    }
+
+    /// Someone says they replaced their identity. Only a chain signed by an identity we
+    /// know (a contact or group member), ending at whoever is connected, is followed;
+    /// anyone else just hears "not known".
+    fn on_move_in(&mut self, conn: Connection, mut send: SendStream, msg: MoveMsg) {
+        let sender = conn.remote_id();
+        let olds = follow_moves(&msg.chain, &sender, |id| self.knows(id));
+        if let Some(olds) = &olds {
+            info!("{} is now {}", olds[0].fmt_short(), sender.fmt_short());
+            for old in olds {
+                if let Some(name) = self.contacts.remove(old) {
+                    self.contacts.entry(sender).or_insert(name);
+                }
+                for g in self.groups.values_mut() {
+                    if g.members.iter().any(|m| m.id == sender) {
+                        g.members.retain(|m| m.id != *old);
+                    } else if let Some(m) = g.members.iter_mut().find(|m| m.id == *old) {
+                        m.id = sender;
+                    }
+                }
+                self.presence.remove(old);
+            }
+            self.emit(UiEvent::IdentityMoved { old: olds.clone(), new: sender });
+            self.probe(sender);
+        }
+        let ack = MoveAck { known: olds.is_some() };
+        tokio::spawn(async move {
+            let _ = write_small(&mut send, &ack).await;
+            let _ = send.finish();
+            let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+        });
+    }
+
     fn on_tick(&mut self) {
+        self.deliver_moves();
         // Re-announce at once when our status, group call or mute/deafen/sharing changes,
         // so group members see who's in a call nearly live; otherwise check every 30 s.
         let now_state = (self.status, self.call.as_ref().map(|c| c.room), self.my_state);
@@ -1521,7 +1646,10 @@ mod tests {
     }
 
     async fn node(name: &str) -> Node {
-        let key = SecretKey::generate();
+        node_with(name, SecretKey::generate()).await
+    }
+
+    async fn node_with(name: &str, key: SecretKey) -> Node {
         let (tx, rx) = async_channel::unbounded();
         let hub = Hub::new();
         let net = start(key, hub.clone(), tx).await.unwrap();
@@ -1591,6 +1719,48 @@ mod tests {
         })
         .await;
         assert!(seen.is_err(), "a non-contact learned Bob's status: {seen:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs internet (n0 relays + discovery)"]
+    async fn identity_move() {
+        let _ = tracing_subscriber::fmt().with_env_filter("parley=debug").try_init();
+        let (k1, k2) = (SecretKey::generate(), SecretKey::generate());
+        let (a, b, d) = tokio::join!(node_with("alice", k1.clone()), node("bob"), node("dave"));
+        // Bob is Alice's friend; Dave is on Alice's list but never had her old code.
+        a.directory(&[&b, &d], vec![]);
+        b.directory(&[&a], vec![]);
+        d.directory(&[], vec![]);
+        b.expect("alice online", |e| matches!(e, UiEvent::Presence { id, presence: Presence::Online, .. } if *id == a.id).then_some(())).await;
+
+        // Alice replaces her identity: the old engine goes away, a new one tells friends.
+        let notice = MoveNotice::sign(&k1, k2.public(), 1);
+        drop(a);
+        let a2 = node_with("alice2", k2).await;
+        a2.directory(&[&b, &d], vec![]);
+        a2.net.send(NetCmd::Moves { chain: vec![notice], pending: vec![b.id, d.id] });
+
+        let (old, new) = b
+            .expect("bob follows the move", |e| match e {
+                UiEvent::IdentityMoved { old, new } => Some((old[0], *new)),
+                _ => None,
+            })
+            .await;
+        assert_eq!((old, new), (k1.public(), a2.id));
+        let mut told = HashMap::new();
+        while told.len() < 2 {
+            let (to, known) = a2
+                .expect("deliveries", |e| match e {
+                    UiEvent::MoveDelivered { to, known } => Some((*to, *known)),
+                    _ => None,
+                })
+                .await;
+            told.insert(to, known);
+        }
+        assert_eq!(told[&b.id], true);
+        assert_eq!(told[&d.id], false, "dave never knew alice, so he learns nothing");
+        // Bob's engine knows Alice's new identity at once: her status reaches him again.
+        b.expect("alice online again", |e| matches!(e, UiEvent::Presence { id, presence: Presence::Online, .. } if *id == a2.id).then_some(())).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

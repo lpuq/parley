@@ -151,7 +151,7 @@ pub fn add_code(app: &Rc<App>, prefill: Option<String>) {
             Ok(ShareCode::Group { n, s, m }) => {
                 let mut g = Group { name: if name.is_empty() { n } else { name }, secret: s, members: m };
                 let me = a.store.borrow().my_name.clone();
-                g.add_member(a.me, &me);
+                g.add_member(a.me(), &me);
                 let gname = g.name.clone();
                 let room = g.room_id();
                 a.add_group(g);
@@ -215,7 +215,7 @@ pub fn new_group(app: &Rc<App>) {
         let n = name.text().trim().to_string();
         let n = if n.is_empty() { "Group".to_string() } else { n };
         let my_name = a.store.borrow().my_name.clone();
-        let mut members = vec![Member { id: a.me, name: my_name }];
+        let mut members = vec![Member { id: a.me(), name: my_name }];
         for (cb, m) in checks.borrow().iter() {
             if cb.is_active() {
                 members.push(m.clone());
@@ -659,6 +659,24 @@ pub fn settings(app: &Rc<App>) {
     priv_.set_description(Some(
         "Calls are encrypted end to end with keys only you and your friends hold. Parley finds friends through free public relay and discovery servers run by n0 (iroh); when a direct connection isn't possible, encrypted packets pass through a relay, which cannot read or hear anything.",
     ));
+    let replace = gtk::Button::builder().label("Replace…").valign(gtk::Align::Center).css_classes(["destructive-action"]).build();
+    let replace_row = adw::ActionRow::builder()
+        .title("Replace my identity")
+        .subtitle("If your code got out: a new code for you, moved over to your friends and groups, and the old one stops working")
+        .build();
+    replace_row.add_suffix(&replace);
+    priv_.add(&replace_row);
+    let waiting = app.move_waiting();
+    if !waiting.is_empty() {
+        let w = adw::ActionRow::builder()
+            .title("Still to get your new identity")
+            .subtitle(format!("{} — each gets it the next time you're both online", waiting.join(", ")))
+            .css_classes(["property"])
+            .build();
+        priv_.add(&w);
+    }
+    let (a, dd) = (app.clone(), d.clone());
+    replace.connect_clicked(move |_| confirm_replace_identity(&a, &dd));
     gen_.add(&priv_);
     let diag = adw::PreferencesGroup::new();
     diag.set_title("Troubleshooting");
@@ -760,6 +778,33 @@ pub fn settings(app: &Rc<App>) {
         }
     });
     d.present(Some(&app.window));
+}
+
+fn confirm_replace_identity(app: &Rc<App>, settings: &adw::PreferencesDialog) {
+    let d = adw::AlertDialog::new(Some("Replace your identity?"), Some("For when your code reached people you don't want hearing from you."));
+    let details = gtk::Label::new(Some(
+        "• You get a new code (and a new #tag). The old one is deleted: nobody can call, message or see you with it any more.\n\n\
+         • Your friends and the members of your groups are moved over automatically, each the next time you're both online (they need Parley 0.7.0 or newer). Until then you'll look offline to each other. Chats are kept.\n\n\
+         • People who only have your old code don't get the new one.\n\n\
+         First remove any friend, and leave any group, you don't trust: they would get your new code too.",
+    ));
+    details.set_wrap(true);
+    details.set_xalign(0.0);
+    details.set_max_width_chars(46);
+    d.set_extra_child(Some(&details));
+    d.add_response("cancel", "Cancel");
+    d.add_response("replace", "Replace identity");
+    d.set_response_appearance("replace", adw::ResponseAppearance::Destructive);
+    d.set_default_response(Some("cancel"));
+    d.set_close_response("cancel");
+    let (a, s) = (app.clone(), settings.clone());
+    d.connect_response(None, move |_, r| {
+        if r == "replace" {
+            s.close();
+            a.replace_identity();
+        }
+    });
+    d.present(Some(settings));
 }
 
 fn device_combo(title: &str, list: &[devices::Device], current: &str) -> adw::ComboRow {

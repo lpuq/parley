@@ -42,11 +42,11 @@ fn main() -> anyhow::Result<()> {
         .thread_name("parley-net")
         .build()?;
 
-    let secret = store::load_or_create_identity()?;
+    let secret = store::load_identity()?;
     let me = secret.public();
     let hub = hub::Hub::new();
     let (ui_tx, ui_rx) = async_channel::unbounded();
-    let net = rt.block_on(net::start(secret, hub.clone(), ui_tx))?;
+    let net = rt.block_on(net::start(secret, hub.clone(), ui_tx.clone()))?;
 
     // A separate profile (for running two copies side by side) needs its own app id.
     let app_id = match std::env::var("PARLEY_PROFILE") {
@@ -62,7 +62,7 @@ fn main() -> anyhow::Result<()> {
                 a.present();
                 return;
             }
-            let a = ui::App::new(app, net.clone(), hub.clone(), me, handle.clone(), ui_rx.clone());
+            let a = ui::App::new(app, net.clone(), hub.clone(), me, handle.clone(), ui_tx.clone(), ui_rx.clone());
             if first.replace(false) && background {
                 a.window.set_visible(false);
                 // Keep running with no window until a call comes in or the user opens us.

@@ -19,6 +19,9 @@ pub const ALPN: &[u8] = b"parley/1";
 pub const PRESENCE_ALPN: &[u8] = b"parley-presence/1";
 /// Text chat: one connection per batch of messages, answered with an ack.
 pub const CHAT_ALPN: &[u8] = b"parley-chat/1";
+/// Identity moves: "my old key handed over to this new one", told to friends and
+/// group members. Answered with a [`MoveAck`].
+pub const MOVE_ALPN: &[u8] = b"parley-move/1";
 
 /// Longest chat message we send or accept, in characters.
 pub const MAX_CHAT_CHARS: usize = 4000;
@@ -51,6 +54,65 @@ pub struct ChatAck {
     /// We don't take messages from them (not a contact or group member).
     #[serde(default)]
     pub refused: bool,
+}
+
+/// One identity replacing another, signed by the old key, so friends who knew the
+/// old one can follow without trusting anyone else's word for it. The new key proves
+/// itself by delivering the notice (the connection is authenticated as it).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MoveNotice {
+    pub old: EndpointId,
+    pub new: EndpointId,
+    /// When the move was made (Unix seconds).
+    pub ts: u64,
+    pub sig: iroh::Signature,
+}
+
+impl MoveNotice {
+    fn signed_bytes(old: &EndpointId, new: &EndpointId, ts: u64) -> Vec<u8> {
+        let mut m = b"parley-move/1:".to_vec();
+        m.extend_from_slice(old.as_bytes());
+        m.extend_from_slice(new.as_bytes());
+        m.extend_from_slice(&ts.to_be_bytes());
+        m
+    }
+
+    pub fn sign(old: &iroh::SecretKey, new: EndpointId, ts: u64) -> Self {
+        let old_id = old.public();
+        let sig = old.sign(&Self::signed_bytes(&old_id, &new, ts));
+        Self { old: old_id, new, ts, sig }
+    }
+
+    pub fn verify(&self) -> bool {
+        self.old != self.new && self.old.verify(&Self::signed_bytes(&self.old, &self.new, self.ts), &self.sig).is_ok()
+    }
+}
+
+/// Every move someone made, oldest first (so a friend who missed one can still
+/// follow the whole way).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MoveMsg {
+    pub chain: Vec<MoveNotice>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MoveAck {
+    /// They knew one of the old identities and now know the new one.
+    pub known: bool,
+}
+
+/// The identities `sender` went by, from the newest one we know, if the chain proves
+/// it's the same person: from there every link must be validly signed and lead on,
+/// ending at `sender` (who is connected to us as that key).
+pub fn follow_moves(chain: &[MoveNotice], sender: &EndpointId, known: impl Fn(&EndpointId) -> bool) -> Option<Vec<EndpointId>> {
+    if chain.len() > 64 || chain.last().map(|m| &m.new) != Some(sender) {
+        return None;
+    }
+    // The newest identity we know: following from there needs the fewest links.
+    let start = chain.iter().rposition(|m| known(&m.old))?;
+    let links = &chain[start..];
+    let ok = links.iter().all(MoveNotice::verify) && links.windows(2).all(|w| w[0].new == w[1].old);
+    ok.then(|| links.iter().map(|m| m.old).collect())
 }
 
 impl ChatEnvelope {
@@ -424,6 +486,41 @@ mod presence_tests {
         };
         let json = serde_json::to_string(&full).unwrap();
         assert_eq!(serde_json::from_str::<PresenceMsg>(&json).unwrap(), full);
+    }
+}
+
+#[cfg(test)]
+mod move_tests {
+    use super::*;
+
+    #[test]
+    fn moves_are_followed_only_along_a_valid_signed_chain() {
+        let (k1, k2, k3) = (iroh::SecretKey::generate(), iroh::SecretKey::generate(), iroh::SecretKey::generate());
+        let (a, b, c) = (k1.public(), k2.public(), k3.public());
+        let m1 = MoveNotice::sign(&k1, b, 1);
+        let m2 = MoveNotice::sign(&k2, c, 2);
+        assert!(m1.verify() && m2.verify());
+        let chain = vec![m1.clone(), m2.clone()];
+        // A friend who knew the first identity, or only the middle one.
+        assert_eq!(follow_moves(&chain, &c, |id| *id == a), Some(vec![a, b]));
+        assert_eq!(follow_moves(&chain, &c, |id| *id == b), Some(vec![b]));
+        // Strangers learn nothing; and the chain must end at whoever delivers it.
+        assert_eq!(follow_moves(&chain, &c, |_| false), None);
+        assert_eq!(follow_moves(&chain, &b, |id| *id == a), None);
+        // A forged link (someone else signing "a moved to me") fails.
+        let mallory = iroh::SecretKey::generate();
+        let forged = MoveNotice { old: a, new: mallory.public(), ts: 3, sig: mallory.sign(b"x") };
+        assert!(!forged.verify());
+        assert_eq!(follow_moves(&[forged], &mallory.public(), |id| *id == a), None);
+        // Tampering with a signed notice breaks it, and so does a gap in the chain.
+        let mut bent = m1.clone();
+        bent.new = c;
+        assert_eq!(follow_moves(&[bent], &c, |id| *id == a), None);
+        let gap = vec![m1, MoveNotice::sign(&k3, iroh::SecretKey::generate().public(), 4)];
+        assert_eq!(follow_moves(&gap, &gap[1].new, |id| *id == a), None);
+        // Survives the wire.
+        let back: MoveMsg = serde_json::from_slice(&serde_json::to_vec(&MoveMsg { chain: chain.clone() }).unwrap()).unwrap();
+        assert_eq!(back.chain, chain);
     }
 }
 

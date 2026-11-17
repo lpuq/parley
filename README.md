@@ -179,6 +179,14 @@ automatically.
   (`~/.local/share/parley/identity.key`, mode 0600). A contact code is your public key
   plus your name. Calls are authenticated against that key, so nobody can impersonate a
   contact.
+- **Identity moves** (Settings → *Replace my identity*): a new key is generated and the
+  old key signs a notice "old → new" (ed25519, domain-separated), then the old key is
+  deleted. The new key delivers the notice over `parley-move/1` to every contact and
+  group member, retrying every 30 s until each is reached. A receiver follows it only if
+  the signed chain starts at an identity it knows and ends at the key it's connected to,
+  then rewrites that person in its contacts, groups and chat history. Anyone who
+  doesn't know an earlier identity just hears "not known". The whole chain is sent, so
+  someone who missed a move can follow several at once.
 - **Groups:** a group code carries a random 256-bit secret. Joining proves knowledge of
   it with an HMAC bound to both participants' keys. A member who rings a contact for
   the group includes the invite inside the encrypted connection, so contacts can join
@@ -236,6 +244,12 @@ automatically.
   and call without you adding them first. Strangers are shown with their ID next to the
   name they chose, so they can't pass as one of your contacts, and only a few calls can
   ring at once. Settings → *Allow calls from people not in my contacts* turns this off.
+- **If your code got out:** Settings → *Replace my identity* gives you a new code and
+  deletes the old key, so the old code stops reaching you at once (no calls, messages,
+  status, or IP address through it). Your friends and the members of your groups are
+  moved over automatically, each the next time you're both online. Nobody else learns the
+  new code, so remove anyone you don't trust first. Friends need Parley 0.7.0 or newer to
+  follow a move.
 - **Nothing happens until you answer:** no audio or video flows on a call you haven't
   accepted. Group joins require proof of the group's secret.
 - **Local data:** your private key (`identity.key`, mode 0600) and contacts live in your
@@ -259,7 +273,8 @@ PARLEY_LOG=parley=debug cargo run           # verbose logs
 
 The network tests cover a direct call, a 3-person group mesh where two members only
 know the creator, leaving, rejoining without ringing, automatic reconnection after a
-dropout, and in-order delivery of video GOPs plus audio datagrams.
+dropout, in-order delivery of video GOPs plus audio datagrams, chat delivery and
+refusal, and identity moves (followed by friends, ignored by strangers).
 
 ## Known limitations / next steps
 

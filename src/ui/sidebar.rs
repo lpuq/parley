@@ -21,11 +21,10 @@ pub struct Sidebar {
     groups_empty: gtk::Label,
     me_row: adw::ActionRow,
     me_avatar: adw::Avatar,
-    /// The open group's members who aren't your friends, at the bottom.
-    others_title: gtk::Box,
-    others_label: gtk::Label,
-    others: gtk::ListBox,
-    others_empty: gtk::Label,
+    /// Everyone in the open group chat, at the bottom.
+    members_title: gtk::Box,
+    members_label: gtk::Label,
+    members: gtk::ListBox,
     scroll: gtk::ScrolledWindow,
     status_dot: gtk::Box,
     status_label: gtk::Label,
@@ -112,11 +111,10 @@ impl Sidebar {
         let friends_empty = hint("No friends yet. Press + and paste a code a friend sent you.");
         let groups_empty = hint("Groups let 3 people call together. Create one from the menu.");
 
-        let others = list();
-        let others_empty = hint("Everyone in this group is already one of your friends.");
-        let others_title = section_title("", None);
-        let others_label = others_title.first_child().and_downcast::<gtk::Label>().unwrap();
-        others_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        let members = list();
+        let members_title = section_title("", None);
+        let members_label = members_title.first_child().and_downcast::<gtk::Label>().unwrap();
+        members_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
 
         let new_group = gtk::Button::builder()
             .icon_name("list-add-symbolic")
@@ -137,9 +135,8 @@ impl Sidebar {
         col.append(&section_title("Groups", Some(&new_group)));
         col.append(&groups);
         col.append(&groups_empty);
-        col.append(&others_title);
-        col.append(&others);
-        col.append(&others_empty);
+        col.append(&members_title);
+        col.append(&members);
 
         let scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
@@ -157,10 +154,9 @@ impl Sidebar {
             groups_empty,
             me_row,
             me_avatar,
-            others_title,
-            others_label,
-            others,
-            others_empty,
+            members_title,
+            members_label,
+            members,
             scroll,
             status_dot,
             status_label,
@@ -207,9 +203,9 @@ impl Sidebar {
         }
         let st = app.store.borrow();
         let my_name = if st.my_name.is_empty() { "You" } else { &st.my_name };
-        self.me_row.set_title(&identity::tagged_markup(my_name, &app.me));
+        self.me_row.set_title(&identity::tagged_markup(my_name, &app.me()));
         self.me_avatar.set_text(Some(my_name));
-        self.me_avatar.set_custom_image(Some(&identity::identicon(&app.me)));
+        self.me_avatar.set_custom_image(Some(&identity::identicon(&app.me())));
         let (cls, text) = match st.settings.status {
             Status::Online => ("online", "Online"),
             Status::DoNotDisturb => ("dnd", "Do Not Disturb"),
@@ -288,7 +284,7 @@ impl Sidebar {
             let others: Vec<String> = g
                 .members
                 .iter()
-                .filter(|m| m.id != app.me)
+                .filter(|m| m.id != app.me())
                 .map(|m| st.name_for(&m.id).unwrap_or_else(|| m.name.clone()))
                 .collect();
             let in_room = app.group_call_members(&rid);
@@ -348,7 +344,7 @@ impl Sidebar {
             // Who's in the call (Discord-style): avatar, name, LIVE while sharing,
             // and mute/deafen icons.
             for (id, ms) in in_room {
-                let name = if id == app.me {
+                let name = if id == app.me() {
                     if st.my_name.is_empty() { "You".to_string() } else { st.my_name.clone() }
                 } else {
                     st.name_for(&id).unwrap_or_else(|| {
@@ -358,31 +354,52 @@ impl Sidebar {
                 self.groups.append(&call_member_row(&name, &id, &ms));
             }
         }
-        // The open group chat's members who aren't your friends, so everyone in it can
-        // be seen (with their status) somewhere.
-        while let Some(c) = self.others.first_child() {
-            self.others.remove(&c);
+        // Everyone in the open group chat with their status, friends or not (people in
+        // a group needn't all have each other as friends).
+        while let Some(c) = self.members.first_child() {
+            self.members.remove(&c);
         }
         let open_group = match app.chat_open() {
             Some(crate::chat::Conv::Group(r)) => st.groups.iter().find(|g| g.room_id() == r).cloned(),
             _ => None,
         };
-        let mut n_others = 0;
         if let Some(g) = &open_group {
-            self.others_label.set_label(&format!("Others in {}", g.name));
             let in_room = app.group_call_members(&g.room_id());
-            let mut members: Vec<_> = g.members.iter().filter(|m| m.id != app.me && st.contact(&m.id).is_none()).cloned().collect();
+            let mut rows: Vec<(String, iroh::EndpointId, &str, &str, bool)> = g
+                .members
+                .iter()
+                .map(|m| {
+                    let me = m.id == app.me();
+                    let in_call = in_room.iter().any(|(id, _)| *id == m.id);
+                    let (cls, text) = if in_call {
+                        ("online", "In the group call")
+                    } else if me {
+                        match st.settings.status {
+                            Status::Online => ("online", "Online"),
+                            Status::DoNotDisturb => ("dnd", "Do not disturb"),
+                            Status::Invisible => ("offline", "Invisible"),
+                        }
+                    } else {
+                        match app.presence_of(&m.id) {
+                            Presence::Online => ("online", "Online"),
+                            Presence::DoNotDisturb => ("dnd", "Do not disturb"),
+                            Presence::Offline => ("offline", "Offline"),
+                        }
+                    };
+                    let name = if me { my_name.to_string() } else { st.name_for(&m.id).unwrap_or_else(|| m.name.clone()) };
+                    (name, m.id, cls, text, me)
+                })
+                .collect();
             // Online first, then by name.
-            members.sort_by_key(|m| (app.presence_of(&m.id) == Presence::Offline, m.name.to_lowercase()));
-            for m in members {
-                n_others += 1;
-                let in_call = in_room.iter().any(|(id, _)| *id == m.id);
-                self.others.append(&self.other_member_row(&m.id, &m.name, app.presence_of(&m.id), in_call));
+            rows.sort_by_key(|(name, _, cls, ..)| (*cls == "offline", name.to_lowercase()));
+            self.members_label.set_label(&format!("Members of {} — {}", g.name, rows.len()));
+            for (name, id, cls, text, me) in rows {
+                let friend = st.contact(&id).is_some();
+                self.members.append(&self.member_row(&id, &name, cls, text, me, friend));
             }
         }
-        self.others_title.set_visible(open_group.is_some());
-        self.others.set_visible(n_others > 0);
-        self.others_empty.set_visible(open_group.is_some() && n_others == 0);
+        self.members_title.set_visible(open_group.is_some());
+        self.members.set_visible(open_group.is_some());
 
         self.friends_empty.set_visible(st.contacts.is_empty());
         self.friends.set_visible(!st.contacts.is_empty());
@@ -390,20 +407,11 @@ impl Sidebar {
         self.groups.set_visible(!st.groups.is_empty());
     }
 
-    /// Someone in the open group who isn't your friend: status, and a button to add them.
-    fn other_member_row(&self, id: &iroh::EndpointId, name: &str, presence: Presence, in_call: bool) -> adw::ActionRow {
-        let (cls, text) = match presence {
-            _ if in_call => ("online", "In the group call"),
-            Presence::Online => ("online", "Online"),
-            Presence::DoNotDisturb => ("dnd", "Do not disturb"),
-            Presence::Offline => ("offline", "Offline"),
-        };
-        let row = adw::ActionRow::builder()
-            .title(identity::tagged_markup(name, id))
-            .title_lines(1)
-            .subtitle(text)
-            .tooltip_text("User info")
-            .build();
+    /// Someone in the open group: status, and for people who aren't your friends a
+    /// button to add them. Clicking shows their info.
+    fn member_row(&self, id: &iroh::EndpointId, name: &str, cls: &str, status: &str, me: bool, friend: bool) -> adw::ActionRow {
+        let title = identity::tagged_markup(name, id) + if me { " (you)" } else { "" };
+        let row = adw::ActionRow::builder().title(title).title_lines(1).subtitle(status).build();
         let avatar = gtk::Overlay::new();
         avatar.set_child(Some(&identity::avatar(32, name, id)));
         let dot = presence_dot();
@@ -413,21 +421,27 @@ impl Sidebar {
         avatar.add_overlay(&dot);
         avatar.set_valign(gtk::Align::Center);
         row.add_prefix(&avatar);
-        let add = gtk::Button::builder()
-            .icon_name("list-add-symbolic")
-            .tooltip_text(format!("Add {name} as a friend"))
-            .valign(gtk::Align::Center)
-            .css_classes(["flat", "circular"])
-            .build();
-        let (a, id, n) = (self.app.clone(), *id, name.to_string());
-        add.connect_clicked(move |_| {
-            if let Some(a) = a.upgrade() {
-                a.add_contact(id, &n);
-            }
-        });
-        row.add_suffix(&add);
+        if me {
+            return row;
+        }
+        if !friend {
+            let add = gtk::Button::builder()
+                .icon_name("list-add-symbolic")
+                .tooltip_text(format!("Add {name} as a friend"))
+                .valign(gtk::Align::Center)
+                .css_classes(["flat", "circular"])
+                .build();
+            let (a, id, n) = (self.app.clone(), *id, name.to_string());
+            add.connect_clicked(move |_| {
+                if let Some(a) = a.upgrade() {
+                    a.add_contact(id, &n);
+                }
+            });
+            row.add_suffix(&add);
+        }
         row.set_activatable(true);
-        let a = self.app.clone();
+        row.set_tooltip_text(Some("User info"));
+        let (a, id) = (self.app.clone(), *id);
         row.connect_activated(move |_| {
             if let Some(a) = a.upgrade() {
                 dialogs::user_info(&a, id);

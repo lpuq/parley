@@ -67,6 +67,42 @@ pub fn load_or_create_identity() -> Result<SecretKey> {
     Ok(key)
 }
 
+/// Replacing the identity, step 1: the new key is written beside the current one.
+/// It only takes over once [`commit_identity`] runs (after the move is recorded),
+/// so a crash in between leaves the old identity working.
+pub fn stage_identity(key: &SecretKey) -> Result<()> {
+    let path = data_dir().join("identity.next.key");
+    let _ = fs::remove_file(&path);
+    let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
+    f.write_all(&key.to_bytes())?;
+    f.sync_all()?;
+    Ok(())
+}
+
+/// Step 2: the new key replaces the old one, which is gone for good.
+pub fn commit_identity() -> Result<()> {
+    fs::rename(data_dir().join("identity.next.key"), data_dir().join("identity.key"))?;
+    Ok(())
+}
+
+/// The identity to start with, finishing a replacement a crash interrupted (if the
+/// move was recorded) or abandoning it (if not).
+pub fn load_identity() -> Result<SecretKey> {
+    let next = data_dir().join("identity.next.key");
+    if let Ok(bytes) = fs::read(&next) {
+        let recorded = <[u8; 32]>::try_from(bytes.as_slice())
+            .ok()
+            .map(|b| SecretKey::from_bytes(&b).public())
+            .is_some_and(|id| Store::load().moves.last().is_some_and(|m| m.new == id));
+        if recorded {
+            commit_identity()?;
+        } else {
+            let _ = fs::remove_file(&next);
+        }
+    }
+    load_or_create_identity()
+}
+
 pub fn random_bytes32() -> [u8; 32] {
     // SecretKey::generate draws from the OS CSPRNG.
     SecretKey::generate().to_bytes()
@@ -300,6 +336,11 @@ pub struct Store {
     pub contacts: Vec<Contact>,
     pub groups: Vec<Group>,
     pub settings: Settings,
+    /// Our own identity replacements, oldest first: what friends who knew an older
+    /// identity need to follow us to the current one.
+    pub moves: Vec<crate::proto::MoveNotice>,
+    /// Friends and group members still to be told about our latest identity.
+    pub move_pending: Vec<EndpointId>,
 }
 
 impl Store {
@@ -336,6 +377,43 @@ impl Store {
         if let Err(e) = res {
             tracing::error!("saving state failed: {e:#}");
         }
+    }
+
+    /// Someone (or we) now goes by a new identity: rewrite them in contacts and groups,
+    /// keeping names and when they were added. Returns whether anything changed.
+    pub fn replace_id(&mut self, old: &EndpointId, new: &EndpointId) -> bool {
+        let mut changed = false;
+        if self.contacts.iter().any(|c| &c.id == new) {
+            let before = self.contacts.len();
+            self.contacts.retain(|c| &c.id != old);
+            changed |= self.contacts.len() != before;
+        } else if let Some(c) = self.contacts.iter_mut().find(|c| &c.id == old) {
+            c.id = *new;
+            changed = true;
+        }
+        for g in &mut self.groups {
+            if g.members.iter().any(|m| &m.id == new) {
+                let before = g.members.len();
+                g.members.retain(|m| &m.id != old);
+                changed |= g.members.len() != before;
+            } else if let Some(m) = g.members.iter_mut().find(|m| &m.id == old) {
+                m.id = *new;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Everyone we know: contacts and the members of our groups (not us).
+    pub fn known_peers(&self, me: &EndpointId) -> Vec<EndpointId> {
+        let mut v: Vec<EndpointId> = self.contacts.iter().map(|c| c.id).collect();
+        for m in self.groups.iter().flat_map(|g| g.members.iter()) {
+            if !v.contains(&m.id) {
+                v.push(m.id);
+            }
+        }
+        v.retain(|id| id != me);
+        v
     }
 
     pub fn contact(&self, id: &EndpointId) -> Option<&Contact> {
