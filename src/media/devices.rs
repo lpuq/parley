@@ -42,9 +42,10 @@ pub fn speakers() -> Vec<Device> {
 }
 
 pub fn cameras() -> Vec<Device> {
-    let devs = provider_devices("v4l2deviceprovider", "Video/Source")
-        .filter(|v| !v.is_empty())
-        .or_else(|| provider_devices("pipewiredeviceprovider", "Video/Source"))
+    // Linux: V4L2 (or PipeWire); Windows: Media Foundation (or kernel streaming).
+    let devs = ["v4l2deviceprovider", "pipewiredeviceprovider", "mfdeviceprovider", "ksdeviceprovider"]
+        .iter()
+        .find_map(|p| provider_devices(p, "Video/Source").filter(|v| !v.is_empty()))
         .unwrap_or_default();
     let mut out: Vec<Device> = Vec::new();
     for d in devs {

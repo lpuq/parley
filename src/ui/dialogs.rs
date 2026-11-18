@@ -702,6 +702,9 @@ pub fn settings(app: &Rc<App>) {
         .build();
     let autostart_on = if in_flatpak() { s.autostart } else { autostart_path().exists() };
     let autostart = adw::SwitchRow::builder().title("Start when I log in").active(autostart_on).build();
+    // Both need the tray to come back to, which Windows doesn't have yet.
+    bg.set_visible(cfg!(target_os = "linux"));
+    autostart.set_visible(cfg!(target_os = "linux"));
     beh.add(&bg);
     beh.add(&autostart);
     beh.add(&unknown);
@@ -787,31 +790,34 @@ pub fn settings(app: &Rc<App>) {
     autostart.connect_active_notify(move |r| {
         let on = r.is_active();
         if in_flatpak() {
-            // Sandboxed apps ask the Background portal instead of writing autostart files.
-            let a = a.clone();
-            let rt = a.rt.clone();
-            glib::spawn_future_local(async move {
-                let res = rt
-                    .spawn(async move {
-                        ashpd::desktop::background::Background::request()
-                            .reason("Start Parley when you log in so friends can call you")
-                            .auto_start(on)
-                            .command(&["parley", "--background"])
-                            .dbus_activatable(false)
-                            .send()
-                            .await?
-                            .response()
-                    })
-                    .await;
-                match res {
-                    Ok(Ok(r)) => {
-                        a.store.borrow_mut().settings.autostart = r.auto_start();
-                        a.save();
+            #[cfg(target_os = "linux")]
+            {
+                // Sandboxed apps ask the Background portal instead of writing autostart files.
+                let a = a.clone();
+                let rt = a.rt.clone();
+                glib::spawn_future_local(async move {
+                    let res = rt
+                        .spawn(async move {
+                            ashpd::desktop::background::Background::request()
+                                .reason("Start Parley when you log in so friends can call you")
+                                .auto_start(on)
+                                .command(&["parley", "--background"])
+                                .dbus_activatable(false)
+                                .send()
+                                .await?
+                                .response()
+                        })
+                        .await;
+                    match res {
+                        Ok(Ok(r)) => {
+                            a.store.borrow_mut().settings.autostart = r.auto_start();
+                            a.save();
+                        }
+                        Ok(Err(e)) => a.toast(&format!("Couldn't change autostart: {e}")),
+                        Err(_) => {}
                     }
-                    Ok(Err(e)) => a.toast(&format!("Couldn't change autostart: {e}")),
-                    Err(_) => {}
-                }
-            });
+                });
+            }
         } else if let Err(e) = set_autostart(on) {
             a.toast(&format!("Couldn't change autostart: {e}"));
         } else {

@@ -1,7 +1,9 @@
 //! Persistent state: identity key, profile, contacts, groups and settings.
 //! Also the share-code format used to exchange contacts and groups.
 
-use std::{fs, io::Write, os::unix::fs::OpenOptionsExt, path::PathBuf};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+use std::{fs, io::Write, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64};
@@ -12,7 +14,16 @@ use sha2::{Digest, Sha256};
 
 const CODE_PREFIX: &str = "parley:";
 
+/// Where per-user folders live on Windows: %APPDATA% (settings, contacts) and
+/// %LOCALAPPDATA% (identity, chats, log).
+fn windows_dir(var: &str) -> PathBuf {
+    PathBuf::from(std::env::var_os(var).unwrap_or_default()).join(app_dir_name())
+}
+
 fn config_dir() -> PathBuf {
+    if cfg!(windows) {
+        return windows_dir("APPDATA");
+    }
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"));
@@ -20,6 +31,9 @@ fn config_dir() -> PathBuf {
 }
 
 pub(crate) fn data_dir() -> PathBuf {
+    if cfg!(windows) {
+        return windows_dir("LOCALAPPDATA");
+    }
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -30,6 +44,9 @@ pub(crate) fn data_dir() -> PathBuf {
 
 /// Diagnostics log (Flatpak: ~/.var/app/io.github.parley.Parley/.local/state/parley/parley.log).
 pub fn log_path() -> PathBuf {
+    if cfg!(windows) {
+        return windows_dir("LOCALAPPDATA").join("parley.log");
+    }
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state"));
@@ -60,7 +77,7 @@ pub fn load_or_create_identity() -> Result<SecretKey> {
     let mut f = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o600)
+        .private()
         .open(&path)
         .with_context(|| format!("creating {}", path.display()))?;
     f.write_all(&key.to_bytes())?;
@@ -73,7 +90,7 @@ pub fn load_or_create_identity() -> Result<SecretKey> {
 pub fn stage_identity(key: &SecretKey) -> Result<()> {
     let path = data_dir().join("identity.next.key");
     let _ = fs::remove_file(&path);
-    let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
+    let mut f = fs::OpenOptions::new().write(true).create_new(true).private().open(&path)?;
     f.write_all(&key.to_bytes())?;
     f.sync_all()?;
     Ok(())
@@ -101,6 +118,20 @@ pub fn load_identity() -> Result<SecretKey> {
         }
     }
     load_or_create_identity()
+}
+
+/// Files only we may read (identity, contacts): owner-only on Unix. On Windows the
+/// per-user AppData folders already are.
+trait Private {
+    fn private(&mut self) -> &mut Self;
+}
+
+impl Private for fs::OpenOptions {
+    fn private(&mut self) -> &mut Self {
+        #[cfg(unix)]
+        self.mode(0o600);
+        self
+    }
 }
 
 pub fn random_bytes32() -> [u8; 32] {
@@ -517,7 +548,7 @@ impl Store {
                 .write(true)
                 .create(true)
                 .truncate(true)
-                .mode(0o600)
+                .private()
                 .open(&tmp)?;
             f.write_all(&serde_json::to_vec_pretty(self)?)?;
             f.sync_all()?;

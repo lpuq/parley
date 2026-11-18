@@ -1,7 +1,6 @@
 //! Capture → encode → [`Hub`] pipelines.
 
 use std::{
-    os::fd::{AsRawFd, OwnedFd},
     sync::{Arc, atomic::Ordering},
     time::Instant,
 };
@@ -662,7 +661,7 @@ impl VideoSender {
 
     pub fn screen(
         hub: Arc<Hub>,
-        fd: Option<OwnedFd>,
+        fd: Option<super::ScreenFd>,
         node_id: u32,
         size: Option<(i32, i32)>,
         quality: (u32, u32, u32),
@@ -674,7 +673,10 @@ impl VideoSender {
         let pipeline = gst::Pipeline::with_name("screen");
         let src = make("pipewiresrc")?;
         if let Some(fd) = &fd {
-            src.set_property("fd", fd.as_raw_fd());
+            #[cfg(unix)]
+            src.set_property("fd", std::os::fd::AsRawFd::as_raw_fd(fd));
+            #[cfg(not(unix))]
+            match *fd {}
         }
         src.set_property("path", node_id.to_string());
         src.set_property("do-timestamp", true);

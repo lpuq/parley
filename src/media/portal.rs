@@ -1,24 +1,32 @@
 //! Screen/window picker via xdg-desktop-portal (the compositor's own dialog).
-
-use std::os::fd::OwnedFd;
+//! Not on Windows yet.
 
 use anyhow::{Result, anyhow};
+#[cfg(target_os = "linux")]
 use ashpd::desktop::{
     PersistMode,
     screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
 };
 use tokio::sync::oneshot;
 
+use super::ScreenFd;
+
 pub struct ScreenPick {
     /// None = use the default PipeWire connection (test hook).
-    pub fd: Option<OwnedFd>,
+    pub fd: Option<ScreenFd>,
     pub node_id: u32,
     pub size: Option<(i32, i32)>,
     /// Dropping this ends the portal session (stops the compositor's capture indicator).
     pub stop: oneshot::Sender<()>,
 }
 
+#[cfg(not(target_os = "linux"))]
+pub async fn pick_screen() -> Result<ScreenPick> {
+    Err(anyhow!("Screen sharing isn't available on Windows yet."))
+}
+
 /// Runs on the tokio runtime. Keeps the portal session alive until `stop` fires.
+#[cfg(target_os = "linux")]
 pub async fn pick_screen() -> Result<ScreenPick> {
     let (res_tx, res_rx) = oneshot::channel();
     let (stop_tx, stop_rx) = oneshot::channel::<()>();

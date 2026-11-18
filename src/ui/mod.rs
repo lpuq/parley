@@ -7,6 +7,7 @@ pub mod identity;
 mod picture;
 mod qr;
 mod sidebar;
+#[cfg(target_os = "linux")]
 mod tray;
 
 use std::{
@@ -107,6 +108,7 @@ pub struct App {
     pub playing_apps: RefCell<Vec<String>>,
     pub share_audio: RefCell<AudioShare>,
     hold: RefCell<Option<gio::ApplicationHoldGuard>>,
+    #[cfg(target_os = "linux")]
     tray: RefCell<Option<ksni::Handle<tray::ParleyTray>>>,
     bt_mic_hint_shown: Cell<bool>,
     /// Live voice-processing settings shared with the microphone pipeline.
@@ -229,6 +231,7 @@ impl App {
             playing_apps: RefCell::new(Vec::new()),
             share_audio: RefCell::new(AudioShare::Off),
             hold: RefCell::new(None),
+            #[cfg(target_os = "linux")]
             tray: RefCell::new(None),
             bt_mic_hint_shown: Cell::new(false),
             voice: VoiceParams::new(true, Gate::Auto, -50.0, true),
@@ -374,7 +377,8 @@ impl App {
         {
             let t = this.clone();
             window.connect_close_request(move |w| {
-                let bg = t.store.borrow().settings.run_in_background;
+                // (Windows has no tray yet to come back from, so there it quits.)
+                let bg = cfg!(target_os = "linux") && t.store.borrow().settings.run_in_background;
                 if t.room.get().is_some() && !bg {
                     t.hang_up();
                     t.end_call_media();
@@ -480,6 +484,7 @@ impl App {
         }
         self.end_call_media();
         self.hold.borrow_mut().take();
+        #[cfg(target_os = "linux")]
         if let Some(h) = self.tray.borrow_mut().take() {
             let rt = self.rt.clone();
             rt.spawn(async move {
@@ -491,6 +496,14 @@ impl App {
         glib::timeout_add_local_once(std::time::Duration::from_millis(delay), move || app.quit());
     }
 
+    /// No tray on Windows yet (so closing the window there quits).
+    #[cfg(not(target_os = "linux"))]
+    fn start_tray(self: &Rc<Self>) {}
+
+    #[cfg(not(target_os = "linux"))]
+    fn update_tray(&self) {}
+
+    #[cfg(target_os = "linux")]
     fn start_tray(self: &Rc<Self>) {
         let (tx, rx) = async_channel::unbounded();
         let icons = tray::icon_pixmaps();
@@ -520,6 +533,7 @@ impl App {
     }
 
     /// Mirror call state into the tray menu.
+    #[cfg(target_os = "linux")]
     fn update_tray(&self) {
         let Some(h) = self.tray.borrow().clone() else { return };
         let (in_call, st, unread) = (self.room.get().is_some(), self.state.get(), self.any_unread());
@@ -1974,7 +1988,7 @@ impl App {
     /// than leaving friends on a black tile.
     fn start_screen_capture(
         self: &Rc<Self>,
-        fd: Option<std::os::fd::OwnedFd>,
+        fd: Option<crate::media::ScreenFd>,
         node_id: u32,
         size: Option<(i32, i32)>,
         gpu_import: bool,

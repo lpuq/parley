@@ -11,6 +11,13 @@ pub mod voice;
 use anyhow::{Result, anyhow};
 use gst::prelude::*;
 
+/// The screen-capture stream's connection (PipeWire's, from the portal). Windows has
+/// no such thing (and no screen sharing yet): an empty type.
+#[cfg(unix)]
+pub use std::os::fd::OwnedFd as ScreenFd;
+#[cfg(not(unix))]
+pub enum ScreenFd {}
+
 /// Name shared by the echo-cancel probe (on playback) and webrtcdsp (on the mic).
 pub const ECHO_PROBE: &str = "parley-echo-probe";
 
