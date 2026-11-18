@@ -547,6 +547,7 @@ impl App {
         });
     }
 
+    #[cfg(target_os = "linux")]
     fn any_unread(&self) -> bool {
         self.chat.borrow().unread.values().any(|n| *n > 0)
     }
