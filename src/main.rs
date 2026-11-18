@@ -1,4 +1,8 @@
-//! Parley — private, serverless voice / video / screen-share calls for Linux.
+//! Parley — private, serverless voice / video / screen-share calls.
+
+// Windows: a GUI program, so no console window opens beside it (debug builds keep one
+// for their output; the log file has everything either way).
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use parley::{hub, net, store, ui};
 
