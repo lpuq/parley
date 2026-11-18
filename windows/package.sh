@@ -28,8 +28,15 @@ for p in $PLUGINS; do
 done
 cp "$P/libexec/gstreamer-1.0/gst-plugin-scanner.exe" "$OUT/libexec/gstreamer-1.0/"
 
-# Image loaders (with their cache, rewritten for the new place).
-cp -r "$P/lib/gdk-pixbuf-2.0" "$OUT/lib/"
+# Image loaders (for pictures people pick as avatars), without the HEIF, JPEG XL and
+# WMF ones and the large libraries they'd bring along. MSYS2's cache of them already
+# names them by relative paths, so it only needs those three left out.
+L=lib/gdk-pixbuf-2.0/2.10.0
+mkdir -p "$OUT/$L/loaders"
+for f in "$P/$L/loaders/"*.dll; do
+  case "$(basename "$f")" in *heif* | *jxl* | io-wmf*) ;; *) cp "$f" "$OUT/$L/loaders/" ;; esac
+done
+awk 'BEGIN { RS = ""; ORS = "\n\n" } !/heif|jxl|io-wmf/' "$P/$L/loaders.cache" > "$OUT/$L/loaders.cache"
 
 # Every DLL from MSYS2 that any of these needs, directly or not.
 # (Paths compared with forward slashes: awk would read the backslashes as escapes.)
@@ -40,9 +47,6 @@ ntldd -R "${binaries[@]}" | tr -d '\r' | tr '\\' '/' | awk -v pb="$prefix_bin" '
   sort -u | while read -r dll; do cp -n "$(cygpath -u "$dll")" "$OUT/bin/"; done
 echo "$(ls "$OUT/bin" | wc -l) files in bin"
 # (The plugin scanner finds them too: Parley puts bin\ on PATH for its helpers.)
-
-GDK_PIXBUF_MODULEDIR="$OUT/lib/gdk-pixbuf-2.0/2.10.0/loaders" gdk-pixbuf-query-loaders \
-  | sed "s|$(cygpath -m "$PWD/$OUT")/||g; s|$PWD/$OUT/||g" > "$OUT/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
 
 # GTK's settings schemas, the Adwaita icons it draws its own widgets with, and
 # Parley's icon by its name (the window and taskbar use it).
