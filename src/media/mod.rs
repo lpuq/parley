@@ -18,6 +18,13 @@ pub use std::os::fd::OwnedFd as ScreenFd;
 #[cfg(not(unix))]
 pub enum ScreenFd {}
 
+#[cfg(not(unix))]
+impl ScreenFd {
+    pub fn try_clone(&self) -> std::io::Result<Self> {
+        match *self {}
+    }
+}
+
 /// Name shared by the echo-cancel probe (on playback) and webrtcdsp (on the mic).
 pub const ECHO_PROBE: &str = "parley-echo-probe";
 
