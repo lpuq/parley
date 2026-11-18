@@ -35,6 +35,12 @@ fn main() -> anyhow::Result<()> {
     gtk::glib::set_application_name("Parley");
     parley::media::send::warm_up_encoders();
 
+    #[cfg(windows)]
+    let Some(_running) = store::single_instance() else {
+        tracing::info!("Parley is already running");
+        return Ok(());
+    };
+
     let background = std::env::args().any(|a| a == "--background");
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)

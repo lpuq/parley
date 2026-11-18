@@ -61,6 +61,17 @@ fn app_dir_name() -> String {
     }
 }
 
+/// Windows: GApplication has no D-Bus there to keep Parley to one running copy, and a
+/// second copy would be the same identity on the network. Holding this file open
+/// with no sharing does it instead; None = another copy has it.
+#[cfg(windows)]
+pub fn single_instance() -> Option<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let dir = data_dir();
+    let _ = fs::create_dir_all(&dir);
+    fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).share_mode(0).open(dir.join("running.lock")).ok()
+}
+
 /// Loads the long-term identity key, creating it on first run.
 /// The public half is this user's address; the file never leaves the machine.
 pub fn load_or_create_identity() -> Result<SecretKey> {
