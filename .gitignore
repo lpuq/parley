@@ -10,3 +10,4 @@ flatpak/repo/
 *.mp4
 *.mkv
 *.webm
+/dist/

@@ -35,6 +35,15 @@ fn main() -> anyhow::Result<()> {
         None => tracing_subscriber::fmt().with_env_filter(filter).init(),
     }
     tracing::info!("Parley {} starting; log at {}", env!("CARGO_PKG_VERSION"), log_path.display());
+    // Windows: helpers GStreamer starts (its plugin scanner, in libexec\) look for their
+    // DLLs on PATH, and those are beside parley.exe.
+    #[cfg(windows)]
+    if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_path_buf())) {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let joined = std::env::join_paths(std::iter::once(dir).chain(std::env::split_paths(&path))).unwrap_or(path);
+        // SAFETY: nothing else is running yet (no other threads read the environment).
+        unsafe { std::env::set_var("PATH", joined) };
+    }
     gst::init().context("initialising GStreamer")?;
     gtk::glib::set_application_name("Parley");
     parley::media::send::warm_up_encoders();
