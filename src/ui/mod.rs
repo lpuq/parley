@@ -9,6 +9,9 @@ mod qr;
 mod sidebar;
 #[cfg(target_os = "linux")]
 mod tray;
+mod tray_common;
+#[cfg(windows)]
+mod tray_win;
 
 use std::{
     cell::{Cell, RefCell},
@@ -110,6 +113,8 @@ pub struct App {
     hold: RefCell<Option<gio::ApplicationHoldGuard>>,
     #[cfg(target_os = "linux")]
     tray: RefCell<Option<ksni::Handle<tray::ParleyTray>>>,
+    #[cfg(windows)]
+    tray: RefCell<Option<tray_win::Tray>>,
     bt_mic_hint_shown: Cell<bool>,
     /// Live voice-processing settings shared with the microphone pipeline.
     pub voice: Arc<VoiceParams>,
@@ -231,7 +236,7 @@ impl App {
             playing_apps: RefCell::new(Vec::new()),
             share_audio: RefCell::new(AudioShare::Off),
             hold: RefCell::new(None),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", windows))]
             tray: RefCell::new(None),
             bt_mic_hint_shown: Cell::new(false),
             voice: VoiceParams::new(true, Gate::Auto, -50.0, true),
@@ -377,8 +382,7 @@ impl App {
         {
             let t = this.clone();
             window.connect_close_request(move |w| {
-                // (Windows has no tray yet to come back from, so there it quits.)
-                let bg = cfg!(target_os = "linux") && t.store.borrow().settings.run_in_background;
+                let bg = t.can_run_in_background() && t.store.borrow().settings.run_in_background;
                 if t.room.get().is_some() && !bg {
                     t.hang_up();
                     t.end_call_media();
@@ -491,17 +495,53 @@ impl App {
                 h.shutdown().await;
             });
         }
+        #[cfg(windows)]
+        self.tray.borrow_mut().take();
         let app = self.app.clone();
         let delay = if in_call { 400 } else { 50 };
         glib::timeout_add_local_once(std::time::Duration::from_millis(delay), move || app.quit());
     }
 
-    /// No tray on Windows yet (so closing the window there quits).
-    #[cfg(not(target_os = "linux"))]
-    fn start_tray(self: &Rc<Self>) {}
+    /// Whether closing the window may leave Parley running. On Linux it can be reopened
+    /// from the app menu even without a tray; on Windows only from the tray icon.
+    pub fn can_run_in_background(&self) -> bool {
+        #[cfg(windows)]
+        return self.tray.borrow().is_some();
+        #[cfg(not(windows))]
+        true
+    }
 
-    #[cfg(not(target_os = "linux"))]
-    fn update_tray(&self) {}
+    #[cfg(windows)]
+    fn start_tray(self: &Rc<Self>) {
+        let (tx, rx) = async_channel::unbounded();
+        match tray_win::Tray::new(tx, self.any_unread()) {
+            Ok(t) => *self.tray.borrow_mut() = Some(t),
+            Err(e) => tracing::warn!("no tray icon ({e}); closing the window will quit Parley"),
+        }
+        self.handle_tray_commands(rx);
+    }
+
+    #[cfg(windows)]
+    fn update_tray(&self) {
+        let st = self.state.get();
+        if let Some(t) = self.tray.borrow().as_ref() {
+            t.update(self.room.get().is_some(), st.mic_muted || st.deafened, self.any_unread());
+        }
+    }
+
+    fn handle_tray_commands(self: &Rc<Self>, rx: async_channel::Receiver<tray_common::TrayCmd>) {
+        let t = self.clone();
+        glib::spawn_future_local(async move {
+            while let Ok(cmd) = rx.recv().await {
+                match cmd {
+                    tray_common::TrayCmd::Show => t.present(),
+                    tray_common::TrayCmd::ToggleMute => t.toggle_mute(),
+                    tray_common::TrayCmd::HangUp => t.hang_up(),
+                    tray_common::TrayCmd::Quit => t.quit(),
+                }
+            }
+        });
+    }
 
     #[cfg(target_os = "linux")]
     fn start_tray(self: &Rc<Self>) {
@@ -519,17 +559,7 @@ impl App {
                 Err(_) => {}
             }
         });
-        let t = self.clone();
-        glib::spawn_future_local(async move {
-            while let Ok(cmd) = rx.recv().await {
-                match cmd {
-                    tray::TrayCmd::Show => t.present(),
-                    tray::TrayCmd::ToggleMute => t.toggle_mute(),
-                    tray::TrayCmd::HangUp => t.hang_up(),
-                    tray::TrayCmd::Quit => t.quit(),
-                }
-            }
-        });
+        self.handle_tray_commands(rx);
     }
 
     /// Mirror call state into the tray menu.
@@ -547,7 +577,6 @@ impl App {
         });
     }
 
-    #[cfg(target_os = "linux")]
     fn any_unread(&self) -> bool {
         self.chat.borrow().unread.values().any(|n| *n > 0)
     }

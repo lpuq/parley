@@ -3,12 +3,7 @@
 
 use gtk::{gdk, glib, prelude::*};
 
-pub enum TrayCmd {
-    Show,
-    ToggleMute,
-    HangUp,
-    Quit,
-}
+pub use super::tray_common::TrayCmd;
 
 pub struct ParleyTray {
     pub tx: async_channel::Sender<TrayCmd>,
@@ -92,37 +87,13 @@ impl ksni::Tray for ParleyTray {
     }
 }
 
-/// The app icon with a red dot in its top-right corner (unread messages), drawn with a
-/// thin white ring so it stands out on any panel.
+/// The app icon with a red dot in its top-right corner (unread messages).
 pub fn with_dot(icons: &[ksni::Icon]) -> Vec<ksni::Icon> {
     icons
         .iter()
         .map(|i| {
-            let (w, h) = (i.width as f32, i.height as f32);
-            let r = w.min(h) * 0.24;
-            let ring = (w.min(h) * 0.05).max(1.0);
-            let (cx, cy) = (w - r - ring, r + ring);
             let mut data = i.data.clone();
-            for y in 0..i.height {
-                for x in 0..i.width {
-                    let d = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
-                    // Edge coverage (1 px of anti-aliasing) for the dot and its ring.
-                    let cover = |radius: f32| (radius + 0.5 - d).clamp(0.0, 1.0);
-                    let (dot, outer) = (cover(r), cover(r + ring));
-                    if outer <= 0.0 {
-                        continue;
-                    }
-                    let p = ((y * i.width + x) * 4) as usize;
-                    let mix = |old: u8, new: f32, a: f32| (old as f32 * (1.0 - a) + new * a).round() as u8;
-                    // White ring first, then the red dot over it (ARGB).
-                    let (a0, r0, g0, b0) = (data[p], data[p + 1], data[p + 2], data[p + 3]);
-                    let (r1, g1, b1) = (mix(r0, 255.0, outer), mix(g0, 255.0, outer), mix(b0, 255.0, outer));
-                    data[p] = mix(a0, 255.0, outer);
-                    data[p + 1] = mix(r1, 224.0, dot);
-                    data[p + 2] = mix(g1, 27.0, dot);
-                    data[p + 3] = mix(b1, 36.0, dot);
-                }
-            }
+            super::tray_common::add_dot(&mut data, i.width as usize, i.height as usize, [0, 1, 2, 3]);
             ksni::Icon { width: i.width, height: i.height, data }
         })
         .collect()

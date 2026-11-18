@@ -700,11 +700,11 @@ pub fn settings(app: &Rc<App>) {
         .subtitle("They still need your code; you'll always be asked before answering")
         .active(s.allow_unknown_callers)
         .build();
-    let autostart_on = if in_flatpak() { s.autostart } else { autostart_path().exists() };
+    let autostart_on = if in_flatpak() { s.autostart } else { autostart_enabled() };
     let autostart = adw::SwitchRow::builder().title("Start when I log in").active(autostart_on).build();
-    // Both need the tray to come back to, which Windows doesn't have yet.
-    bg.set_visible(cfg!(target_os = "linux"));
-    autostart.set_visible(cfg!(target_os = "linux"));
+    // Both need a way back to Parley (on Windows, its tray icon).
+    bg.set_visible(app.can_run_in_background());
+    autostart.set_visible(app.can_run_in_background());
     beh.add(&bg);
     beh.add(&autostart);
     beh.add(&unknown);
@@ -880,6 +880,12 @@ fn in_flatpak() -> bool {
     std::path::Path::new("/.flatpak-info").exists()
 }
 
+#[cfg(not(windows))]
+fn autostart_enabled() -> bool {
+    autostart_path().exists()
+}
+
+#[cfg(not(windows))]
 fn autostart_path() -> std::path::PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
@@ -887,6 +893,7 @@ fn autostart_path() -> std::path::PathBuf {
     base.join("autostart").join(format!("{}.desktop", super::APP_ID))
 }
 
+#[cfg(not(windows))]
 fn set_autostart(on: bool) -> std::io::Result<()> {
     let p = autostart_path();
     if on {
@@ -905,6 +912,35 @@ fn set_autostart(on: bool) -> std::io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+/// Windows: a value under the user's Run key, starting Parley hidden in the tray.
+#[cfg(windows)]
+const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+
+/// `reg.exe`, without the console window it would otherwise flash up.
+#[cfg(windows)]
+fn reg(args: &[&str]) -> std::io::Result<bool> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = std::process::Command::new("reg").args(args).creation_flags(CREATE_NO_WINDOW).output()?;
+    Ok(out.status.success())
+}
+
+#[cfg(windows)]
+fn autostart_enabled() -> bool {
+    reg(&["query", RUN_KEY, "/v", "Parley"]).unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn set_autostart(on: bool) -> std::io::Result<()> {
+    let ok = if on {
+        let exe = std::env::current_exe()?;
+        reg(&["add", RUN_KEY, "/v", "Parley", "/t", "REG_SZ", "/d", &format!("\"{}\" --background", exe.display()), "/f"])?
+    } else {
+        !autostart_enabled() || reg(&["delete", RUN_KEY, "/v", "Parley", "/f"])?
+    };
+    if ok { Ok(()) } else { Err(std::io::Error::other("the registry change didn't take")) }
 }
 
 /// A contact's details: picture, name#tag, full key and contact code, when they were

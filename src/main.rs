@@ -48,18 +48,19 @@ fn main() -> anyhow::Result<()> {
     gtk::glib::set_application_name("Parley");
     parley::media::send::warm_up_encoders();
 
-    #[cfg(windows)]
-    let Some(_running) = store::single_instance() else {
-        tracing::info!("Parley is already running");
-        return Ok(());
-    };
-
     let background = std::env::args().any(|a| a == "--background");
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .thread_name("parley-net")
         .build()?;
+
+    // Windows: one copy at a time (see store::instance_pipe).
+    #[cfg(windows)]
+    let Some(show_requests) = claim_instance(&rt) else {
+        tracing::info!("Parley is already running: asked it to show its window");
+        return Ok(());
+    };
 
     let secret = store::load_identity()?;
     let me = secret.public();
@@ -92,10 +93,50 @@ fn main() -> anyhow::Result<()> {
             *cell.borrow_mut() = Some(a);
         });
     });
+    // Another copy was started: bring this one's window forward instead.
+    #[cfg(windows)]
+    {
+        let app = app.clone();
+        gtk::glib::spawn_future_local(async move {
+            while show_requests.recv().await.is_ok() {
+                app.activate();
+            }
+        });
+    }
     // Our own flags (like --background) aren't GTK's business.
     let code = app.run_with_args::<&str>(&[]);
     APP.with(|c| c.borrow_mut().take());
     // Don't let lingering network/IO tasks keep the process alive after Quit.
     rt.shutdown_timeout(std::time::Duration::from_millis(500));
     std::process::exit(if code == gtk::glib::ExitCode::SUCCESS { 0 } else { 1 });
+}
+
+/// Windows: claims the instance pipe, or (another copy has it) asks that copy to show
+/// its window. Some = we're the one; its receiver hears later copies being started.
+#[cfg(windows)]
+fn claim_instance(rt: &tokio::runtime::Runtime) -> Option<async_channel::Receiver<()>> {
+    use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+    let name = store::instance_pipe();
+    let _rt = rt.enter();
+    match ServerOptions::new().first_pipe_instance(true).create(&name) {
+        Ok(first) => {
+            let (tx, rx) = async_channel::unbounded();
+            rt.spawn(async move {
+                let mut server = first;
+                // Each connection is another copy starting; then listen again.
+                while server.connect().await.is_ok() {
+                    let _ = tx.send(()).await;
+                    match ServerOptions::new().create(&name) {
+                        Ok(next) => server = next,
+                        Err(_) => break,
+                    }
+                }
+            });
+            Some(rx)
+        }
+        Err(_) => {
+            let _ = ClientOptions::new().open(&name);
+            None
+        }
+    }
 }

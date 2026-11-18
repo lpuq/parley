@@ -35,6 +35,10 @@ ashpd = { version = "0.14", default-features = false, features = ["tokio", "scre
 pipewire = "0.10"
 ksni = "0.3"
 
+# Windows: the notification-area (tray) icon.
+[target.'cfg(windows)'.dependencies]
+tray-icon = { version = "0.26.1", default-features = false }
+
 [profile.release]
 opt-level = 3
 lto = "thin"
