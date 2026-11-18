@@ -2397,7 +2397,7 @@ impl App {
         glib::spawn_future_local(async move {
             // Test hook: share an existing PipeWire screencast node instead of asking the portal.
             let test_node = std::env::var("PARLEY_TEST_SCREEN_NODE").ok().and_then(|v| v.parse::<u32>().ok());
-            let pick = match test_node {
+            let pick: Result<anyhow::Result<ScreenPick>, tokio::task::JoinError> = match test_node {
                 Some(node_id) => {
                     let (stop, _) = tokio::sync::oneshot::channel();
                     Ok(Ok(ScreenPick { fd: None, node_id, size: None, stop }))
