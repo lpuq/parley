@@ -65,6 +65,9 @@ struct Media {
     screen_audio: Option<ScreenAudioSender>,
     /// Waiting for PipeWire to announce the virtual sink before recording it.
     screen_audio_pending: bool,
+    /// Windows: the screen being shared.
+    #[cfg(windows)]
+    screen_monitor: Option<gst::Device>,
     remote: HashMap<(EndpointId, Track), VideoReceiver>,
 }
 
@@ -2046,9 +2049,32 @@ impl App {
             t.toast(&format!("Screen sharing stopped — {msg}"));
             t.stop_screen_share();
         };
+        #[cfg(windows)]
+        let s = {
+            let _ = (fd, node_id, size);
+            let monitor = self.media.borrow().screen_monitor.clone().ok_or_else(|| anyhow::anyhow!("no screen chosen"))?;
+            VideoSender::monitor(self.hub.clone(), &monitor, settings.screen_params(), settings.hw_encode, on_error)?
+        };
+        #[cfg(not(windows))]
         let s = VideoSender::screen(self.hub.clone(), fd, node_id, size, settings.screen_params(), settings.hw_encode, gpu_import, on_error)?;
         self.media.borrow_mut().screen = Some(s);
         Ok(())
+    }
+
+    /// Windows: which screen to share (asked only when there's more than one).
+    #[cfg(windows)]
+    async fn pick_monitor(self: &Rc<Self>) -> anyhow::Result<ScreenPick> {
+        let monitors = crate::media::devices::monitors();
+        let chosen = match monitors.len() {
+            0 => anyhow::bail!("Windows didn't report any screen to capture."),
+            1 => monitors[0].clone(),
+            _ => dialogs::pick_monitor(self, &monitors).await.ok_or_else(|| anyhow::anyhow!("Cancelled"))?,
+        };
+        let size = crate::media::devices::monitor_size(&chosen.device);
+        self.media.borrow_mut().screen_monitor = Some(chosen.device);
+        // Nothing like a portal session to end afterwards.
+        let (stop, _) = tokio::sync::oneshot::channel();
+        Ok(ScreenPick { fd: None, node_id: 0, size, stop })
     }
 
     /// Pushes the voice settings to the running microphone (no restart needed).
@@ -2376,6 +2402,12 @@ impl App {
                     let (stop, _) = tokio::sync::oneshot::channel();
                     Ok(Ok(ScreenPick { fd: None, node_id, size: None, stop }))
                 }
+                #[cfg(windows)]
+                None => {
+                    let _ = &rt;
+                    Ok(t.pick_monitor().await)
+                }
+                #[cfg(not(windows))]
                 None => rt.spawn(crate::media::portal::pick_screen()).await,
             };
             let pick: ScreenPick = match pick {
@@ -2393,7 +2425,8 @@ impl App {
                 let _ = pick.stop.send(());
                 return;
             }
-            if let Err(e) = t.start_screen_capture(pick.fd, pick.node_id, pick.size, true) {
+            // (No GPU import to fall back from on Windows.)
+            if let Err(e) = t.start_screen_capture(pick.fd, pick.node_id, pick.size, cfg!(not(windows))) {
                 let _ = pick.stop.send(());
                 t.toast(&format!("Screen share failed: {e:#}"));
                 return;

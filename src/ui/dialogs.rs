@@ -865,6 +865,21 @@ fn confirm_replace_identity(app: &Rc<App>, settings: &adw::PreferencesDialog) {
     d.present(Some(settings));
 }
 
+/// Windows: asks which screen to share.
+#[cfg(windows)]
+pub async fn pick_monitor(app: &Rc<App>, monitors: &[devices::Device]) -> Option<devices::Device> {
+    let d = adw::AlertDialog::new(Some("Share which screen?"), None);
+    for (i, m) in monitors.iter().enumerate() {
+        let size = devices::monitor_size(&m.device).map(|(w, h)| format!(" — {w}×{h}")).unwrap_or_default();
+        d.add_response(&i.to_string(), &format!("Screen {}{size}", i + 1));
+        d.set_response_appearance(&i.to_string(), adw::ResponseAppearance::Suggested);
+    }
+    d.add_response("cancel", "Cancel");
+    d.set_close_response("cancel");
+    let r = d.choose_future(Some(&app.window)).await;
+    r.parse::<usize>().ok().and_then(|i| monitors.get(i).cloned())
+}
+
 fn device_combo(title: &str, list: &[devices::Device], current: &str) -> adw::ComboRow {
     let mut labels = vec!["System default".to_string()];
     labels.extend(list.iter().map(|d| d.name.clone()));

@@ -669,7 +669,6 @@ impl VideoSender {
         gpu_import: bool,
         on_error: impl Fn(String) + 'static,
     ) -> Result<Self> {
-        let (max_h, fps, kbps) = quality;
         let pipeline = gst::Pipeline::with_name("screen");
         let src = make("pipewiresrc")?;
         if let Some(fd) = &fd {
@@ -710,6 +709,45 @@ impl VideoSender {
             gst::PadProbeReturn::Ok
         });
         head_chain.push(sysmem);
+        let keep: Option<Box<dyn std::any::Any + Send>> = fd.map(|fd| Box::new(fd) as Box<dyn std::any::Any + Send>);
+        let fail_test = gpu_import && std::env::var_os("PARLEY_TEST_FAIL_GPU_IMPORT").is_some();
+        Self::screen_from(hub, pipeline, src, head_chain, size, quality, hw, on_error, keep, fail_test)
+    }
+
+    /// Windows: shares a monitor, as GStreamer's screen-capture device provider lists it
+    /// (Direct3D 11 capture).
+    #[cfg(windows)]
+    pub fn monitor(hub: Arc<Hub>, monitor: &gst::Device, quality: (u32, u32, u32), hw: bool, on_error: impl Fn(String) + 'static) -> Result<Self> {
+        let pipeline = gst::Pipeline::with_name("screen");
+        let src = monitor.create_element(Some("screensrc"))?;
+        set_opt(&src, "show-cursor", "true");
+        // Frames come in GPU memory: bring them to normal memory for the encoder side.
+        let mut head_chain = Vec::new();
+        if has("d3d11download") {
+            head_chain.push(make("d3d11download")?);
+        }
+        head_chain.push(caps_filter("video/x-raw")?);
+        let size = super::devices::monitor_size(monitor);
+        Self::screen_from(hub, pipeline, src, head_chain, size, quality, hw, on_error, None, false)
+    }
+
+    /// The rest of a screen share, whatever the source: scaling, a repeater feeding the
+    /// encoder, and the encoder. `keep` lives as long as the pipeline (the portal's
+    /// connection).
+    #[allow(clippy::too_many_arguments)]
+    fn screen_from(
+        hub: Arc<Hub>,
+        pipeline: gst::Pipeline,
+        src: gst::Element,
+        mut head_chain: Vec<gst::Element>,
+        size: Option<(i32, i32)>,
+        quality: (u32, u32, u32),
+        hw: bool,
+        on_error: impl Fn(String) + 'static,
+        keep: Option<Box<dyn std::any::Any + Send>>,
+        fail_test: bool,
+    ) -> Result<Self> {
+        let (max_h, fps, kbps) = quality;
         // Some compositors report a bogus pixel aspect ratio (niri: 1/2147483647), which
         // makes the scaler squash the picture into black borders. Screens have square pixels.
         if has("capssetter") {
@@ -810,7 +848,7 @@ impl VideoSender {
         })?;
 
         // Test hook: pretend the GPU import failed (exercises the shared-memory fallback).
-        if gpu_import && std::env::var_os("PARLEY_TEST_FAIL_GPU_IMPORT").is_some() {
+        if fail_test {
             let p = pipeline.downgrade();
             gtk::glib::timeout_add_seconds_local_once(1, move || {
                 if let Some(p) = p.upgrade() {
@@ -820,8 +858,8 @@ impl VideoSender {
         }
         let mut run = Running::start(pipeline, "Screen share", on_error)?;
         // The portal's PipeWire connection must outlive the pipeline.
-        if let Some(fd) = fd {
-            run.keep_alive(fd);
+        if let Some(k) = keep {
+            run.keep_alive(k);
         }
         Ok(Self { _run: run, hub, track: Track::Screen, preview, stop: Some(stop) })
     }

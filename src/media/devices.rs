@@ -1,4 +1,4 @@
-//! Microphone, speaker and camera enumeration.
+//! Microphone, speaker, camera (and, on Windows, screen) enumeration.
 
 use gst::prelude::*;
 
@@ -20,11 +20,11 @@ fn prop_str(d: &gst::Device, key: &str) -> Option<String> {
 }
 
 /// Prefer the PulseAudio API (served by pipewire-pulse): it's the most robust
-/// path for live audio in GStreamer. Fall back to native PipeWire.
+/// path for live audio in GStreamer. Fall back to native PipeWire; on Windows, WASAPI.
 fn audio_devices(class: &str) -> Vec<Device> {
-    let devs = provider_devices("pulsedeviceprovider", class)
-        .filter(|v| !v.is_empty())
-        .or_else(|| provider_devices("pipewiredeviceprovider", class))
+    let devs = ["pulsedeviceprovider", "pipewiredeviceprovider", "wasapi2deviceprovider"]
+        .iter()
+        .find_map(|p| provider_devices(p, class).filter(|v| !v.is_empty()))
         .unwrap_or_default();
     devs.into_iter()
         .filter(|d| prop_str(d, "device.class").as_deref() != Some("monitor"))
@@ -153,4 +153,21 @@ fn pick_fps(s: &gst::StructureRef, target: f64) -> Option<gst::Fraction> {
         .min_by(|a, b| fps_of(a).partial_cmp(&fps_of(b)).unwrap())
         .or_else(|| fr.iter().max_by(|a, b| fps_of(a).partial_cmp(&fps_of(b)).unwrap()))
         .copied()
+}
+
+/// Windows: the screens GStreamer can capture (Direct3D 11).
+#[cfg(windows)]
+pub fn monitors() -> Vec<Device> {
+    provider_devices("d3d11screencapturedeviceprovider", "Source/Monitor")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|d| Device { name: d.display_name().to_string(), device: d })
+        .collect()
+}
+
+/// A screen's size in pixels, from the capture device's caps.
+pub fn monitor_size(d: &gst::Device) -> Option<(i32, i32)> {
+    let caps = d.caps()?;
+    let s = caps.structure(0)?;
+    Some((s.get::<i32>("width").ok()?, s.get::<i32>("height").ok()?))
 }

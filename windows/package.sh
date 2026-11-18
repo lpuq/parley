@@ -32,11 +32,13 @@ cp "$P/libexec/gstreamer-1.0/gst-plugin-scanner.exe" "$OUT/libexec/gstreamer-1.0
 cp -r "$P/lib/gdk-pixbuf-2.0" "$OUT/lib/"
 
 # Every DLL from MSYS2 that any of these needs, directly or not.
-prefix_bin=$(cygpath -w "$P/bin" | tr '[:upper:]' '[:lower:]')
+# (Paths compared with forward slashes: awk would read the backslashes as escapes.)
+prefix_bin=$(cygpath -m "$P/bin" | tr '[:upper:]' '[:lower:]')
 mapfile -t binaries < <(find "$OUT" -name '*.exe' -o -name '*.dll')
-ntldd -R "${binaries[@]}" | tr -d '\r' | awk -v pb="$prefix_bin" '
-  { line = tolower($0); if (index(line, pb) > 0) { sub(/^[^>]*=> */, ""); sub(/ \(0x[0-9a-f]+\)$/, ""); print } }' |
+ntldd -R "${binaries[@]}" | tr -d '\r' | tr '\\' '/' | awk -v pb="$prefix_bin" '
+  { if (index(tolower($0), pb) > 0) { sub(/^[^>]*=> */, ""); sub(/ \(0x[0-9a-f]+\)$/, ""); print } }' |
   sort -u | while read -r dll; do cp -n "$(cygpath -u "$dll")" "$OUT/bin/"; done
+echo "$(ls "$OUT/bin" | wc -l) files in bin"
 # (The plugin scanner finds them too: Parley puts bin\ on PATH for its helpers.)
 
 GDK_PIXBUF_MODULEDIR="$OUT/lib/gdk-pixbuf-2.0/2.10.0/loaders" gdk-pixbuf-query-loaders \
