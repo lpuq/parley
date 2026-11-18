@@ -160,7 +160,6 @@ pub struct ScreenAudioSender {
 
 impl ScreenAudioSender {
     pub fn start(hub: Arc<Hub>, sink_node_name: &str, on_error: impl Fn(String) + 'static) -> Result<Self> {
-        let pipeline = gst::Pipeline::with_name("screen-audio");
         let src = if has("pulsesrc") {
             let s = make("pulsesrc")?;
             s.set_property("device", format!("{sink_node_name}.monitor"));
@@ -175,6 +174,25 @@ impl ScreenAudioSender {
         };
         set_opt(&src, "buffer-time", "40000");
         set_opt(&src, "latency-time", "10000");
+        Self::from_source(hub, src, &format!("{sink_node_name}.monitor"), on_error)
+    }
+
+    /// Windows: everything playing on the computer except Parley itself (WASAPI process
+    /// loopback, which needs Windows 11), so friends never hear themselves.
+    #[cfg(windows)]
+    pub fn desktop(hub: Arc<Hub>, on_error: impl Fn(String) + 'static) -> Result<Self> {
+        let src = make("wasapi2src")?;
+        src.set_property("loopback", true);
+        set_opt(&src, "loopback-mode", "exclude-process-tree");
+        if src.find_property("loopback-target-pid").is_some() {
+            src.set_property("loopback-target-pid", std::process::id());
+        }
+        set_opt(&src, "low-latency", "true");
+        Self::from_source(hub, src, "the desktop (except Parley)", on_error)
+    }
+
+    fn from_source(hub: Arc<Hub>, src: gst::Element, what: &str, on_error: impl Fn(String) + 'static) -> Result<Self> {
+        let pipeline = gst::Pipeline::with_name("screen-audio");
         let chain = [
             src,
             make("audioconvert")?,
@@ -199,7 +217,7 @@ impl ScreenAudioSender {
         pipeline.add_many(&chain)?;
         gst::Element::link_many(&chain)?;
         // Diagnostics: how much sound we capture, every 10 s.
-        tracing::info!("screen audio: capturing {sink_node_name}.monitor");
+        tracing::info!("screen audio: capturing {what}");
         let stats = Arc::new(std::sync::Mutex::new((0u64, 0f64, Instant::now())));
         chain[4].static_pad("sink").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
             if let Some(buf) = info.buffer() {

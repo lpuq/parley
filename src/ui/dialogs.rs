@@ -327,13 +327,19 @@ pub fn screen_share(app: &Rc<App>) {
     g.set_title("Sound");
     g.set_description(Some("Parley's own audio (your friends' voices) is never included, so nobody hears an echo."));
     let mode = adw::ComboRow::builder().title("Share audio").build();
-    mode.set_model(Some(&gtk::StringList::new(&["No audio", "All desktop audio", "Only selected apps"])));
+    // (Picking single apps needs PipeWire's virtual sink: Linux only for now.)
+    let choices: &[&str] = if cfg!(windows) {
+        &["No audio", "All desktop audio"]
+    } else {
+        &["No audio", "All desktop audio", "Only selected apps"]
+    };
+    mode.set_model(Some(&gtk::StringList::new(choices)));
     let apps = app.playing_apps.borrow().clone();
     let prev = app.share_audio.borrow().clone();
     mode.set_selected(match prev {
         AudioShare::Off => 0,
-        AudioShare::Desktop => 1,
-        AudioShare::Apps(_) => 2,
+        AudioShare::Apps(_) if !cfg!(windows) => 2,
+        _ => 1,
     });
     if matches!(prev, AudioShare::Off) {
         mode.set_selected(1);

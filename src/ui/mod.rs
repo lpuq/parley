@@ -2434,20 +2434,8 @@ impl App {
             t.media.borrow_mut().screen_stop = Some(pick.stop);
             let mut st = t.state.get();
             st.screen = true;
-            st.screen_audio = audio != AudioShare::Off;
             *t.share_audio.borrow_mut() = audio.clone();
-            match (&t.app_audio, &audio) {
-                (_, AudioShare::Off) => {}
-                (Some(a), mode) => {
-                    // Recording starts once PipeWire reports the virtual sink (SinkReady).
-                    t.media.borrow_mut().screen_audio_pending = true;
-                    a.set(mode.clone());
-                }
-                (None, _) => {
-                    st.screen_audio = false;
-                    t.toast("Can't capture app audio: PipeWire isn't available.");
-                }
-            }
+            st.screen_audio = audio != AudioShare::Off && t.begin_screen_audio(&audio);
             t.publish_state(st);
             t.call_view.rebuild(&t);
         });
@@ -2458,18 +2446,50 @@ impl App {
         if !self.state.get().screen {
             return;
         }
-        let Some(a) = &self.app_audio else { return };
         let mut st = self.state.get();
         if audio == AudioShare::Off {
             self.media.borrow_mut().screen_audio = None;
             st.screen_audio = false;
+            if let Some(a) = &self.app_audio {
+                a.set(AudioShare::Off);
+            }
         } else if self.media.borrow().screen_audio.is_none() {
-            // Sink gets (re)created; SinkReady starts the recorder.
-            self.media.borrow_mut().screen_audio_pending = true;
-            st.screen_audio = true;
+            st.screen_audio = self.begin_screen_audio(&audio);
+        } else if let Some(a) = &self.app_audio {
+            // Already recording: just changes which apps play into the sink.
+            a.set(audio.clone());
         }
-        a.set(audio.clone());
         self.publish_state(st);
+    }
+
+    /// Starts recording the sound shared with the screen; returns whether it's on. On
+    /// Linux recording begins once PipeWire reports the virtual sink (SinkReady); on
+    /// Windows the desktop's sound (all but Parley's own) is recorded straight away.
+    fn begin_screen_audio(self: &Rc<Self>, mode: &AudioShare) -> bool {
+        #[cfg(windows)]
+        {
+            let _ = mode;
+            match ScreenAudioSender::desktop(self.hub.clone(), self.on_media_error()) {
+                Ok(s) => {
+                    self.media.borrow_mut().screen_audio = Some(s);
+                    true
+                }
+                Err(e) => {
+                    self.toast(&format!("Screen audio failed: {e:#}"));
+                    false
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let Some(a) = &self.app_audio else {
+                self.toast("Can't capture app audio: PipeWire isn't available.");
+                return false;
+            };
+            self.media.borrow_mut().screen_audio_pending = true;
+            a.set(mode.clone());
+            true
+        }
     }
 
     fn start_screen_audio_if_pending(self: &Rc<Self>) {
