@@ -3,7 +3,7 @@
 Private voice, video and screen-share calls for Linux, straight between friends,
 including your desktop or individual apps' audio when you share your screen, which
 few calling apps on Linux can do. No accounts, no port forwarding, and no server you
-have to run or pay for.
+have to run or pay for. A [Windows preview](#windows-preview) is out too.
 
 ![A Parley call: Bob shares a slide while he and Alice talk](docs/screenshot.png)
 
@@ -92,6 +92,44 @@ Runtime needs: PipeWire (with pipewire-pulse) and GStreamer 1.22+ with the *good
 *bad*, *ugly* and *libav* plugin sets plus the GTK 4 video sink (`gstreamer1-plugin-gtk4`
 on Fedora, `gstreamer1.0-gtk4` on Debian/Ubuntu). Screen sharing uses
 xdg-desktop-portal, which works on GNOME, KDE, niri, Hyprland, Sway and others.
+
+## Windows (preview)
+
+Parley runs on Windows 11 (x64; Windows 10 should work but hasn't been tried). It's a
+preview: so far it has been tested in a Windows 11 virtual machine, against Linux
+friends, not on real PCs. Calls work between Windows and Linux like any others.
+
+1. Download `Parley-<version>-windows-x64.zip` from the
+   [Releases](https://github.com/lpuq/parley/releases) page and unzip it anywhere.
+2. Start `Parley\bin\parley.exe`. The build isn't code-signed, so Windows SmartScreen
+   may say it doesn't recognise it: **More info → Run anyway**.
+
+Calls, chat, groups, screen sharing, the tray icon (with Mute and Hang up during a
+call), notifications and starting at login all work as on Linux. What's different
+or missing so far:
+
+- Screen sharing shares a whole screen (you pick which one if there are several),
+  not single windows.
+- The sound you share is everything playing on the computer except Parley itself, so
+  friends never hear themselves. Choosing single apps is Linux-only for now.
+- Video is encoded in software (x264); hardware encoding isn't used yet.
+- Webcams haven't been tested.
+- No installer and no automatic updates. To update, quit Parley (tray icon → *Quit
+  Parley*) and replace the folder. Your identity, friends and chats stay in
+  `%LOCALAPPDATA%\parley` and `%APPDATA%\parley`. If you move the folder, switch
+  Settings → *Start when I log in* off and on again.
+- Windows 11 tucks new tray icons away: click **^** next to the clock, and drag
+  Parley's icon onto the taskbar to keep it in sight.
+
+To build it yourself, install [MSYS2](https://www.msys2.org), then in its *CLANG64*
+shell:
+
+```bash
+pacman -S --needed git zip mingw-w64-clang-x86_64-{toolchain,pkgconf,rust,gtk4,libadwaita,ntldd} \
+    mingw-w64-clang-x86_64-{gstreamer,gst-plugins-base,gst-plugins-good,gst-plugins-bad,gst-plugins-ugly,gst-libav,gst-plugins-rs}
+git clone https://github.com/lpuq/parley.git && cd parley
+windows/package.sh    # builds dist/Parley and dist/Parley-<version>-windows-x64.zip
+```
 
 ## Building it yourself (no prebuilt binaries)
 
@@ -305,6 +343,8 @@ group member being refused by the group (after joining fine before the removal).
 - Up to 3 people (full mesh). Larger calls would need an SFU-style forwarding peer.
 - No Signal integration. Codes are plain text built for pasting into Signal or any
   messenger, or can be scanned as QR codes.
+- Windows is a preview (see [above](#windows-preview) for what's missing there); there's
+  no macOS version.
 - The Flatpak isn't on Flathub. Publishing it would need an app ID on a domain or
   GitHub account you control (`io.github.parley.Parley` is a placeholder).
 

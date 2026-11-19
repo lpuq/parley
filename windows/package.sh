@@ -57,10 +57,13 @@ cp data/icons/io.github.parley.Parley.svg "$OUT/share/icons/hicolor/scalable/app
 
 cp LICENSE "$OUT/LICENSE.txt"
 cat > "$OUT/README.txt" <<EOF
-Parley $VERSION for Windows
+Parley $VERSION for Windows (preview)
 
-Start Parley with bin\\parley.exe.
+Start Parley with bin\\parley.exe. (It isn't code-signed: if Windows SmartScreen says
+it doesn't recognise it, choose More info, then Run anyway.)
 Your identity, friends and chats are kept in %LOCALAPPDATA%\\parley and %APPDATA%\\parley.
+To update, quit Parley (tray icon, Quit Parley) and replace this folder.
+What works and what's missing on Windows so far: https://github.com/lpuq/parley#windows-preview
 
 Parley is free software (GPL-3.0-or-later, see LICENSE.txt); it uses GTK, libadwaita
 and GStreamer (LGPL), among others. Source: https://github.com/lpuq/parley
