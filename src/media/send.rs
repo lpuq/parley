@@ -218,7 +218,7 @@ impl ScreenAudioSender {
         gst::Element::link_many(&chain)?;
         // Diagnostics: how much sound we capture, every 10 s.
         tracing::info!("screen audio: capturing {what}");
-        let stats = Arc::new(std::sync::Mutex::new((0u64, 0f64, Instant::now())));
+        let stats = Arc::new(std::sync::Mutex::new((0u64, -100f64, Instant::now())));
         chain[4].static_pad("sink").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
             if let Some(buf) = info.buffer() {
                 if let Ok(map) = buf.map_readable() {

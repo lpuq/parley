@@ -374,7 +374,12 @@ pub fn screen_share(app: &Rc<App>) {
         q.set_description(Some("Stop and start sharing again to change quality."));
     }
     let go = gtk::Button::builder()
-        .label(if sharing { "Update sound" } else { "Choose screen or window…" })
+        .label(match (sharing, cfg!(windows)) {
+            (true, _) => "Update sound",
+            // (Windows shares whole screens.)
+            (false, true) => "Share screen",
+            (false, false) => "Choose screen or window…",
+        })
         .css_classes(["pill", "suggested-action"])
         .build();
     let stop = gtk::Button::builder().label("Stop sharing").css_classes(["pill", "destructive-action"]).build();
@@ -451,6 +456,8 @@ pub fn settings(app: &Rc<App>) {
         .subtitle("Off: with “System default”, earbuds stay in high-quality mode and another mic is used. On: their mic is used, which switches them to low-quality headset mode.")
         .active(s.allow_bluetooth_mic)
         .build();
+    // (Choosing around headsets' low-quality mode is PipeWire's; Windows does its own.)
+    bt_mic.set_visible(cfg!(target_os = "linux"));
     dev.add(&bt_mic);
     page.add(&dev);
     let a = app.clone();

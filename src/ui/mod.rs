@@ -118,6 +118,9 @@ pub struct App {
     tray: RefCell<Option<ksni::Handle<tray::ParleyTray>>>,
     #[cfg(windows)]
     tray: RefCell<Option<tray_win::Tray>>,
+    /// Windows: the notification showing from the tray icon, and the action clicking it runs.
+    #[cfg(windows)]
+    shown_notification: RefCell<Option<(String, Option<(String, Option<glib::Variant>)>)>>,
     bt_mic_hint_shown: Cell<bool>,
     /// Live voice-processing settings shared with the microphone pipeline.
     pub voice: Arc<VoiceParams>,
@@ -241,6 +244,8 @@ impl App {
             hold: RefCell::new(None),
             #[cfg(any(target_os = "linux", windows))]
             tray: RefCell::new(None),
+            #[cfg(windows)]
+            shown_notification: RefCell::new(None),
             bt_mic_hint_shown: Cell::new(false),
             voice: VoiceParams::new(true, Gate::Auto, -50.0, true),
             mic_test: RefCell::new(None),
@@ -393,10 +398,13 @@ impl App {
                 if bg {
                     // Still in a call: it carries on from the tray.
                     if t.room.get().is_some() {
-                        let n = gio::Notification::new("Still in your call");
-                        n.set_body(Some("Parley keeps the call going in the background. Open it from the tray icon, or hang up there."));
-                        n.set_default_action("app.show");
-                        t.app.send_notification(Some("in-call"), &n);
+                        t.notify(
+                            "in-call",
+                            "Still in your call",
+                            "Parley keeps the call going in the background. Open it from the tray icon, or hang up there.",
+                            Some(("app.show", None)),
+                            |_| {},
+                        );
                     }
                     // Stay reachable for incoming calls.
                     w.set_visible(false);
@@ -406,11 +414,13 @@ impl App {
                     if !t.store.borrow().settings.background_hint_shown {
                         t.store.borrow_mut().settings.background_hint_shown = true;
                         t.save();
-                        let n = gio::Notification::new("Parley is still running");
-                        n.set_body(Some(
+                        t.notify(
+                            "background",
+                            "Parley is still running",
                             "So friends can call you. Quit from the Parley tray icon, or open Parley and use its menu → Quit. (Settings → \"Keep running when closed\" turns this off.)",
-                        ));
-                        t.app.send_notification(Some("background"), &n);
+                            None,
+                            |_| {},
+                        );
                     }
                     return glib::Propagation::Stop;
                 }
@@ -541,6 +551,16 @@ impl App {
                     tray_common::TrayCmd::ToggleMute => t.toggle_mute(),
                     tray_common::TrayCmd::HangUp => t.hang_up(),
                     tray_common::TrayCmd::Quit => t.quit(),
+                    #[cfg(windows)]
+                    tray_common::TrayCmd::NotificationClicked => {
+                        match t.shown_notification.borrow_mut().take().and_then(|(_, a)| a) {
+                            Some((a, target)) => {
+                                let name = a.strip_prefix("app.").unwrap_or(&a);
+                                t.app.activate_action(name, target.as_ref());
+                            }
+                            None => t.present(),
+                        }
+                    }
                 }
             }
         });
@@ -1047,9 +1067,7 @@ impl App {
                 let _ = from;
                 self.toast(&format!("Missed call from {name}"));
                 if !self.window.is_active() && !self.dnd() {
-                    let n = gio::Notification::new("Missed call");
-                    n.set_body(Some(&format!("{name} tried to call you.")));
-                    self.app.send_notification(Some("missed"), &n);
+                    self.notify("missed", "Missed call", &format!("{name} tried to call you."), None, |_| {});
                 }
             }
             UiEvent::Notice(msg) => self.toast(&msg),
@@ -1369,10 +1387,13 @@ impl App {
         };
         let last = &fresh[fresh.len() - 1].text;
         let body: String = last.chars().take(140).collect();
-        let n = gio::Notification::new(&title);
-        n.set_body(Some(&body));
-        n.set_default_action_and_target_value("app.open-chat", Some(&conv.key().to_variant()));
-        self.app.send_notification(Some(&format!("chat-{}", conv.key())), &n);
+        self.notify(
+            &format!("chat-{}", conv.key()),
+            &title,
+            &body,
+            Some(("app.open-chat", Some(conv.key().to_variant()))),
+            |_| {},
+        );
     }
 
     /// Someone's Parley version, if they've told us (0.4.3 and later do).
@@ -1837,17 +1858,55 @@ impl App {
         self.set_ringer(Some(RingKind::Incoming));
 
         if !self.window.is_active() {
-            let n = gio::Notification::new(&heading);
-            n.set_body(Some(if group { "Group call — join if you like" } else { "Parley call" }));
-            n.set_priority(if group { gio::NotificationPriority::Normal } else { gio::NotificationPriority::Urgent });
-            n.add_button(if group { "Not now" } else { "Decline" }, "app.decline-call");
-            n.add_button(if group { "Join" } else { "Answer" }, "app.accept-call");
-            n.set_default_action("app.show");
-            self.app.send_notification(Some("incoming"), &n);
+            let body = if group { "Group call — join if you like" } else { "Parley call" };
+            self.notify("incoming", &heading, body, Some(("app.show", None)), |n| {
+                n.set_priority(if group { gio::NotificationPriority::Normal } else { gio::NotificationPriority::Urgent });
+                n.add_button(if group { "Not now" } else { "Decline" }, "app.decline-call");
+                n.add_button(if group { "Join" } else { "Answer" }, "app.accept-call");
+            });
         }
     }
 
+    /// Shows a desktop notification, replacing any earlier one with the same `id`.
+    /// Clicking it runs `action` (an app action and its target), or just opens Parley.
+    /// `extras` adds what only Linux shows (buttons, priority). On Windows it comes from
+    /// the tray icon, as long as there is one.
+    fn notify(
+        &self,
+        id: &str,
+        title: &str,
+        body: &str,
+        action: Option<(&str, Option<glib::Variant>)>,
+        extras: impl FnOnce(&gio::Notification),
+    ) {
+        #[cfg(windows)]
+        if let Some(t) = self.tray.borrow().as_ref() {
+            if t.notify(title, body) {
+                let action = action.map(|(a, target)| (a.to_string(), target));
+                *self.shown_notification.borrow_mut() = Some((id.to_string(), action));
+                return;
+            }
+        }
+        let n = gio::Notification::new(title);
+        n.set_body(Some(body));
+        if let Some((a, target)) = action {
+            n.set_default_action_and_target_value(a, target.as_ref());
+        }
+        extras(&n);
+        self.app.send_notification(Some(id), &n);
+    }
+
     fn withdraw_notification(&self) {
+        #[cfg(windows)]
+        {
+            let mut shown = self.shown_notification.borrow_mut();
+            if shown.as_ref().is_some_and(|(id, _)| id == "incoming") {
+                *shown = None;
+                if let Some(t) = self.tray.borrow().as_ref() {
+                    t.withdraw();
+                }
+            }
+        }
         self.app.withdraw_notification("incoming");
     }
 

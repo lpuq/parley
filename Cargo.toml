@@ -38,6 +38,8 @@ ksni = "0.3"
 # Windows: the notification-area (tray) icon.
 [target.'cfg(windows)'.dependencies]
 tray-icon = { version = "0.26.1", default-features = false }
+# (The version tray-icon uses.)
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [profile.release]
 opt-level = 3

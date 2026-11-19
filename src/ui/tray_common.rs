@@ -6,6 +6,9 @@ pub enum TrayCmd {
     ToggleMute,
     HangUp,
     Quit,
+    /// Windows: the notification shown from the tray icon was clicked.
+    #[cfg(windows)]
+    NotificationClicked,
 }
 
 /// Paints a red dot (with a thin white ring, so it stands out on any panel) in the top
