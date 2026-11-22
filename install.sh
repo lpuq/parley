@@ -193,7 +193,9 @@ flatpak build-init --arch="$ARCH" \
   "$APPDIR" "$APP_ID" org.gnome.Sdk org.gnome.Platform "$RUNTIME_BRANCH"
 
 say "Compiling Parley (first time ~5-10 min; later runs are quick)"
-flatpak build --share=network \
+RELEASE_ENV=()
+[[ $BUILD_ONLY == 1 ]] && RELEASE_ENV=(--env=PARLEY_RELEASE_BUILD=parley-official-build)
+flatpak build --share=network "${RELEASE_ENV[@]}" \
   --bind-mount=/run/parley-src="$PWD" --bind-mount=/run/parley-cache="$CACHE/$ARCH" \
   --env=PATH=/usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm22/bin:/app/bin:/usr/bin \
   --env=LIBCLANG_PATH=/usr/lib/sdk/llvm22/lib \

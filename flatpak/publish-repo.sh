@@ -35,6 +35,9 @@ for arch in $ARCHES; do
     *) app="${PARLEY_APPDIR_aarch64:-$CACHE/$arch/app}" ;;
   esac
   [[ -f "$app/metadata" ]] || { echo "No $arch build in $app" >&2; exit 1; }
+  # Without this, people on that architecture wouldn't hear about updates at startup.
+  grep -qa parley-official-build "$app/files/bin/parley" ||
+    { echo "The $arch build isn't a release build (install.sh --build-only, cross-bundle.sh --release)" >&2; exit 1; }
   flatpak build-export --arch="$arch" "${SIGN[@]}" "$SITE/repo" "$app" master >/dev/null
 done
 flatpak build-update-repo "${SIGN[@]}" --title=Parley --default-branch=master \

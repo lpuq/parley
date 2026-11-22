@@ -586,9 +586,12 @@ impl App {
         use crate::update::UpdateEvent as E;
         match ev {
             E::Available(version) => {
-                // (The portal repeats this; don't disturb an update under way.)
-                if self.update_stage.get() == UpdateStage::None {
+                if version.is_some() {
                     *self.update_version.borrow_mut() = version;
+                }
+                // (It can be reported twice; don't disturb an update under way, or bring
+                // the button back after checks were turned off.)
+                if self.update_stage.get() == UpdateStage::None && self.updater.borrow().is_some() {
                     self.set_update_stage(UpdateStage::Available, "Update");
                     self.update_btn.set_tooltip_text(Some("A new version of Parley is available"));
                 }

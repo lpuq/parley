@@ -2,7 +2,8 @@
 # Cross-build an x86_64 Parley Flatpak bundle on an aarch64 machine (no emulation):
 # the official Rust toolchain from the Flatpak SDK extension plus the host's clang
 # target x86_64, linking against the x86_64 GNOME SDK as sysroot.
-#   flatpak/cross-bundle.sh     -> parley-x86_64.flatpak
+#   flatpak/cross-bundle.sh             -> parley-x86_64.flatpak
+#   flatpak/cross-bundle.sh --release   the same, as a build for flatpak/publish-repo.sh
 # Build machine needs: flatpak, clang, lld, llvm (llvm-ar), pkgconf, curl.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -10,6 +11,7 @@ cd "$(dirname "$0")/.."
 APP_ID=io.github.parley.Parley
 TARGET=x86_64-unknown-linux-gnu
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/parley-build"
+[[ "${1:-}" == --release ]] && export PARLEY_RELEASE_BUILD=parley-official-build
 C="$CACHE/cross"
 mkdir -p "$C/cargo" "$C/target" "$C/dl"
 

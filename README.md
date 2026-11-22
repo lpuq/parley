@@ -165,9 +165,9 @@ cargo build --release --locked
 
 ### Updating
 
-Release bundles and the Windows zip update themselves, when you say so: a small
-**Update** button appears in the top bar when a new version is out, and **Restart to
-update** once it's installed. Nothing installs without that click, and Settings →
+Release bundles and the Windows zip update themselves, when you say so: when a new
+version is out, a small **Update** button appears in the top bar as Parley opens (or
+while it's running), and **Restart to update** once it's installed. Nothing installs without that click, and Settings →
 *Check for updates* turns it off. Updates are signed, and Parley refuses any that aren't:
 on Linux they come through Flatpak's own update portal, so Parley needs no extra sandbox
 permission. Moving to this from a version before it takes one last manual install.
@@ -308,7 +308,7 @@ automatically.
   and, by calling, learn your IP address, as with any peer-to-peer app. n0's relay and
   discovery servers see your IP address and public key, but not who you talk to inside
   a connection or what is said.
-- **Update checks:** to find new versions, Parley (or Flatpak, on Linux) asks GitHub, which
+- **Update checks:** to find new versions, Parley (and Flatpak, on Linux) asks GitHub, which
   sees your IP address like any website. No identity or contact data is sent. Settings →
   *Check for updates* turns this off.
 - **Online status:** only your contacts can see it. Invisible makes Parley stop
@@ -358,7 +358,7 @@ without them, people need one manual update to move to new keys.
 
 ```bash
 ./install.sh --build-only             # aarch64 (leaves this machine's install alone)
-flatpak/cross-bundle.sh               # x86_64
+flatpak/cross-bundle.sh --release     # x86_64
 flatpak/publish-repo.sh --push        # signs both into the hosted repo, rebuilds the bundles
 cargo run --release --example sign_release -- manifest VERSION Parley-VERSION-windows-x64.zip OUTDIR
 ```

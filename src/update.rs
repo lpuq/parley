@@ -3,6 +3,8 @@
 //!
 //! - **Flatpak** (from a release bundle, which follows Parley's hosted repo): Flatpak's own update portal does
 //!   the work, checks the repo's GPG signature, and needs no extra sandbox permission.
+//!   It only looks for updates every 30 minutes, so release builds also read the signed
+//!   manifest when Parley opens.
 //! - **Windows**: a manifest signed with the release key names the new zip and its
 //!   checksum. The zip is unpacked beside the install and swapped in after Parley exits.
 //! - **Built from source**: updates the way it was built (`git pull && ./install.sh`).
@@ -16,11 +18,15 @@ pub const MANIFEST_KEY: &str = match option_env!("PARLEY_UPDATE_KEY") {
     Some(k) => k,
     None => "788c14c04659e10d73dd847f58df7477635d99dc128906598cbdcf339e15c0fb",
 };
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 const MANIFEST_URL: &str = match option_env!("PARLEY_UPDATE_URL") {
     Some(u) => u,
     None => "https://github.com/lpuq/parley/releases/latest/download/latest.json",
 };
+/// Set by the release build scripts (and checked by `flatpak/publish-repo.sh`). A build
+/// from source can't take updates from the hosted repo, so it isn't offered them.
+#[cfg(target_os = "linux")]
+const RELEASE_BUILD: Option<&str> = option_env!("PARLEY_RELEASE_BUILD");
 
 /// What a release offers, signed by the release key.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -54,6 +60,37 @@ pub fn is_newer(new: &str, current: &str) -> bool {
         Some((p.next()??, p.next()??, p.next()??))
     };
     matches!((parse(new), parse(current)), (Some(n), Some(c)) if n > c)
+}
+
+/// The curl that ships with the system (Windows) or the Flatpak runtime.
+#[cfg(any(windows, target_os = "linux"))]
+fn curl() -> std::path::PathBuf {
+    #[cfg(windows)]
+    return windows::system_tool("curl.exe");
+    #[cfg(not(windows))]
+    std::path::PathBuf::from("/usr/bin/curl")
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn fetch(url: &str) -> Result<Vec<u8>> {
+    let mut command = std::process::Command::new(curl());
+    command.args(["-fsSL", "--max-time", "30", url]);
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut command, windows::CREATE_NO_WINDOW);
+    let out = command.output().context("running curl")?;
+    if !out.status.success() {
+        anyhow::bail!("couldn't reach the update server");
+    }
+    Ok(out.stdout)
+}
+
+/// The signed manifest, if it offers a newer version than this one.
+#[cfg(any(windows, target_os = "linux"))]
+fn check() -> Result<Option<Manifest>> {
+    let json = fetch(MANIFEST_URL)?;
+    let sig = fetch(&format!("{MANIFEST_URL}.sig"))?;
+    let m = verified_manifest(&json, &String::from_utf8_lossy(&sig), MANIFEST_KEY)?;
+    Ok(is_newer(&m.version, env!("CARGO_PKG_VERSION")).then_some(m))
 }
 
 pub enum UpdateEvent {
@@ -120,18 +157,21 @@ impl Updater {
 
 #[cfg(target_os = "linux")]
 mod flatpak {
-    use std::{cell::RefCell, collections::HashMap, rc::Rc};
+    use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::mpsc, time::Duration};
 
     use anyhow::{Result, anyhow};
     use gtk::{gio, glib, prelude::*};
 
-    use super::UpdateEvent;
+    use super::{RELEASE_BUILD, UpdateEvent, check};
 
     const BUS: &str = "org.freedesktop.portal.Flatpak";
     const PATH: &str = "/org/freedesktop/portal/Flatpak";
     const MONITOR: &str = "org.freedesktop.portal.Flatpak.UpdateMonitor";
     /// Start the newest installed version, not the one this process runs from.
     const SPAWN_LATEST_VERSION: &str = "uint32 2";
+    /// At login the network may not be up yet.
+    const STARTUP_TRIES: u32 = 4;
+    const STARTUP_RETRY: Duration = Duration::from_secs(45);
 
     /// The sandbox can't see which remote it came from, and needn't: the portal watches
     /// that remote. A build from `./install.sh` has a local one, so it's never offered
@@ -145,15 +185,20 @@ mod flatpak {
         conn: RefCell<Option<gio::DBusConnection>>,
         monitor: RefCell<Option<String>>,
         subscription: RefCell<Option<gio::SignalSubscription>>,
+        /// Dropping this ends the check at startup (Settings → Check for updates).
+        _stop: mpsc::Sender<()>,
     }
 
     impl Portal {
         pub fn start(tx: async_channel::Sender<UpdateEvent>) -> Rc<Self> {
-            let this = Rc::new(Self { tx, conn: Default::default(), monitor: Default::default(), subscription: Default::default() });
+            let (stop, stopped) = mpsc::channel();
+            let this = Rc::new(Self { tx, conn: Default::default(), monitor: Default::default(), subscription: Default::default(), _stop: stop });
             let t = this.clone();
             glib::spawn_future_local(async move {
-                if let Err(e) = t.connect().await {
-                    tracing::warn!("update checks unavailable: {e:#}");
+                // (Only offer an update once the portal is there to install it.)
+                match t.connect().await {
+                    Ok(()) => check_at_startup(t.tx.clone(), stopped),
+                    Err(e) => tracing::warn!("update checks unavailable: {e:#}"),
                 }
             });
             this
@@ -227,6 +272,28 @@ mod flatpak {
         }
     }
 
+    /// Release builds don't wait for the portal's first look, 30 minutes after opening.
+    fn check_at_startup(tx: async_channel::Sender<UpdateEvent>, stopped: mpsc::Receiver<()>) {
+        let Some(build) = RELEASE_BUILD else { return };
+        let _ = std::thread::Builder::new().name("update-check".into()).spawn(move || {
+            tracing::info!("checking for updates ({build})");
+            for _ in 0..STARTUP_TRIES {
+                match check() {
+                    Ok(found) => {
+                        if let (Some(m), Err(mpsc::TryRecvError::Empty)) = (found, stopped.try_recv()) {
+                            let _ = tx.send_blocking(UpdateEvent::Available(Some(m.version)));
+                        }
+                        return;
+                    }
+                    Err(e) => tracing::info!("update check: {e:#}"),
+                }
+                if !matches!(stopped.recv_timeout(STARTUP_RETRY), Err(mpsc::RecvTimeoutError::Timeout)) {
+                    return;
+                }
+            }
+        });
+    }
+
     impl Drop for Portal {
         fn drop(&mut self) {
             if let (Some(conn), Some(path)) = (self.conn.get_mut().take(), self.monitor.get_mut().take()) {
@@ -242,8 +309,8 @@ mod flatpak {
             "Progress" => match info.lookup::<u32>("status").ok().flatten() {
                 Some(0) => UpdateEvent::Progress(info.lookup::<u32>("progress").ok().flatten().unwrap_or(0)),
                 Some(2) => UpdateEvent::Ready,
-                // Already on the newest version.
-                Some(1) => return,
+                // Nothing to install: the repo hasn't caught up with the release yet.
+                Some(1) => UpdateEvent::Failed("this update isn't ready yet. Try again in a few minutes.".into()),
                 _ => UpdateEvent::Failed(
                     info.lookup::<String>("error_message").ok().flatten().unwrap_or_else(|| "the update failed".into()),
                 ),
@@ -269,14 +336,14 @@ mod windows {
     use gtk::glib;
     use sha2::{Digest, Sha256};
 
-    use super::{MANIFEST_KEY, MANIFEST_URL, Manifest, UpdateEvent, is_newer, verified_manifest};
+    use super::{Manifest, UpdateEvent, check, curl};
 
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const CHECK_EVERY: Duration = Duration::from_secs(6 * 3600);
     const RETRY_AFTER: Duration = Duration::from_secs(30 * 60);
 
     /// A tool that ships with Windows, by full path: Parley's own folder is on PATH.
-    fn system_tool(name: &str) -> PathBuf {
+    pub fn system_tool(name: &str) -> PathBuf {
         let root = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
         root.join("System32").join(name)
     }
@@ -293,25 +360,6 @@ mod windows {
         install.with_file_name(format!("{}.new", install.file_name().unwrap_or_default().to_string_lossy()))
     }
 
-    fn fetch(url: &str) -> Result<Vec<u8>> {
-        let out = Command::new(system_tool("curl.exe"))
-            .args(["-fsSL", "--max-time", "30", url])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .context("running curl")?;
-        if !out.status.success() {
-            bail!("couldn't reach the update server");
-        }
-        Ok(out.stdout)
-    }
-
-    fn check() -> Result<Option<Manifest>> {
-        let json = fetch(MANIFEST_URL)?;
-        let sig = fetch(&format!("{MANIFEST_URL}.sig"))?;
-        let m = verified_manifest(&json, &String::from_utf8_lossy(&sig), MANIFEST_KEY)?;
-        Ok(is_newer(&m.version, env!("CARGO_PKG_VERSION")).then_some(m))
-    }
-
     /// Downloads and checks the zip, and unpacks it beside the install.
     fn download(m: &Manifest, tx: &async_channel::Sender<UpdateEvent>) -> Result<()> {
         let install = install_dir().ok_or_else(|| anyhow!("can't tell where Parley is installed"))?;
@@ -319,7 +367,7 @@ mod windows {
         let _ = std::fs::remove_dir_all(&stage);
         std::fs::create_dir_all(&stage).with_context(|| format!("can't write next to {}", install.display()))?;
         let zip = stage.join("update.zip");
-        let mut curl = Command::new(system_tool("curl.exe"))
+        let mut curl = Command::new(curl())
             .args(["-fsSL", "--max-time", "1800", "-o"])
             .arg(&zip)
             .arg(&m.windows_x64.url)

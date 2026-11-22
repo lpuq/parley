@@ -31,6 +31,14 @@
     <content_attribute id="social-audio">intense</content_attribute>
   </content_rating>
   <releases>
+    <release version="0.12.2" date="2026-11-22">
+      <description>
+        <ul>
+          <li>On Linux, the Update button now appears as soon as Parley opens instead of up to 30 minutes later</li>
+          <li>A clear message if an update isn't quite ready yet, instead of the button getting stuck</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.12.1" date="2026-11-22">
       <description>
         <ul>
