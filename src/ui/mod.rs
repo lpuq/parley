@@ -62,6 +62,8 @@ struct Media {
     camera: Option<VideoSender>,
     screen: Option<VideoSender>,
     screen_stop: Option<tokio::sync::oneshot::Sender<()>>,
+    /// What's being shared: PipeWire node, its size, and whether frames go through GL.
+    screen_source: Option<(u32, Option<(i32, i32)>, bool)>,
     screen_audio: Option<ScreenAudioSender>,
     /// Waiting for PipeWire to announce the virtual sink before recording it.
     screen_audio_pending: bool,
@@ -69,6 +71,14 @@ struct Media {
     #[cfg(windows)]
     screen_monitor: Option<gst::Device>,
     remote: HashMap<(EndpointId, Track), VideoReceiver>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum UpdateStage {
+    None,
+    Available,
+    Installing,
+    Ready,
 }
 
 pub struct Incoming {
@@ -112,6 +122,13 @@ pub struct App {
 
     app_audio: Option<AppAudio>,
     pub playing_apps: RefCell<Vec<String>>,
+    /// When playback last had to be restarted after an error.
+    audio_restarted: Cell<Option<Instant>>,
+    /// The top bar's update button, and how far along an update is.
+    update_btn: gtk::Button,
+    update_stage: Cell<UpdateStage>,
+    update_version: RefCell<Option<String>>,
+    updater: RefCell<Option<crate::update::Updater>>,
     pub share_audio: RefCell<AudioShare>,
     hold: RefCell<Option<gio::ApplicationHoldGuard>>,
     #[cfg(target_os = "linux")]
@@ -240,6 +257,11 @@ impl App {
             ringer: RefCell::new(None),
             app_audio,
             playing_apps: RefCell::new(Vec::new()),
+            audio_restarted: Cell::new(None),
+            update_btn: gtk::Button::builder().css_classes(["pill", "update-btn"]).valign(gtk::Align::Center).visible(false).build(),
+            update_stage: Cell::new(UpdateStage::None),
+            update_version: RefCell::new(None),
+            updater: RefCell::new(None),
             share_audio: RefCell::new(AudioShare::Off),
             hold: RefCell::new(None),
             #[cfg(any(target_os = "linux", windows))]
@@ -290,6 +312,11 @@ impl App {
             });
         }
         content_header.pack_start(&sidebar_toggle);
+        {
+            let t = this.clone();
+            this.update_btn.connect_clicked(move |_| t.update_clicked());
+        }
+        content_header.pack_end(&this.update_btn);
         content_page.add_top_bar(&content_header);
         content_page.set_content(Some(&content));
 
@@ -480,6 +507,31 @@ impl App {
             });
         }
 
+        // Ctrl+C copies text selected across chat messages (labels don't take focus);
+        // Ctrl+V pastes into the message box even when it isn't focused.
+        {
+            let keys = gtk::EventControllerKey::new();
+            keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let w = Rc::downgrade(&this);
+            keys.connect_key_pressed(move |_, key, _, mods| {
+                let Some(t) = w.upgrade() else { return glib::Propagation::Proceed };
+                if !mods.contains(gtk::gdk::ModifierType::CONTROL_MASK) || t.window.visible_dialog().is_some() {
+                    return glib::Propagation::Proceed;
+                }
+                let handled = match key.to_lower() {
+                    gtk::gdk::Key::c => t.chat_view.copy_selection(),
+                    gtk::gdk::Key::v => t.chat_view.paste_to_composer(),
+                    _ => false,
+                };
+                if handled { glib::Propagation::Stop } else { glib::Propagation::Proceed }
+            });
+            this.window.add_controller(keys);
+        }
+
+        if this.store.borrow().settings.check_updates {
+            this.start_update_checks();
+        }
+
         // Diagnostics: route desktop audio into the share sink without a call/portal.
         if std::env::var_os("PARLEY_TEST_SHARE_AUDIO").is_some() {
             if let Some(a) = &this.app_audio {
@@ -491,6 +543,114 @@ impl App {
             glib::idle_add_local_once(move || dialogs::ask_name(&t, true));
         }
         this
+    }
+
+    // ------------------------------------------------------------ updates
+
+    pub fn start_update_checks(self: &Rc<Self>) {
+        if self.updater.borrow().is_some() {
+            return;
+        }
+        let (tx, rx) = async_channel::unbounded();
+        let Some(u) = crate::update::Updater::start(tx) else { return };
+        *self.updater.borrow_mut() = Some(u);
+        let t = self.clone();
+        glib::spawn_future_local(async move {
+            while let Ok(ev) = rx.recv().await {
+                t.on_update_event(ev);
+            }
+        });
+    }
+
+    /// Turned off in Settings. (An update already installed still applies on restart.)
+    pub fn stop_update_checks(&self) {
+        if self.update_stage.get() != UpdateStage::Ready {
+            self.updater.borrow_mut().take();
+            self.set_update_stage(UpdateStage::None, "");
+        }
+    }
+
+    fn set_update_stage(&self, stage: UpdateStage, label: &str) {
+        self.update_stage.set(stage);
+        self.update_btn.set_label(label);
+        self.update_btn.set_visible(stage != UpdateStage::None);
+        self.update_btn.set_sensitive(stage != UpdateStage::Installing);
+    }
+
+    fn on_update_event(self: &Rc<Self>, ev: crate::update::UpdateEvent) {
+        use crate::update::UpdateEvent as E;
+        match ev {
+            E::Available(version) => {
+                // (The portal repeats this; don't disturb an update under way.)
+                if self.update_stage.get() == UpdateStage::None {
+                    *self.update_version.borrow_mut() = version;
+                    self.set_update_stage(UpdateStage::Available, "Update");
+                    self.update_btn.set_tooltip_text(Some("A new version of Parley is available"));
+                }
+            }
+            E::Progress(p) => self.set_update_stage(UpdateStage::Installing, &format!("Updating {p}%")),
+            E::Ready => {
+                self.set_update_stage(UpdateStage::Ready, "Restart to update");
+                self.update_btn.set_tooltip_text(Some("The new version starts when Parley restarts"));
+            }
+            E::Failed(msg) => {
+                tracing::warn!("update failed: {msg}");
+                self.toast(&format!("Couldn't update Parley: {msg}"));
+                self.set_update_stage(UpdateStage::Available, "Update");
+            }
+        }
+    }
+
+    fn update_clicked(self: &Rc<Self>) {
+        match self.update_stage.get() {
+            UpdateStage::Available => {
+                let heading = match &*self.update_version.borrow() {
+                    Some(v) => format!("Update to Parley {v}?"),
+                    None => "Update Parley?".to_string(),
+                };
+                let d = adw::AlertDialog::new(Some(&heading), Some("It installs in the background, so you can keep using Parley. Your friends, chats and settings stay as they are."));
+                d.add_response("later", "Not now");
+                d.add_response("update", "Update");
+                d.set_response_appearance("update", adw::ResponseAppearance::Suggested);
+                d.set_default_response(Some("update"));
+                d.set_close_response("later");
+                let t = self.clone();
+                d.connect_response(None, move |_, r| {
+                    if r == "update" {
+                        t.set_update_stage(UpdateStage::Installing, "Updating…");
+                        if let Some(u) = t.updater.borrow().as_ref() {
+                            u.install();
+                        }
+                    }
+                });
+                d.present(Some(&self.window));
+            }
+            UpdateStage::Ready if self.room.get().is_some() => {
+                let d = adw::AlertDialog::new(Some("Restart Parley now?"), Some("This ends your call. You can also finish it first and restart afterwards."));
+                d.add_response("later", "Not now");
+                d.add_response("restart", "End call and restart");
+                d.set_response_appearance("restart", adw::ResponseAppearance::Destructive);
+                d.set_close_response("later");
+                let t = self.clone();
+                d.connect_response(None, move |_, r| {
+                    if r == "restart" {
+                        t.restart_into_update();
+                    }
+                });
+                d.present(Some(&self.window));
+            }
+            UpdateStage::Ready => self.restart_into_update(),
+            _ => {}
+        }
+    }
+
+    fn restart_into_update(self: &Rc<Self>) {
+        let res = self.updater.borrow().as_ref().map(|u| u.relaunch_after_quit());
+        match res {
+            Some(Ok(())) => self.quit(),
+            Some(Err(e)) => self.toast(&format!("Couldn't restart Parley: {e:#}. Quit and open it again to finish updating.")),
+            None => {}
+        }
     }
 
     /// Leaves any call cleanly (so friends see "left", not a dropout), then exits.
@@ -820,7 +980,6 @@ impl App {
         }
         self.app.set_accels_for_action("app.quit", &["<Ctrl>q"]);
         self.app.set_accels_for_action("app.fullscreen", &["F11"]);
-        self.app.set_accels_for_action("app.add-contact", &["<Ctrl>v"]);
     }
 
     // ------------------------------------------------------------ calling
@@ -2022,7 +2181,21 @@ impl App {
         let settings = self.store.borrow().settings.clone();
         let speakers = devices::speakers();
         let spk = devices::find(&speakers, &settings.speaker).map(|d| d.device.clone());
-        let ready = match AudioOut::start(spk.as_ref(), self.on_media_error()) {
+        // Any error stops the playback pipeline, and with it everyone's sound: bring it
+        // back rather than leaving people to rejoin the call.
+        let weak = Rc::downgrade(self);
+        let on_error = move |msg: String| {
+            let Some(t) = weak.upgrade() else { return };
+            let recently = t.audio_restarted.get().is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(5));
+            if recently {
+                t.toast(&msg);
+                return;
+            }
+            tracing::warn!("{msg}: restarting audio output");
+            t.audio_restarted.set(Some(Instant::now()));
+            glib::idle_add_local_once(move || t.restart_audio_output());
+        };
+        let ready = match AudioOut::start(spk.as_ref(), on_error) {
             Ok(out) => {
                 out.set_deafened(self.state.get().deafened);
                 let r = out.ready.clone();
@@ -2086,16 +2259,36 @@ impl App {
         gpu_import: bool,
     ) -> anyhow::Result<()> {
         let settings = self.store.borrow().settings.clone();
-        let spare = RefCell::new(fd.as_ref().and_then(|f| f.try_clone().ok()));
+        let on_error = self.screen_error_handler(node_id, size, gpu_import);
+        // The old capture and encoder go first: the new encoder takes over keyframe
+        // requests, which the old one would clear when dropped.
+        self.media.borrow_mut().screen = None;
+        #[cfg(windows)]
+        let s = {
+            let _ = (fd, node_id, size);
+            let monitor = self.media.borrow().screen_monitor.clone().ok_or_else(|| anyhow::anyhow!("no screen chosen"))?;
+            VideoSender::monitor(self.hub.clone(), &monitor, settings.screen_params(), settings.hw_encode, on_error)?
+        };
+        #[cfg(not(windows))]
+        let s = VideoSender::screen(self.hub.clone(), fd, node_id, size, settings.screen_params(), settings.hw_encode, gpu_import, on_error)?;
+        let mut m = self.media.borrow_mut();
+        m.screen = Some(s);
+        m.screen_source = Some((node_id, size, gpu_import));
+        Ok(())
+    }
+
+    fn screen_error_handler(self: &Rc<Self>, node_id: u32, size: Option<(i32, i32)>, gpu_import: bool) -> impl Fn(String) + 'static {
         let weak = Rc::downgrade(self);
-        let on_error = move |msg: String| {
+        move |msg: String| {
             let Some(t) = weak.upgrade() else { return };
-            if !t.state.get().screen {
+            // (Ended, or already moved on to shared memory.)
+            if !t.state.get().screen || t.media.borrow().screen_source.is_some_and(|s| s.2 != gpu_import) {
                 return;
             }
             if gpu_import {
                 tracing::warn!("screen: GPU frame import failed ({msg}); capturing through shared memory instead");
-                let fd = spare.borrow_mut().take();
+                let fd = t.media.borrow().screen.as_ref().and_then(|s| s.capture_fd());
+                t.media.borrow_mut().screen_source = Some((node_id, size, false));
                 // Replace the failed capture after this error callback returns.
                 glib::idle_add_local_once(move || {
                     if let Err(e) = t.start_screen_capture(fd, node_id, size, false) {
@@ -2107,17 +2300,26 @@ impl App {
             }
             t.toast(&format!("Screen sharing stopped — {msg}"));
             t.stop_screen_share();
-        };
-        #[cfg(windows)]
-        let s = {
-            let _ = (fd, node_id, size);
-            let monitor = self.media.borrow().screen_monitor.clone().ok_or_else(|| anyhow::anyhow!("no screen chosen"))?;
-            VideoSender::monitor(self.hub.clone(), &monitor, settings.screen_params(), settings.hw_encode, on_error)?
-        };
-        #[cfg(not(windows))]
-        let s = VideoSender::screen(self.hub.clone(), fd, node_id, size, settings.screen_params(), settings.hw_encode, gpu_import, on_error)?;
-        self.media.borrow_mut().screen = Some(s);
-        Ok(())
+        }
+    }
+
+    /// New resolution or frame rate for the running share. The capture and the call
+    /// state carry on, so nobody's view of the stream changes but its quality.
+    pub fn apply_stream_quality(self: &Rc<Self>) {
+        let Some((node_id, size, gpu_import)) = self.media.borrow().screen_source else { return };
+        let Some(old) = self.media.borrow_mut().screen.take() else { return };
+        let settings = self.store.borrow().settings.clone();
+        let on_error = self.screen_error_handler(node_id, size, gpu_import);
+        match old.with_quality(settings.screen_params(), settings.hw_encode, on_error) {
+            Ok(s) => {
+                self.media.borrow_mut().screen = Some(s);
+                self.call_view.rebuild(self);
+            }
+            Err(e) => {
+                self.toast(&format!("Screen sharing stopped — {e:#}"));
+                self.stop_screen_share();
+            }
+        }
     }
 
     /// Windows: which screen to share (asked only when there's more than one).
@@ -2484,13 +2686,28 @@ impl App {
                 let _ = pick.stop.send(());
                 return;
             }
+            // Already sharing: this swaps what's shared. Friends' view of the stream carries on.
+            let was_sharing = t.state.get().screen;
+            let old_stop = t.media.borrow_mut().screen_stop.take();
             // (No GPU import to fall back from on Windows.)
-            if let Err(e) = t.start_screen_capture(pick.fd, pick.node_id, pick.size, cfg!(not(windows))) {
+            let started = t.start_screen_capture(pick.fd, pick.node_id, pick.size, cfg!(not(windows)));
+            if let Some(stop) = old_stop {
+                let _ = stop.send(());
+            }
+            if let Err(e) = started {
                 let _ = pick.stop.send(());
                 t.toast(&format!("Screen share failed: {e:#}"));
+                if was_sharing {
+                    t.stop_screen_share();
+                }
                 return;
             }
             t.media.borrow_mut().screen_stop = Some(pick.stop);
+            if was_sharing {
+                t.set_share_audio(audio);
+                t.call_view.rebuild(&t);
+                return;
+            }
             let mut st = t.state.get();
             st.screen = true;
             *t.share_audio.borrow_mut() = audio.clone();

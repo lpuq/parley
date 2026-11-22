@@ -68,6 +68,27 @@ impl Playout {
             }
             None => off,
         };
+        let mut floor = floor;
+        // The path got slower and stayed slower (a congested link, usually while people
+        // stream): if even the fastest packets of the last second are later than the
+        // buffer can hold, every packet would be dropped as late, silently, until the
+        // creep above caught up minutes later. Move the schedule to where they arrive.
+        if arrival.saturating_sub(self.adjusted_at) > 1_000_000_000 && self.delays.len() >= 50 {
+            let recent = self
+                .delays
+                .iter()
+                .rev()
+                .take_while(|d| arrival.saturating_sub(d.0) < 1_000_000_000)
+                .map(|d| d.1)
+                .min()
+                .unwrap_or(0)
+                .min(((off - floor) / 1_000_000).max(0) as u32);
+            if recent + 30 > MAX_JITTER_MS {
+                tracing::info!("audio arrives {recent} ms later than it did: moving its playback schedule");
+                floor += recent as i64 * 1_000_000;
+                self.delays.clear();
+            }
+        }
         self.floor = Some(floor);
         self.floor_at = arrival;
         let delay_ms = ((off - floor) / 1_000_000).max(0) as u32;
@@ -572,4 +593,42 @@ fn h264_decoder() -> Result<gst::Element> {
         }
     }
     Err(anyhow::anyhow!("No H.264 decoder found. Install gstreamer1-plugin-libav (or the Flatpak codecs extension)."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 20 ms packets; returns how far behind schedule the last one plays (ms).
+    fn run(p: &mut Playout, from: u32, to: u32, lag_ms: u64) -> i64 {
+        let mut behind = 0;
+        for n in from..to {
+            let sent = n as u64 * 20_000_000;
+            let arrival = sent + lag_ms * 1_000_000;
+            let (at, _) = p.schedule(n * 960, arrival, JITTER_MS);
+            behind = (arrival as i64 - at as i64) / 1_000_000;
+        }
+        behind
+    }
+
+    #[test]
+    fn playout_follows_a_lasting_delay() {
+        let mut p = Playout::default();
+        assert_eq!(run(&mut p, 0, 250, 0), 0);
+        // The link slows by 800 ms and stays that way: audio must come back, within the
+        // jitter buffer's reach, rather than staying late (silent).
+        let behind = run(&mut p, 250, 500, 800);
+        assert!(behind < MAX_JITTER_MS as i64, "still {behind} ms late");
+    }
+
+    #[test]
+    fn playout_rides_out_short_jitter() {
+        let mut p = Playout::default();
+        run(&mut p, 0, 250, 0);
+        let before = p.floor;
+        // A brief 300 ms bump is the jitter buffer's job, not a new schedule.
+        run(&mut p, 250, 260, 300);
+        run(&mut p, 260, 400, 0);
+        assert!(p.floor.unwrap() - before.unwrap() < 200_000_000);
+    }
 }

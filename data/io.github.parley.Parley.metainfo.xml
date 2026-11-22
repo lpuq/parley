@@ -31,6 +31,18 @@
     <content_attribute id="social-audio">intense</content_attribute>
   </content_rating>
   <releases>
+    <release version="0.12.0" date="2026-11-22">
+      <description>
+        <ul>
+          <li>In-app updates: an Update button appears when a new version is out, and nothing installs until you agree</li>
+          <li>Change stream quality, sound or what you're sharing mid-stream; friends watching stay on your stream</li>
+          <li>Shared windows no longer freeze after going fullscreen or being resized</li>
+          <li>Sound recovers by itself on a congested connection or after a playback error, without rejoining</li>
+          <li>"Only selected apps" now shows its app list and can't be left empty</li>
+          <li>Select text across chat messages, in standard blue; Ctrl+V pastes instead of opening the invite window</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.11.0" date="2026-11-18">
       <description>
         <ul>

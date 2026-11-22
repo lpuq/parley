@@ -164,6 +164,8 @@ if [[ $USE_PREBUILT == 1 ]]; then
   need org.freedesktop.Platform.codecs-extra//$FDO_BRANCH-extra
   say "Installing prebuilt parley-$ARCH.flatpak"
   flatpak install --user -y --noninteractive --reinstall "parley-$ARCH.flatpak"
+  # Parley asks before it updates, so Flatpak needn't ask a second time.
+  flatpak permission-set flatpak updates "$APP_ID" yes 2>/dev/null || true
   finish
 fi
 

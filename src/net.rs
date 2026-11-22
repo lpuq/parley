@@ -128,6 +128,9 @@ pub async fn start(
         .max_concurrent_uni_streams(128u32.into())
         .stream_receive_window((8u32 * 1024 * 1024).into())
         .send_window(32 * 1024 * 1024)
+        // Audio datagrams wait here when the link is full. The default (1 MB) is most of
+        // a minute of sound: keep well under a second, so the oldest go, not the voice.
+        .datagram_send_buffer_size(12 * 1024)
         .build();
     let ep = Endpoint::builder(presets::N0)
         .secret_key(secret)

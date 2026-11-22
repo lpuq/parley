@@ -7,3 +7,4 @@ pub mod net;
 pub mod proto;
 pub mod store;
 pub mod ui;
+pub mod update;

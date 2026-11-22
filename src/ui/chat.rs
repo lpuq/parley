@@ -23,6 +23,55 @@ const GROUP_MS: u64 = 7 * 60 * 1000;
 /// How long a message must wait undelivered before we explain why.
 pub const WAIT_NOTICE_MS: u64 = 5000;
 
+/// A place in the conversation's text: which message, and how many characters in.
+type Spot = (usize, i32);
+
+/// The word (or run of spaces or punctuation) around a character offset, as offsets.
+fn word_at(text: &str, at: i32) -> (i32, i32) {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return (0, 0);
+    }
+    let at = (at.max(0) as usize).min(chars.len() - 1);
+    let kind = |c: char| if c.is_alphanumeric() || c == '_' { 0 } else if c.is_whitespace() { 1 } else { 2 };
+    let k = kind(chars[at]);
+    let start = chars[..at].iter().rposition(|c| kind(*c) != k).map_or(0, |p| p + 1);
+    let end = chars[at..].iter().position(|c| kind(*c) != k).map_or(chars.len(), |p| at + p);
+    (start as i32, end as i32)
+}
+
+/// The part of message `i` a selection from `from` to `to` covers, as character offsets.
+fn range_in(labels: &[gtk::Label], i: usize, from: Spot, to: Spot) -> Option<(i32, i32)> {
+    if i < from.0 || i > to.0 {
+        return None;
+    }
+    let start = if i == from.0 { from.1 } else { 0 };
+    let end = if i == to.0 { to.1 } else { labels[i].text().chars().count() as i32 };
+    (start < end).then_some((start, end))
+}
+
+/// Highlights part of a message in the standard selection blue. (GTK lets only one label
+/// at a time hold a real selection, so a selection across messages is drawn this way.)
+fn highlight(label: &gtk::Label, range: Option<(i32, i32)>) {
+    let Some((start, end)) = range else {
+        label.set_attributes(None);
+        return;
+    };
+    let text = label.text();
+    let byte = |chars: i32| text.char_indices().nth(chars as usize).map_or(text.len(), |(b, _)| b) as u32;
+    let (from, to) = (byte(start), byte(end));
+    let attrs = gtk::pango::AttrList::new();
+    let mut bg = gtk::pango::AttrColor::new_background(0x3535, 0x8484, 0xe4e4);
+    bg.set_start_index(from);
+    bg.set_end_index(to);
+    attrs.insert(bg);
+    let mut fg = gtk::pango::AttrColor::new_foreground(0xffff, 0xffff, 0xffff);
+    fg.set_start_index(from);
+    fg.set_end_index(to);
+    attrs.insert(fg);
+    label.set_attributes(Some(&attrs));
+}
+
 pub struct ChatView {
     app: Weak<App>,
     pub root: gtk::Box,
@@ -44,6 +93,10 @@ pub struct ChatView {
     last: Cell<Option<(EndpointId, u64, i32)>>,
     /// Message id → its text label (to un-grey once delivered).
     labels: RefCell<HashMap<String, gtk::Label>>,
+    /// The message labels in order, for selecting across them.
+    texts: RefCell<Vec<gtk::Label>>,
+    /// The current selection across messages, as dragged (start, end).
+    selection: Cell<Option<(Spot, Spot)>>,
 }
 
 impl ChatView {
@@ -133,7 +186,10 @@ impl ChatView {
             panel: Cell::new(false),
             last: Cell::new(None),
             labels: RefCell::new(HashMap::new()),
+            texts: RefCell::default(),
+            selection: Cell::new(None),
         });
+        Self::add_selection_drag(&this);
 
         // Enter sends; Shift+Enter is a new line.
         let keys = gtk::EventControllerKey::new();
@@ -194,6 +250,232 @@ impl ChatView {
         this
     }
 
+    /// Left-button selection for the whole conversation (each message is its own label,
+    /// and a label can only select within itself): drag across messages, double-click
+    /// for a word, triple-click for a message. Links, buttons and the right-click menu
+    /// are left alone.
+    fn add_selection_drag(this: &Rc<Self>) {
+        let click = gtk::GestureClick::new();
+        click.set_button(gtk::gdk::BUTTON_PRIMARY);
+        click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let drag = gtk::GestureDrag::new();
+        drag.set_button(gtk::gdk::BUTTON_PRIMARY);
+        drag.set_propagation_phase(gtk::PropagationPhase::Capture);
+        drag.group_with(&click);
+        // Where the selection began, and the pointer now (in the scroller, which stays
+        // put while the list scrolls under it).
+        let anchor: Rc<Cell<Option<Spot>>> = Rc::default();
+        let pointer: Rc<Cell<(f64, f64)>> = Rc::default();
+        let dragging: Rc<Cell<bool>> = Rc::default();
+
+        let (w, a) = (Rc::downgrade(this), anchor.clone());
+        click.connect_pressed(move |g, n_press, x, y| {
+            let Some(v) = w.upgrade() else { return };
+            if !v.owns_press(g, x, y) {
+                a.set(None);
+                g.set_state(gtk::EventSequenceState::Denied);
+                return;
+            }
+            g.set_state(gtk::EventSequenceState::Claimed);
+            v.clear_selection();
+            let spot = v.spot_at(x, y);
+            a.set(spot);
+            let Some((i, at)) = spot else { return };
+            let text = v.texts.borrow()[i].text();
+            let (start, end) = match n_press {
+                1 => return,
+                2 => word_at(&text, at),
+                _ => (0, text.chars().count() as i32),
+            };
+            a.set(Some((i, start)));
+            v.select((i, start), (i, end));
+        });
+
+        let (w, a, p, d) = (Rc::downgrade(this), anchor.clone(), pointer.clone(), dragging.clone());
+        drag.connect_drag_update(move |g, dx, dy| {
+            let Some(v) = w.upgrade() else { return };
+            let Some((x, y)) = g.start_point() else { return };
+            p.set((x + dx, y + dy));
+            if !d.get() {
+                if dx.hypot(dy) < 3.0 || a.get().is_none() {
+                    return;
+                }
+                d.set(true);
+                // Past the top or bottom edge, the list scrolls along.
+                let (w, a, p, d) = (w.clone(), a.clone(), p.clone(), d.clone());
+                glib::timeout_add_local(std::time::Duration::from_millis(40), move || {
+                    let Some(v) = w.upgrade().filter(|_| d.get()) else { return glib::ControlFlow::Break };
+                    let (x, y) = p.get();
+                    let h = v.scroller.height() as f64;
+                    let step = if y < 24.0 { (y - 24.0).max(-60.0) } else if y > h - 24.0 { (y - h + 24.0).min(60.0) } else { 0.0 };
+                    if step != 0.0 {
+                        let adj = v.scroller.vadjustment();
+                        adj.set_value(adj.value() + step);
+                        if let (Some(from), Some(to)) = (a.get(), v.spot_at(x, y)) {
+                            v.select(from, to);
+                        }
+                    }
+                    glib::ControlFlow::Continue
+                });
+            }
+            if let (Some(from), Some(to)) = (a.get(), v.spot_at(x + dx, y + dy)) {
+                v.select(from, to);
+            }
+        });
+        // As with any selected text on Linux, it can be middle-click pasted.
+        let (d, w) = (dragging, Rc::downgrade(this));
+        drag.connect_drag_end(move |_, _, _| {
+            d.set(false);
+            if let Some(v) = w.upgrade() {
+                if let Some(text) = v.selected_text() {
+                    v.root.primary_clipboard().set_text(&text);
+                }
+            }
+        });
+        this.scroller.add_controller(click);
+        this.scroller.add_controller(drag);
+
+        // Right-click on a selection: Copy. (Otherwise the labels' own menu, for links.)
+        let menu = gtk::Popover::new();
+        menu.set_has_arrow(false);
+        menu.set_halign(gtk::Align::Start);
+        menu.set_parent(&this.scroller);
+        let copy = gtk::Button::builder().label("Copy").css_classes(["flat"]).build();
+        menu.set_child(Some(&copy));
+        let (w, m) = (Rc::downgrade(this), menu.clone());
+        copy.connect_clicked(move |_| {
+            m.popdown();
+            if let Some(v) = w.upgrade() {
+                v.copy_selection();
+            }
+        });
+        let right = gtk::GestureClick::new();
+        right.set_button(gtk::gdk::BUTTON_SECONDARY);
+        right.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let w = Rc::downgrade(this);
+        right.connect_pressed(move |g, _, x, y| {
+            let Some(v) = w.upgrade() else { return };
+            if v.selected_text().is_none() {
+                return;
+            }
+            g.set_state(gtk::EventSequenceState::Claimed);
+            menu.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            menu.popup();
+        });
+        this.scroller.add_controller(right);
+    }
+
+    /// Whether a left press in the scroller is ours to select with: not on a scrollbar,
+    /// a button or a link, and not a finger (that scrolls).
+    fn owns_press(&self, g: &gtk::GestureClick, x: f64, y: f64) -> bool {
+        if g.current_event_device().is_some_and(|d| d.source() == gtk::gdk::InputSource::Touchscreen) {
+            return false;
+        }
+        let mut hit = self.scroller.pick(x, y, gtk::PickFlags::DEFAULT);
+        while let Some(h) = hit {
+            if h == *self.scroller.upcast_ref::<gtk::Widget>() {
+                break;
+            }
+            if h.is::<gtk::Scrollbar>() || h.is::<gtk::Button>() {
+                return false;
+            }
+            if h.downcast_ref::<gtk::Label>().is_some_and(|l| l.current_uri().is_some()) {
+                return false;
+            }
+            hit = h.parent();
+        }
+        true
+    }
+
+    /// The text position under a point in the scroller: the nearest message above or
+    /// below when it's between messages.
+    fn spot_at(&self, x: f64, y: f64) -> Option<Spot> {
+        let labels = self.texts.borrow();
+        let point = self.scroller.compute_point(&self.list, &gtk::graphene::Point::new(x as f32, y as f32))?;
+        for (i, l) in labels.iter().enumerate() {
+            let b = l.compute_bounds(&self.list)?;
+            if point.y() > b.y() + b.height() {
+                continue;
+            }
+            if point.y() < b.y() {
+                return Some((i, 0));
+            }
+            let q = self.list.compute_point(l, &point)?;
+            let (ox, oy) = l.layout_offsets();
+            let layout = l.layout();
+            let scale = gtk::pango::SCALE;
+            let (_, index, trailing) = layout.xy_to_index((q.x() as i32 - ox) * scale, (q.y() as i32 - oy) * scale);
+            let text = layout.text();
+            let at = (index.max(0) as usize).min(text.len());
+            return Some((i, text[..at].chars().count() as i32 + trailing));
+        }
+        let last = labels.len().checked_sub(1)?;
+        Some((last, labels[last].text().chars().count() as i32))
+    }
+
+    fn select(&self, a: Spot, b: Spot) {
+        let (from, to) = if a <= b { (a, b) } else { (b, a) };
+        let labels = self.texts.borrow();
+        let old = self.selection.get();
+        // Only the messages in the old or new selection can change.
+        let (first, last) = old.map_or((from.0, to.0), |(f, t)| (f.0.min(from.0), t.0.max(to.0)));
+        for i in first..=last.min(labels.len().saturating_sub(1)) {
+            let was = old.and_then(|(f, t)| range_in(&labels, i, f, t));
+            let now = range_in(&labels, i, from, to);
+            if was != now {
+                highlight(&labels[i], now);
+            }
+        }
+        self.selection.set(Some((from, to)));
+    }
+
+    fn clear_selection(&self) {
+        if let Some((from, to)) = self.selection.take() {
+            let labels = self.texts.borrow();
+            for l in labels.iter().take(to.0 + 1).skip(from.0) {
+                highlight(l, None);
+            }
+        }
+    }
+
+    /// What's selected, one message per line.
+    fn selected_text(&self) -> Option<String> {
+        let (from, to) = self.selection.get()?;
+        let labels = self.texts.borrow();
+        let parts: Vec<String> = (from.0..=to.0.min(labels.len().checked_sub(1)?))
+            .filter_map(|i| {
+                let (start, end) = range_in(&labels, i, from, to)?;
+                Some(labels[i].text().chars().skip(start as usize).take((end - start) as usize).collect())
+            })
+            .collect();
+        (!parts.is_empty()).then(|| parts.join("\n"))
+    }
+
+    /// Ctrl+C: copies what's selected in the conversation. False if that's nothing, or
+    /// the text being typed has a selection of its own.
+    pub fn copy_selection(&self) -> bool {
+        if !self.root.is_mapped() || (self.input.has_focus() && self.input.buffer().has_selection()) {
+            return false;
+        }
+        let Some(text) = self.selected_text() else { return false };
+        self.root.clipboard().set_text(&text);
+        true
+    }
+
+    /// Ctrl+V with no text field focused: pastes into the message box.
+    pub fn paste_to_composer(&self) -> bool {
+        if !self.input.is_mapped() || self.conv.get().is_none() {
+            return false;
+        }
+        let typing = self.root.root().and_then(|r| r.focus()).is_some_and(|f| f.is::<gtk::TextView>() || f.is::<gtk::Editable>());
+        if typing {
+            return false;
+        }
+        self.input.grab_focus();
+        self.input.emit_paste_clipboard();
+        true
+    }
+
     pub fn conv(&self) -> Option<Conv> {
         self.conv.get()
     }
@@ -206,6 +488,8 @@ impl ChatView {
             self.list.remove(&c);
         }
         self.labels.borrow_mut().clear();
+        self.texts.borrow_mut().clear();
+        self.selection.set(None);
         self.last.set(None);
     }
 
@@ -227,6 +511,8 @@ impl ChatView {
             self.list.remove(&c);
         }
         self.labels.borrow_mut().clear();
+        self.texts.borrow_mut().clear();
+        self.selection.set(None);
         self.last.set(None);
         let msgs = app.chat.borrow_mut().messages(&conv).clone();
         let pending = app.chat.borrow().pending_in(&conv);
@@ -403,6 +689,7 @@ impl ChatView {
             set_class(text.upcast_ref(), "refused", refused);
         }
         self.labels.borrow_mut().insert(m.id.clone(), text.clone());
+        self.texts.borrow_mut().push(text.clone());
 
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 16);
         row.add_css_class("chat-msg");

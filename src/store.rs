@@ -417,6 +417,8 @@ pub struct Settings {
     pub camera_kbps: u32,
     pub hw_encode: bool,
     pub run_in_background: bool,
+    /// Show a button in the top bar when a new version is out.
+    pub check_updates: bool,
     pub allow_unknown_callers: bool,
     /// Remembered for the Flatpak case, where the portal owns the real setting.
     pub autostart: bool,
@@ -492,6 +494,7 @@ impl Default for Settings {
             camera_kbps: 1500,
             hw_encode: true,
             run_in_background: true,
+            check_updates: true,
             allow_unknown_callers: true,
             autostart: false,
             background_hint_shown: false,

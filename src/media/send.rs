@@ -1,6 +1,8 @@
 //! Capture → encode → [`Hub`] pipelines.
 
 use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
     sync::{Arc, atomic::Ordering},
     time::Instant,
 };
@@ -642,6 +644,185 @@ pub struct VideoSender {
     pub preview: gtk::gdk::Paintable,
     /// Stops the screen frame repeater thread.
     stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Screen shares: what's being captured (it outlives a change of encoder settings).
+    capture: Option<ScreenCapture>,
+}
+
+/// The newest captured frame, and how many have been captured.
+type LatestFrame = Arc<std::sync::Mutex<(Option<gst::Sample>, u64)>>;
+
+/// With no new frame for this long, capture is reconnected, then less and less often
+/// while the picture really is still.
+const CAPTURE_STALL: std::time::Duration = std::time::Duration::from_millis(1500);
+const CAPTURE_STALL_MAX: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// Captures the shared screen or window into `latest`, in a pipeline of its own.
+///
+/// pipewiresrc can stop for good when a stream changes size (a shared window going
+/// fullscreen and back), and an idle compositor sends nothing either, so the two look
+/// alike from here. So capture that goes quiet is simply reconnected: it costs nothing
+/// when the picture is still, and viewers keep the last frame meanwhile.
+pub struct ScreenCapture {
+    inner: Rc<CaptureInner>,
+}
+
+struct CaptureInner {
+    latest: LatestFrame,
+    build: Box<dyn Fn(&LatestFrame) -> Result<gst::Pipeline>>,
+    on_error: Rc<dyn Fn(String)>,
+    run: RefCell<Option<Running>>,
+    /// Counts connections; errors from an earlier one no longer matter.
+    generation: Cell<u32>,
+    /// The portal's PipeWire connection.
+    fd: RefCell<Option<super::ScreenFd>>,
+}
+
+impl ScreenCapture {
+    fn start(
+        build: impl Fn(&LatestFrame) -> Result<gst::Pipeline> + 'static,
+        fd: Option<super::ScreenFd>,
+        reconnect_when_quiet: bool,
+        on_error: Rc<dyn Fn(String)>,
+    ) -> Result<Self> {
+        let inner = Rc::new(CaptureInner {
+            latest: Default::default(),
+            build: Box::new(build),
+            on_error,
+            run: Default::default(),
+            generation: Cell::new(0),
+            fd: RefCell::new(fd),
+        });
+        inner.connect()?;
+        if reconnect_when_quiet {
+            CaptureInner::watch(&inner);
+        }
+        Ok(Self { inner })
+    }
+
+    /// The size frames are arriving at, if any have.
+    fn frame_size(&self) -> Option<(i32, i32)> {
+        let g = self.inner.latest.lock().unwrap();
+        let caps = g.0.as_ref()?.caps_owned()?;
+        let st = caps.structure(0)?;
+        Some((st.get("width").ok()?, st.get("height").ok()?))
+    }
+}
+
+impl Drop for ScreenCapture {
+    fn drop(&mut self) {
+        // The portal's connection must outlive the pipeline.
+        if let Some(mut run) = self.inner.run.borrow_mut().take() {
+            if let Some(fd) = self.inner.fd.borrow_mut().take() {
+                run.keep_alive(fd);
+            }
+        }
+    }
+}
+
+impl CaptureInner {
+    fn connect(self: &Rc<Self>) -> Result<()> {
+        let generation = self.generation.get() + 1;
+        self.generation.set(generation);
+        let pipeline = (self.build)(&self.latest)?;
+        let weak = Rc::downgrade(self);
+        let run = Running::start(pipeline, "Screen share", move |msg| {
+            if let Some(c) = weak.upgrade().filter(|c| c.generation.get() == generation) {
+                (c.on_error)(msg);
+            }
+        })?;
+        *self.run.borrow_mut() = Some(run);
+        Ok(())
+    }
+
+    fn watch(this: &Rc<Self>) {
+        let weak = Rc::downgrade(this);
+        let (mut seen, mut last_new, mut wait) = (0u64, Instant::now(), CAPTURE_STALL);
+        let (mut logged, mut logged_at) = (0u64, Instant::now());
+        gtk::glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
+            let Some(c) = weak.upgrade() else { return gtk::glib::ControlFlow::Break };
+            let seq = c.latest.lock().unwrap().1;
+            if logged_at.elapsed() >= std::time::Duration::from_secs(10) {
+                tracing::info!("screen capture: {} new frames in 10 s", seq - logged);
+                (logged, logged_at) = (seq, Instant::now());
+            }
+            if seq != seen {
+                // More than a lone frame: it's flowing, so react quickly next time.
+                if seq - seen > 1 {
+                    wait = CAPTURE_STALL;
+                }
+                seen = seq;
+                last_new = Instant::now();
+            } else if last_new.elapsed() >= wait && c.run.borrow().is_some() {
+                tracing::debug!("screen capture: no new frame for {wait:?}, reconnecting");
+                c.reconnect();
+                last_new = Instant::now();
+                wait = (wait * 2).min(CAPTURE_STALL_MAX);
+            }
+            gtk::glib::ControlFlow::Continue
+        });
+    }
+
+    /// Replaces the capture pipeline. The old one goes first (off the UI thread, and
+    /// not waited for forever): a stream may only take one consumer.
+    fn reconnect(self: &Rc<Self>) {
+        let Some(old) = self.run.borrow_mut().take() else { return };
+        self.generation.set(self.generation.get() + 1);
+        let (tx, rx) = async_channel::bounded::<()>(1);
+        let pipeline = old.pipeline.clone();
+        let _ = std::thread::Builder::new().name("screen-reconnect".into()).spawn(move || {
+            let _ = pipeline.set_state(gst::State::Null);
+            let _ = tx.send_blocking(());
+        });
+        let weak = Rc::downgrade(self);
+        gtk::glib::spawn_future_local(async move {
+            let _ = gtk::glib::future_with_timeout(std::time::Duration::from_secs(3), rx.recv()).await;
+            drop(old);
+            if let Some(c) = weak.upgrade() {
+                if let Err(e) = c.connect() {
+                    tracing::warn!("screen capture: reconnecting failed: {e:#}");
+                }
+            }
+        });
+    }
+}
+
+/// The capture half of a screen share: `src` and `head` into an appsink keeping the
+/// newest frame (compositors send frames only when something changes).
+fn capture_pipeline(src: gst::Element, mut head: Vec<gst::Element>, latest: &LatestFrame) -> Result<gst::Pipeline> {
+    let pipeline = gst::Pipeline::with_name("screen-capture");
+    // Some compositors report a bogus pixel aspect ratio (niri: 1/2147483647), which
+    // makes the scaler squash the picture into black borders. Screens have square pixels.
+    if has("capssetter") {
+        let fix = make("capssetter")?;
+        fix.set_property("caps", gst::Caps::builder("video/x-raw").field("pixel-aspect-ratio", gst::Fraction::new(1, 1)).build());
+        head.push(fix);
+    }
+    let grab = gst_app::AppSink::builder().sync(false).max_buffers(1).drop(true).build();
+    let (l2, l3) = (latest.clone(), latest.clone());
+    grab.set_callbacks(
+        gst_app::AppSinkCallbacks::builder()
+            .new_preroll(move |s| {
+                let sample = s.pull_preroll().map_err(|_| gst::FlowError::Eos)?;
+                let mut g = l3.lock().unwrap();
+                g.0 = Some(sample);
+                g.1 += 1;
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .new_sample(move |s| {
+                let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                let mut g = l2.lock().unwrap();
+                g.0 = Some(sample);
+                g.1 += 1;
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+    let mut chain = vec![src];
+    chain.extend(head);
+    chain.push(grab.upcast());
+    pipeline.add_many(&chain)?;
+    gst::Element::link_many(&chain)?;
+    Ok(pipeline)
 }
 
 impl Drop for VideoSender {
@@ -674,7 +855,7 @@ impl VideoSender {
         pipeline.add_many(&chain[..chain.len() - 1])?;
         gst::Element::link_many(&chain)?;
         let run = Running::start(pipeline, "Camera", on_error)?;
-        Ok(Self { _run: run, hub, track: Track::Camera, preview, stop: None })
+        Ok(Self { _run: run, hub, track: Track::Camera, preview, stop: None, capture: None })
     }
 
     pub fn screen(
@@ -687,132 +868,126 @@ impl VideoSender {
         gpu_import: bool,
         on_error: impl Fn(String) + 'static,
     ) -> Result<Self> {
-        let pipeline = gst::Pipeline::with_name("screen");
-        let src = make("pipewiresrc")?;
-        if let Some(fd) = &fd {
+        let on_error: Rc<dyn Fn(String)> = Rc::new(on_error);
+        #[cfg(unix)]
+        let raw_fd = fd.as_ref().map(std::os::fd::AsRawFd::as_raw_fd);
+        let build = move |latest: &LatestFrame| {
+            let src = make("pipewiresrc")?;
             #[cfg(unix)]
-            src.set_property("fd", std::os::fd::AsRawFd::as_raw_fd(fd));
-            #[cfg(not(unix))]
-            match *fd {}
-        }
-        src.set_property("path", node_id.to_string());
-        src.set_property("do-timestamp", true);
-        // Compositors (niri, GNOME, KDE…) usually hand out GPU (DMA-BUF) frames, often
-        // tiled. Reading those directly with the CPU gives black/garbage, so import them
-        // through GL and download a normal image. Shared-memory frames pass through too.
-        // Some GPU buffers can't be imported (e.g. AMD's compressed DCC layouts, when
-        // the GL driver lacks that modifier); then `gpu_import` is false and the
-        // compositor is asked for ordinary shared-memory frames instead.
-        let mut head_chain: Vec<gst::Element> = Vec::new();
-        if gpu_import && has("glupload") && has("glcolorconvert") && has("gldownload") {
-            head_chain.push(make("glupload")?);
-            head_chain.push(make("glcolorconvert")?);
-            head_chain.push(make("gldownload")?);
-        }
-        let sysmem = caps_filter("video/x-raw")?;
-        sysmem.static_pad("src").unwrap().add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, |_, info| {
-            if let Some(gst::PadProbeData::Event(ev)) = &info.data {
-                if let gst::EventView::Caps(c) = ev.view() {
-                    tracing::info!("screen frames after import: {}", c.caps());
-                }
+            if let Some(raw) = raw_fd {
+                src.set_property("fd", raw);
             }
-            gst::PadProbeReturn::Ok
-        });
-        src.static_pad("src").unwrap().add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, |_, info| {
-            if let Some(gst::PadProbeData::Event(ev)) = &info.data {
-                if let gst::EventView::Caps(c) = ev.view() {
-                    tracing::info!("screen source caps: {}", c.caps());
-                }
+            src.set_property("path", node_id.to_string());
+            src.set_property("do-timestamp", true);
+            // Compositors (niri, GNOME, KDE…) usually hand out GPU (DMA-BUF) frames, often
+            // tiled. Reading those directly with the CPU gives black/garbage, so import them
+            // through GL and download a normal image. Shared-memory frames pass through too.
+            // Some GPU buffers can't be imported (e.g. AMD's compressed DCC layouts, when
+            // the GL driver lacks that modifier); then `gpu_import` is false and the
+            // compositor is asked for ordinary shared-memory frames instead.
+            let mut head_chain: Vec<gst::Element> = Vec::new();
+            if gpu_import && has("glupload") && has("glcolorconvert") && has("gldownload") {
+                head_chain.push(make("glupload")?);
+                head_chain.push(make("glcolorconvert")?);
+                head_chain.push(make("gldownload")?);
             }
-            gst::PadProbeReturn::Ok
-        });
-        head_chain.push(sysmem);
-        let keep: Option<Box<dyn std::any::Any + Send>> = fd.map(|fd| Box::new(fd) as Box<dyn std::any::Any + Send>);
-        let fail_test = gpu_import && std::env::var_os("PARLEY_TEST_FAIL_GPU_IMPORT").is_some();
-        Self::screen_from(hub, pipeline, src, head_chain, size, quality, hw, on_error, keep, fail_test)
+            let sysmem = caps_filter("video/x-raw")?;
+            sysmem.static_pad("src").unwrap().add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, |_, info| {
+                if let Some(gst::PadProbeData::Event(ev)) = &info.data {
+                    if let gst::EventView::Caps(c) = ev.view() {
+                        tracing::info!("screen frames after import: {}", c.caps());
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            });
+            src.static_pad("src").unwrap().add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, |_, info| {
+                if let Some(gst::PadProbeData::Event(ev)) = &info.data {
+                    if let gst::EventView::Caps(c) = ev.view() {
+                        tracing::info!("screen source caps: {}", c.caps());
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            });
+            head_chain.push(sysmem);
+            capture_pipeline(src, head_chain, latest)
+        };
+        let capture = ScreenCapture::start(build, fd, true, on_error.clone())?;
+        // Test hook: pretend the GPU import failed (exercises the shared-memory fallback).
+        if gpu_import && std::env::var_os("PARLEY_TEST_FAIL_GPU_IMPORT").is_some() {
+            if let Some(p) = capture.inner.run.borrow().as_ref().map(|r| r.pipeline.downgrade()) {
+                gtk::glib::timeout_add_seconds_local_once(1, move || {
+                    if let Some(p) = p.upgrade() {
+                        let _ = p.post_message(gst::message::Error::builder(gst::CoreError::Failed, "test: GPU import failed").src(&p).build());
+                    }
+                });
+            }
+        }
+        Self::screen_from(hub, capture, size, quality, hw, on_error)
     }
 
     /// Windows: shares a monitor, as GStreamer's screen-capture device provider lists it
     /// (Direct3D 11 capture).
     #[cfg(windows)]
     pub fn monitor(hub: Arc<Hub>, monitor: &gst::Device, quality: (u32, u32, u32), hw: bool, on_error: impl Fn(String) + 'static) -> Result<Self> {
-        let pipeline = gst::Pipeline::with_name("screen");
-        let src = monitor.create_element(Some("screensrc"))?;
-        set_opt(&src, "show-cursor", "true");
-        // Frames come in GPU memory: bring them to normal memory for the encoder side.
-        let mut head_chain = Vec::new();
-        if has("d3d11download") {
-            head_chain.push(make("d3d11download")?);
-        }
-        head_chain.push(caps_filter("video/x-raw")?);
+        let on_error: Rc<dyn Fn(String)> = Rc::new(on_error);
+        let device = monitor.clone();
+        let build = move |latest: &LatestFrame| {
+            let src = device.create_element(Some("screensrc"))?;
+            set_opt(&src, "show-cursor", "true");
+            // Frames come in GPU memory: bring them to normal memory for the encoder side.
+            let mut head_chain = Vec::new();
+            if has("d3d11download") {
+                head_chain.push(make("d3d11download")?);
+            }
+            head_chain.push(caps_filter("video/x-raw")?);
+            capture_pipeline(src, head_chain, latest)
+        };
         let size = super::devices::monitor_size(monitor);
-        Self::screen_from(hub, pipeline, src, head_chain, size, quality, hw, on_error, None, false)
+        let capture = ScreenCapture::start(build, None, false, on_error.clone())?;
+        Self::screen_from(hub, capture, size, quality, hw, on_error)
     }
 
-    /// The rest of a screen share, whatever the source: scaling, a repeater feeding the
-    /// encoder, and the encoder. `keep` lives as long as the pipeline (the portal's
-    /// connection).
-    #[allow(clippy::too_many_arguments)]
+    /// The same capture with new quality settings, without interrupting it: viewers see
+    /// the stream carry on (and keep it in focus), from a fresh keyframe.
+    pub fn with_quality(mut self, quality: (u32, u32, u32), hw: bool, on_error: impl Fn(String) + 'static) -> Result<Self> {
+        let capture = self.capture.take().ok_or_else(|| anyhow!("not a screen share"))?;
+        let (hub, size) = (self.hub.clone(), capture.frame_size());
+        // Fully stopped first, so no frame of the old encoder lands among the new ones.
+        let _ = self._run.pipeline.set_state(gst::State::Null);
+        drop(self);
+        Self::screen_from(hub, capture, size, quality, hw, Rc::new(on_error))
+    }
+
+    /// A handle on the share's PipeWire connection, to start a new capture on it.
+    pub fn capture_fd(&self) -> Option<super::ScreenFd> {
+        self.capture.as_ref()?.inner.fd.borrow().as_ref()?.try_clone().ok()
+    }
+
+    /// The encoding half of a screen share: a repeater feeding the newest captured frame
+    /// to the scaler and encoder.
     fn screen_from(
         hub: Arc<Hub>,
-        pipeline: gst::Pipeline,
-        src: gst::Element,
-        mut head_chain: Vec<gst::Element>,
+        capture: ScreenCapture,
         size: Option<(i32, i32)>,
         quality: (u32, u32, u32),
         hw: bool,
-        on_error: impl Fn(String) + 'static,
-        keep: Option<Box<dyn std::any::Any + Send>>,
-        fail_test: bool,
+        on_error: Rc<dyn Fn(String)>,
     ) -> Result<Self> {
+        let pipeline = gst::Pipeline::with_name("screen");
         let (max_h, fps, kbps) = quality;
-        // Some compositors report a bogus pixel aspect ratio (niri: 1/2147483647), which
-        // makes the scaler squash the picture into black borders. Screens have square pixels.
-        if has("capssetter") {
-            let fix = make("capssetter")?;
-            fix.set_property("caps", gst::Caps::builder("video/x-raw").field("pixel-aspect-ratio", gst::Fraction::new(1, 1)).build());
-            head_chain.push(fix);
-        }
         let (sw, sh) = size.map(|(w, h)| (w.max(2) as u32, h.max(2) as u32)).unwrap_or((1920, 1080));
         let (w, h) = if sh > max_h { (sw * max_h / sh, max_h) } else { (sw, sh) };
         let p = VideoParams { width: (w & !1).max(2), height: (h & !1).max(2), fps, kbps, hw };
         let (head, preview) = video_tail(&pipeline, hub.clone(), Track::Screen, &p)?;
         // Compositors only send frames when the screen changes, and pipewiresrc's
-        // keepalive doesn't repeat GPU frames. So capture ends in an appsink holding the
-        // newest frame, and a repeater thread feeds the encoder side through an appsrc:
-        // new frames right away, the last one again every 200 ms while the screen is idle.
-        let latest: Arc<std::sync::Mutex<(Option<gst::Sample>, u64)>> = Default::default();
-        let grab = gst_app::AppSink::builder().sync(false).max_buffers(1).drop(true).build();
-        // Must not wait for preroll: the encoder side only gets data once this sink does.
-        grab.set_property("async", false);
-        let (l2, l3) = (latest.clone(), latest.clone());
-        grab.set_callbacks(
-            gst_app::AppSinkCallbacks::builder()
-                .new_preroll(move |s| {
-                    let sample = s.pull_preroll().map_err(|_| gst::FlowError::Eos)?;
-                    let mut g = l3.lock().unwrap();
-                    g.0 = Some(sample);
-                    g.1 += 1;
-                    Ok(gst::FlowSuccess::Ok)
-                })
-                .new_sample(move |s| {
-                    let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                    let mut g = l2.lock().unwrap();
-                    g.0 = Some(sample);
-                    g.1 += 1;
-                    Ok(gst::FlowSuccess::Ok)
-                })
-                .build(),
-        );
+        // keepalive doesn't repeat GPU frames. So a repeater thread feeds the encoder side
+        // through an appsrc: new frames right away, the last one again every 200 ms while
+        // the screen is idle.
+        let latest = capture.inner.latest.clone();
         let feed = gst_app::AppSrc::builder().is_live(true).do_timestamp(true).format(gst::Format::Time).build();
         set_opt(feed.upcast_ref(), "leaky-type", "downstream");
         set_opt(feed.upcast_ref(), "max-buffers", "2");
 
-        let mut capture = vec![src];
-        capture.extend(head_chain);
-        capture.push(grab.clone().upcast());
-        pipeline.add_many(&capture)?;
-        gst::Element::link_many(&capture)?;
         pipeline.add(&feed)?;
         feed.link(&head)?;
 
@@ -865,20 +1040,7 @@ impl VideoSender {
             }
         })?;
 
-        // Test hook: pretend the GPU import failed (exercises the shared-memory fallback).
-        if fail_test {
-            let p = pipeline.downgrade();
-            gtk::glib::timeout_add_seconds_local_once(1, move || {
-                if let Some(p) = p.upgrade() {
-                    let _ = p.post_message(gst::message::Error::builder(gst::CoreError::Failed, "test: GPU import failed").src(&p).build());
-                }
-            });
-        }
-        let mut run = Running::start(pipeline, "Screen share", on_error)?;
-        // The portal's PipeWire connection must outlive the pipeline.
-        if let Some(k) = keep {
-            run.keep_alive(k);
-        }
-        Ok(Self { _run: run, hub, track: Track::Screen, preview, stop: Some(stop) })
+        let run = Running::start(pipeline, "Screen share", move |msg| on_error(msg))?;
+        Ok(Self { _run: run, hub, track: Track::Screen, preview, stop: Some(stop), capture: Some(capture) })
     }
 }

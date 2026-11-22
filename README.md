@@ -52,7 +52,8 @@ have to run or pay for. A [Windows preview](#windows-preview) is out too.
 - **Screen share with app audio.** Share all desktop audio or only chosen apps.
   Parley's own audio (your friends' voices) is never captured, so there's no echo.
   Pick resolution (480p–1440p) and frame rate (24, 30, 60 or custom) separately; when the
-  connection can't keep up, the bitrate drops on the fly so motion stays smooth.
+  connection can't keep up, the bitrate drops on the fly so motion stays smooth. Change
+  the quality, sound or what you're sharing mid-stream, and friends watching stay on it.
 - **Resilient groups.** Someone dropping out doesn't end the call for everyone else.
   Parley reconnects automatically after network blips, and anyone can rejoin with one
   click.
@@ -114,8 +115,8 @@ or missing so far:
   friends never hear themselves. Choosing single apps is Linux-only for now.
 - Video is encoded in software (x264); hardware encoding isn't used yet.
 - Webcams haven't been tested.
-- No installer and no automatic updates. To update, quit Parley (tray icon → *Quit
-  Parley*) and replace the folder. Your identity, friends and chats stay in
+- No installer. When a new version is out, an **Update** button appears in the top bar
+  (see [Updating](#updating)). Your identity, friends and chats stay in
   `%LOCALAPPDATA%\parley` and `%APPDATA%\parley`. If you move the folder, switch
   Settings → *Start when I log in* off and on again.
 - Windows 11 tucks new tray icons away: click **^** next to the clock, and drag
@@ -163,6 +164,15 @@ cargo build --release --locked
 ```
 
 ### Updating
+
+Release bundles and the Windows zip update themselves, when you say so: a small
+**Update** button appears in the top bar when a new version is out, and **Restart to
+update** once it's installed. Nothing installs without that click, and Settings →
+*Check for updates* turns it off. Updates are signed, and Parley refuses any that aren't:
+on Linux they come through Flatpak's own update portal, so Parley needs no extra sandbox
+permission. Moving to this from a version before it takes one last manual install.
+
+If you built Parley from source:
 
 ```bash
 git pull
@@ -298,6 +308,9 @@ automatically.
   and, by calling, learn your IP address, as with any peer-to-peer app. n0's relay and
   discovery servers see your IP address and public key, but not who you talk to inside
   a connection or what is said.
+- **Update checks:** to find new versions, Parley (or Flatpak, on Linux) asks GitHub, which
+  sees your IP address like any website. No identity or contact data is sent. Settings →
+  *Check for updates* turns this off.
 - **Online status:** only your contacts can see it. Invisible makes Parley stop
   answering status checks, so you look offline; someone with your code could still
   notice your computer is reachable at the network level.
@@ -337,6 +350,20 @@ know the creator, leaving, rejoining without ringing, automatic reconnection aft
 dropout, in-order delivery of video GOPs plus audio datagrams, chat delivery and
 refusal, identity moves (followed by friends, ignored by strangers), and a removed
 group member being refused by the group (after joining fine before the removal).
+
+### Publishing a release
+
+Signing keys live in `~/.config/parley-release`, never in this repository. Back them up:
+without them, people need one manual update to move to new keys.
+
+```bash
+./install.sh --bundle                 # aarch64
+flatpak/cross-bundle.sh               # x86_64
+flatpak/publish-repo.sh --push        # signs both into the hosted repo, rebuilds the bundles
+cargo run --release --example sign_release -- manifest VERSION Parley-VERSION-windows-x64.zip OUTDIR
+```
+
+Attach `latest.json` and `latest.json.sig` to the GitHub release with the zip and bundles.
 
 ## Known limitations / next steps
 

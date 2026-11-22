@@ -1,6 +1,9 @@
 //! Dialogs: name, add code, new group, rename, screen share options, settings.
 
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 use adw::prelude::*;
 use gtk::glib;
@@ -275,6 +278,25 @@ pub fn screen_share(app: &Rc<App>) {
     tv.add_top_bar(&adw::HeaderBar::new());
     let page = adw::PreferencesPage::new();
 
+    let sharing = app.state.get().screen;
+    // While sharing: swap what's shared, without stopping the stream.
+    let can_change_source = sharing && (cfg!(not(windows)) || crate::media::devices::monitors_count() > 1);
+    let change_source = can_change_source.then(|| {
+        let group = adw::PreferencesGroup::new();
+        let row = adw::ActionRow::builder()
+            .title("Change screen or window…")
+            .subtitle("Friends watching stay on your stream")
+            .activatable(true)
+            .build();
+        row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+        group.add(&row);
+        page.add(&group);
+        row
+    });
+    if sharing {
+        d.set_title("Stream settings");
+    }
+
     let q = adw::PreferencesGroup::new();
     q.set_title("Stream quality");
     let (cur_h, cur_fps) = {
@@ -334,7 +356,6 @@ pub fn screen_share(app: &Rc<App>) {
         &["No audio", "All desktop audio", "Only selected apps"]
     };
     mode.set_model(Some(&gtk::StringList::new(choices)));
-    let apps = app.playing_apps.borrow().clone();
     let prev = app.share_audio.borrow().clone();
     mode.set_selected(match prev {
         AudioShare::Off => 0,
@@ -345,43 +366,92 @@ pub fn screen_share(app: &Rc<App>) {
         mode.set_selected(1);
     }
     g.add(&mode);
-    let apps_group = adw::PreferencesGroup::new();
-    apps_group.set_title("Apps playing sound");
-    let switches: Rc<RefCell<Vec<(adw::SwitchRow, String)>>> = Rc::default();
-    if apps.is_empty() {
-        let row = adw::ActionRow::builder()
-            .title("No apps are playing sound right now")
-            .subtitle("Start playback in the app first, then reopen this dialog.")
-            .build();
-        apps_group.add(&row);
-    }
-    let prev_apps = if let AudioShare::Apps(v) = &prev { v.clone() } else { vec![] };
-    for a in &apps {
-        let row = adw::SwitchRow::builder().title(glib::markup_escape_text(a)).active(prev_apps.contains(a)).build();
-        apps_group.add(&row);
-        switches.borrow_mut().push((row, a.clone()));
-    }
-    apps_group.set_visible(mode.selected() == 2);
-    let ag = apps_group.clone();
-    mode.connect_selected_notify(move |m| ag.set_visible(m.selected() == 2));
-    page.add(&g);
-    page.add(&apps_group);
-
-    let sharing = app.state.get().screen;
-    if sharing {
-        d.set_title("Screen share");
-        q.set_sensitive(false);
-        q.set_description(Some("Stop and start sharing again to change quality."));
-    }
     let go = gtk::Button::builder()
         .label(match (sharing, cfg!(windows)) {
-            (true, _) => "Update sound",
+            (true, _) => "Apply",
             // (Windows shares whole screens.)
             (false, true) => "Share screen",
             (false, false) => "Choose screen or window…",
         })
         .css_classes(["pill", "suggested-action"])
         .build();
+
+    let apps_group = adw::PreferencesGroup::new();
+    apps_group.set_title("Apps to share");
+    let switches: Rc<RefCell<Vec<(adw::SwitchRow, String)>>> = Rc::default();
+    let no_apps = adw::ActionRow::builder()
+        .title("No apps are playing sound right now")
+        .subtitle("Start playback in the app and it will appear here.")
+        .build();
+    apps_group.add(&no_apps);
+    // "Only selected apps" with none selected would share no sound at all.
+    let check = {
+        let (mode, switches, go, group) = (mode.clone(), switches.clone(), go.clone(), apps_group.clone());
+        Rc::new(move || {
+            let none = mode.selected() == 2 && !switches.borrow().iter().any(|(r, _)| r.is_active());
+            go.set_sensitive(!none);
+            group.set_description(none.then_some("Choose at least one app to share its sound."));
+        })
+    };
+    let add_app = {
+        let (switches, group, no_apps, check) = (switches.clone(), apps_group.clone(), no_apps.clone(), check.clone());
+        Rc::new(move |name: &str, on: bool| {
+            if switches.borrow().iter().any(|(_, n)| n == name) {
+                return;
+            }
+            no_apps.set_visible(false);
+            let row = adw::SwitchRow::builder().title(glib::markup_escape_text(name)).active(on).build();
+            let c = check.clone();
+            row.connect_active_notify(move |_| c());
+            group.add(&row);
+            switches.borrow_mut().push((row, name.to_string()));
+            check();
+        })
+    };
+    let apps = app.playing_apps.borrow().clone();
+    let prev_apps = if let AudioShare::Apps(v) = &prev { v.clone() } else { vec![] };
+    for a in &prev_apps {
+        add_app(a, true);
+    }
+    for a in &apps {
+        // With just one app playing, that's the one you mean.
+        add_app(a, prev_apps.is_empty() && apps.len() == 1);
+    }
+    // Apps that start playing while this is open.
+    let open = Rc::new(Cell::new(true));
+    {
+        let o = open.clone();
+        d.connect_closed(move |_| o.set(false));
+        let (o, a, add) = (open.clone(), app.clone(), add_app.clone());
+        glib::timeout_add_local(std::time::Duration::from_secs(1), move || {
+            if !o.get() {
+                return glib::ControlFlow::Break;
+            }
+            for name in a.playing_apps.borrow().iter() {
+                add(name, false);
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+    apps_group.set_visible(mode.selected() == 2);
+    {
+        let (ag, c, sw, none) = (apps_group.clone(), check.clone(), switches.clone(), no_apps.clone());
+        mode.connect_selected_notify(move |m| {
+            ag.set_visible(m.selected() == 2);
+            c();
+            if m.selected() == 2 {
+                // The list can be below the fold: bring it into view, once it's laid out.
+                let row: gtk::Widget = sw.borrow().last().map(|(r, _)| r.clone().upcast()).unwrap_or_else(|| none.clone().upcast());
+                glib::timeout_add_local_once(std::time::Duration::from_millis(120), move || {
+                    row.grab_focus();
+                });
+            }
+        });
+    }
+    check();
+    page.add(&g);
+    page.add(&apps_group);
+
     let stop = gtk::Button::builder().label("Stop sharing").css_classes(["pill", "destructive-action"]).build();
     stop.set_visible(sharing);
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 12);
@@ -401,32 +471,47 @@ pub fn screen_share(app: &Rc<App>) {
     tv.set_content(Some(&bx));
     d.set_child(Some(&tv));
 
-    let (a, d2) = (app.clone(), d.clone());
-    go.connect_clicked(move |_| {
-        {
-            let st = &mut a.store.borrow_mut().settings;
-            st.screen_height = SCREEN_HEIGHTS[qrow.selected() as usize];
-            st.screen_fps = fps_of();
-        }
-        a.save();
-        let audio = match mode.selected() {
-            0 => AudioShare::Off,
-            1 => AudioShare::Desktop,
-            _ => AudioShare::Apps(
-                switches.borrow().iter().filter(|(r, _)| r.is_active()).map(|(_, n)| n.clone()).collect(),
-            ),
-        };
-        let audio = match audio {
-            AudioShare::Apps(v) if v.is_empty() => AudioShare::Off,
-            x => x,
-        };
-        d2.close();
-        if a.state.get().screen {
-            a.set_share_audio(audio);
-        } else {
-            a.start_screen_share(audio);
-        }
-    });
+    // While sharing, everything applies to the running stream: friends watching it stay
+    // on it. `pick_again` also asks for a different screen or window.
+    let apply = {
+        let (a, d2) = (app.clone(), d.clone());
+        Rc::new(move |pick_again: bool| {
+            let (height, fps) = (SCREEN_HEIGHTS[qrow.selected() as usize], fps_of());
+            let quality_changed = {
+                let st = &mut a.store.borrow_mut().settings;
+                let changed = (st.screen_height, st.screen_fps) != (height, fps);
+                st.screen_height = height;
+                st.screen_fps = fps;
+                changed
+            };
+            a.save();
+            let audio = match mode.selected() {
+                0 => AudioShare::Off,
+                1 => AudioShare::Desktop,
+                _ => AudioShare::Apps(
+                    switches.borrow().iter().filter(|(r, _)| r.is_active()).map(|(_, n)| n.clone()).collect(),
+                ),
+            };
+            let audio = match audio {
+                AudioShare::Apps(v) if v.is_empty() => AudioShare::Off,
+                x => x,
+            };
+            d2.close();
+            if pick_again || !a.state.get().screen {
+                a.start_screen_share(audio);
+            } else {
+                if quality_changed {
+                    a.apply_stream_quality();
+                }
+                a.set_share_audio(audio);
+            }
+        })
+    };
+    let ap = apply.clone();
+    go.connect_clicked(move |_| ap(false));
+    if let Some(row) = change_source {
+        row.connect_activated(move |_| apply(true));
+    }
     d.present(Some(&app.window));
 }
 
@@ -720,6 +805,25 @@ pub fn settings(app: &Rc<App>) {
     autostart.set_visible(app.can_run_in_background());
     beh.add(&bg);
     beh.add(&autostart);
+    let updates = adw::SwitchRow::builder()
+        .title("Check for updates")
+        .subtitle("Shows a button in the top bar when a new version is out. Nothing installs until you choose to.")
+        .active(s.check_updates)
+        .visible(crate::update::supported())
+        .build();
+    {
+        let a = app.clone();
+        updates.connect_active_notify(move |r| {
+            a.store.borrow_mut().settings.check_updates = r.is_active();
+            a.save();
+            if r.is_active() {
+                a.start_update_checks();
+            } else {
+                a.stop_update_checks();
+            }
+        });
+    }
+    beh.add(&updates);
     beh.add(&unknown);
     gen_.add(&beh);
     let priv_ = adw::PreferencesGroup::new();

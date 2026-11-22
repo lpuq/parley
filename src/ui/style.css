@@ -93,6 +93,9 @@ splitbutton.call-btn > menubutton > button { border-radius: 0 999px 999px 0; min
 .call-row-btn:disabled { background-color: alpha(#248046, 0.3); }
 .join-btn { background-color: #248046; color: white; padding: 2px 14px; }
 .join-btn:disabled { background-color: alpha(#248046, 0.3); }
+.update-btn { background-color: #248046; color: white; padding: 2px 12px; min-height: 24px; font-size: 13px; font-weight: 600; }
+.update-btn:hover { background-color: #2c9a55; }
+.update-btn:disabled { background-color: alpha(#248046, 0.45); color: alpha(white, 0.85); }
 .group-icon { color: @group_icon_fg; }
 
 /* Narrow windows (see the breakpoint in ui/mod.rs): smaller call controls so the
@@ -146,6 +149,7 @@ levelbar.voice-meter.open block.filled { background-color: #23a55a; }
 .chat-text { font-size: 15px; }
 .chat-text.pending { opacity: 0.5; }
 .chat-text.refused { color: #f23f42; }
+.chat-text > selection, .chat-input > text > selection { background-color: #3584e4; color: #ffffff; }
 .chat-day { margin: 18px 16px 4px 16px; }
 .chat-notice { margin: 0 16px 6px 16px; font-size: 13px; color: alpha(currentColor, 0.7); }
 .chat-composer { margin: 0 16px 18px 16px; border-radius: 8px; background-color: @composer_bg; }

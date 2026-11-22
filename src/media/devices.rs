@@ -171,3 +171,11 @@ pub fn monitor_size(d: &gst::Device) -> Option<(i32, i32)> {
     let s = caps.structure(0)?;
     Some((s.get::<i32>("width").ok()?, s.get::<i32>("height").ok()?))
 }
+
+/// How many screens could be shared (Windows; elsewhere the portal asks).
+pub fn monitors_count() -> usize {
+    #[cfg(windows)]
+    return monitors().len();
+    #[cfg(not(windows))]
+    0
+}
