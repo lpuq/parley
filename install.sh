@@ -5,6 +5,7 @@
 #                              a prebuilt parley-<arch>.flatpak next to this script if present
 #   ./install.sh --prebuilt    use the prebuilt parley-<arch>.flatpak even in a git checkout
 #   ./install.sh --bundle      also write parley-<arch>.flatpak to copy to other machines
+#   ./install.sh --build-only  build for a release (flatpak/publish-repo.sh), install nothing
 #   ./install.sh --native      build a native binary instead of a Flatpak (needs -devel pkgs)
 #   ./install.sh --uninstall
 #
@@ -21,14 +22,15 @@ MANIFEST=flatpak/$APP_ID.yml
 UPDATE_REPO=https://lpuq.github.io/parley/repo
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/parley-build"
 ARCH="${PARLEY_ARCH:-$(flatpak --default-arch 2>/dev/null || uname -m)}"
-MODE=auto BUNDLE=0 PREBUILT=0
+MODE=auto BUNDLE=0 PREBUILT=0 BUILD_ONLY=0
 for a in "$@"; do
   case "$a" in
     --bundle) BUNDLE=1 ;;
+    --build-only) BUNDLE=1 BUILD_ONLY=1 ;;
     --prebuilt) PREBUILT=1 ;;
     --native) MODE=native ;;
     --uninstall) MODE=uninstall ;;
-    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
     *) echo "Unknown option: $a"; exit 2 ;;
   esac
 done
@@ -216,6 +218,10 @@ if [[ $BUNDLE == 1 ]]; then
   say "Wrote parley-$ARCH.flatpak — copy it next to install.sh on another $ARCH machine and run ./install.sh there."
 fi
 
+if [[ $BUILD_ONLY == 1 ]]; then
+  say "Built for $ARCH; nothing was installed."
+  exit 0
+fi
 if [[ "$ARCH" == "$(flatpak --default-arch)" ]]; then
   flatpak remote-add --user --if-not-exists --no-gpg-verify parley-local "$REPO"
   # (A prebuilt install may have pointed it at the release repo: this build is local.)

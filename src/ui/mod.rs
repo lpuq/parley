@@ -12,6 +12,8 @@ mod tray;
 mod tray_common;
 #[cfg(windows)]
 mod tray_win;
+#[cfg(windows)]
+mod win_snap;
 
 use std::{
     cell::{Cell, RefCell},
@@ -290,6 +292,9 @@ impl App {
                 .build(),
             open_calls: RefCell::new(HashMap::new()),
         });
+
+        #[cfg(windows)]
+        win_snap::install(&this.window);
 
         // ----- layout -----
         let content_page = this.content_page.clone();
@@ -2372,7 +2377,7 @@ impl App {
         }
         self.apply_voice();
         let settings = self.store.borrow().settings.clone();
-        let mics = devices::microphones();
+        let mics = devices::microphones(settings.allow_desktop_mic);
         let opts = MicOptions {
             device: devices::find(&mics, &settings.mic).map(|d| d.device.clone()),
             echo_cancel: false,
@@ -2439,7 +2444,7 @@ impl App {
         self.stop_mic_test();
         self.media.borrow_mut().mic = None;
         let settings = self.store.borrow().settings.clone();
-        let mics = devices::microphones();
+        let mics = devices::microphones(settings.allow_desktop_mic);
         let mut dev = devices::find(&mics, &settings.mic).map(|d| d.device.clone());
         // "System default" pointing at Bluetooth earbuds would flip them into headset mode
         // (telephone-quality and, on many adapters, silent). Use another mic instead unless

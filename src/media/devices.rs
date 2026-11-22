@@ -21,24 +21,37 @@ fn prop_str(d: &gst::Device, key: &str) -> Option<String> {
 
 /// Prefer the PulseAudio API (served by pipewire-pulse): it's the most robust
 /// path for live audio in GStreamer. Fall back to native PipeWire; on Windows, WASAPI.
-fn audio_devices(class: &str) -> Vec<Device> {
+fn audio_devices(class: &str, include_desktop: bool) -> Vec<Device> {
     let devs = ["pulsedeviceprovider", "pipewiredeviceprovider", "wasapi2deviceprovider"]
         .iter()
         .find_map(|p| provider_devices(p, class).filter(|v| !v.is_empty()))
         .unwrap_or_default();
     devs.into_iter()
-        .filter(|d| prop_str(d, "device.class").as_deref() != Some("monitor"))
+        .filter(|d| include_desktop || !records_desktop(d))
         .filter(|d| !d.display_name().contains("Parley"))
         .map(|d| Device { name: d.display_name().to_string(), device: d })
         .collect()
 }
 
-pub fn microphones() -> Vec<Device> {
-    audio_devices("Audio/Source")
+/// A "microphone" that really records what the computer is playing: a PulseAudio
+/// monitor, or a WASAPI loopback (only its element says so).
+fn records_desktop(d: &gst::Device) -> bool {
+    match prop_str(d, "device.api").as_deref() {
+        Some("wasapi2") => d
+            .create_element(None)
+            .is_ok_and(|e| e.find_property("loopback").is_some() && e.property::<bool>("loopback")),
+        _ => prop_str(d, "device.class").as_deref() == Some("monitor"),
+    }
+}
+
+/// Input devices. Desktop audio only on request (Settings → Advanced): as a mic it sends
+/// people's own voices back to them a moment late, which makes it hard to speak.
+pub fn microphones(allow_desktop: bool) -> Vec<Device> {
+    audio_devices("Audio/Source", allow_desktop)
 }
 
 pub fn speakers() -> Vec<Device> {
-    audio_devices("Audio/Sink")
+    audio_devices("Audio/Sink", false)
 }
 
 pub fn cameras() -> Vec<Device> {

@@ -527,7 +527,7 @@ pub fn settings(app: &Rc<App>) {
 
     let dev = adw::PreferencesGroup::new();
     dev.set_title("Devices");
-    let mics = devices::microphones();
+    let mics = devices::microphones(s.allow_desktop_mic);
     let spks = devices::speakers();
     let cams = devices::cameras();
     let mic_row = device_combo("Microphone", &mics, &s.mic);
@@ -723,6 +723,17 @@ pub fn settings(app: &Rc<App>) {
     vid.add(&cam_kbps);
     vid.add(&hw);
     page.add(&vid);
+
+    let advanced = adw::PreferencesGroup::new();
+    let more = adw::ExpanderRow::builder().title("Advanced").build();
+    let desktop_mic = adw::SwitchRow::builder()
+        .title("Allow desktop audio as a microphone")
+        .subtitle("Lists what your computer is playing as a mic. People can hear their own voices come back from it a moment late, which makes it hard to speak. Leave this off unless you need it.")
+        .active(s.allow_desktop_mic)
+        .build();
+    more.add_row(&desktop_mic);
+    advanced.add(&more);
+    page.add(&advanced);
     d.add(&page);
 
     // ----- General -----
@@ -864,12 +875,39 @@ pub fn settings(app: &Rc<App>) {
 
     // ----- Apply on change -----
     let names = |l: &[devices::Device]| -> Vec<String> { std::iter::once(String::new()).chain(l.iter().map(|d| d.name.clone())).collect() };
-    let (mic_names, spk_names, cam_names) = (names(&mics), names(&spks), names(&cams));
-    let a = app.clone();
+    let (spk_names, cam_names) = (names(&spks), names(&cams));
+    let mic_names = Rc::new(RefCell::new(names(&mics)));
+    let refilling = Rc::new(Cell::new(false));
+    let (a, n, busy) = (app.clone(), mic_names.clone(), refilling.clone());
     mic_row.connect_selected_notify(move |r| {
-        a.store.borrow_mut().settings.mic = mic_names[r.selected() as usize].clone();
+        if busy.get() {
+            return;
+        }
+        a.store.borrow_mut().settings.mic = n.borrow()[r.selected() as usize].clone();
         a.save();
         a.restart_mic();
+    });
+    let (a, row) = (app.clone(), mic_row.clone());
+    desktop_mic.connect_active_notify(move |r| {
+        let list = devices::microphones(r.is_active());
+        let (current, still_listed) = {
+            let st = &mut a.store.borrow_mut().settings;
+            st.allow_desktop_mic = r.is_active();
+            let listed = st.mic.is_empty() || list.iter().any(|d| d.name == st.mic);
+            if !listed {
+                st.mic.clear();
+            }
+            (st.mic.clone(), listed)
+        };
+        a.save();
+        *mic_names.borrow_mut() = names(&list);
+        refilling.set(true);
+        fill_device_combo(&row, &list, &current);
+        refilling.set(false);
+        // It was recording desktop audio, which is no longer allowed.
+        if !still_listed {
+            a.restart_mic();
+        }
     });
     let a = app.clone();
     spk_row.connect_selected_notify(move |r| {
@@ -998,14 +1036,35 @@ pub async fn pick_monitor(app: &Rc<App>, monitors: &[devices::Device]) -> Option
 }
 
 fn device_combo(title: &str, list: &[devices::Device], current: &str) -> adw::ComboRow {
+    let row = adw::ComboRow::builder().title(title).build();
+    fill_device_combo(&row, list, current);
+    row
+}
+
+fn fill_device_combo(row: &adw::ComboRow, list: &[devices::Device], current: &str) {
     let mut labels = vec!["System default".to_string()];
     labels.extend(list.iter().map(|d| d.name.clone()));
     let refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
-    let row = adw::ComboRow::builder().title(title).build();
     row.set_model(Some(&gtk::StringList::new(&refs)));
     let idx = list.iter().position(|d| d.name == current).map(|i| i + 1).unwrap_or(0);
     row.set_selected(idx as u32);
-    row
+}
+
+/// Clicking anywhere outside the dialog's content closes it. (The dialog widget covers
+/// the whole window, dimmed part included.)
+fn close_on_outside_click(d: &adw::Dialog, content: &impl IsA<gtk::Widget>) {
+    let click = gtk::GestureClick::new();
+    click.set_button(0);
+    click.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let (dialog, content) = (d.clone(), content.clone().upcast::<gtk::Widget>());
+    click.connect_pressed(move |g, _, x, y| {
+        let Some(bounds) = content.compute_bounds(&dialog) else { return };
+        if !bounds.contains_point(&gtk::graphene::Point::new(x as f32, y as f32)) {
+            g.set_state(gtk::EventSequenceState::Claimed);
+            dialog.close();
+        }
+    });
+    d.add_controller(click);
 }
 
 fn in_flatpak() -> bool {
@@ -1165,5 +1224,6 @@ pub fn user_info(app: &Rc<App>, id: iroh::EndpointId) {
     });
     tv.set_content(Some(&page));
     d.set_child(Some(&tv));
+    close_on_outside_click(&d, &tv);
     d.present(Some(&app.window));
 }

@@ -1040,7 +1040,10 @@ fn device_popover(app: Weak<App>, kind: DeviceKind) -> gtk::Popover {
         }
         let Some(a) = app.upgrade() else { return };
         let (title, list, current) = match kind {
-            DeviceKind::Mic => ("Input device", devices::microphones(), a.store.borrow().settings.mic.clone()),
+            DeviceKind::Mic => {
+                let st = a.store.borrow();
+                ("Input device", devices::microphones(st.settings.allow_desktop_mic), st.settings.mic.clone())
+            }
             DeviceKind::Camera => ("Camera", devices::cameras(), a.store.borrow().settings.camera.clone()),
         };
         let h = gtk::Label::new(Some(title));

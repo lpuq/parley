@@ -357,7 +357,7 @@ Signing keys live in `~/.config/parley-release`, never in this repository. Back 
 without them, people need one manual update to move to new keys.
 
 ```bash
-./install.sh --bundle                 # aarch64
+./install.sh --build-only             # aarch64 (leaves this machine's install alone)
 flatpak/cross-bundle.sh               # x86_64
 flatpak/publish-repo.sh --push        # signs both into the hosted repo, rebuilds the bundles
 cargo run --release --example sign_release -- manifest VERSION Parley-VERSION-windows-x64.zip OUTDIR
