@@ -18,6 +18,7 @@ APP_ID=io.github.parley.Parley
 RUNTIME_BRANCH=51          # org.gnome.Platform / Sdk
 FDO_BRANCH=26.08           # its freedesktop base (for SDK extensions)
 MANIFEST=flatpak/$APP_ID.yml
+UPDATE_REPO=https://lpuq.github.io/parley/repo
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/parley-build"
 ARCH="${PARLEY_ARCH:-$(flatpak --default-arch 2>/dev/null || uname -m)}"
 MODE=auto BUNDLE=0 PREBUILT=0
@@ -164,6 +165,11 @@ if [[ $USE_PREBUILT == 1 ]]; then
   need org.freedesktop.Platform.codecs-extra//$FDO_BRANCH-extra
   say "Installing prebuilt parley-$ARCH.flatpak"
   flatpak install --user -y --noninteractive --reinstall "parley-$ARCH.flatpak"
+  # A bundle installed over an older one keeps that one's remote, with its signature
+  # checks off. Updates must be verified against Parley's release key.
+  flatpak remote-modify --user --url="$UPDATE_REPO" --gpg-verify --gpg-import=flatpak/parley-repo.gpg \
+    "$(flatpak info --user --show-origin "$APP_ID")" ||
+    warn "Couldn't turn on signature checks for updates; don't use in-app updates on this machine."
   # Parley asks before it updates, so Flatpak needn't ask a second time.
   flatpak permission-set flatpak updates "$APP_ID" yes 2>/dev/null || true
   finish
@@ -212,6 +218,8 @@ fi
 
 if [[ "$ARCH" == "$(flatpak --default-arch)" ]]; then
   flatpak remote-add --user --if-not-exists --no-gpg-verify parley-local "$REPO"
+  # (A prebuilt install may have pointed it at the release repo: this build is local.)
+  flatpak remote-modify --user --no-gpg-verify --url="file://$REPO" parley-local
   flatpak install --user -y --noninteractive --reinstall parley-local "$APP_ID" >/dev/null
   finish
 fi
