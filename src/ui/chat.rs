@@ -53,23 +53,27 @@ fn range_in(labels: &[gtk::Label], i: usize, from: Spot, to: Spot) -> Option<(i3
 /// Highlights part of a message in the standard selection blue. (GTK lets only one label
 /// at a time hold a real selection, so a selection across messages is drawn this way.)
 fn highlight(label: &gtk::Label, range: Option<(i32, i32)>) {
-    let Some((start, end)) = range else {
-        label.set_attributes(None);
-        return;
-    };
-    let text = label.text();
-    let byte = |chars: i32| text.char_indices().nth(chars as usize).map_or(text.len(), |(b, _)| b) as u32;
-    let (from, to) = (byte(start), byte(end));
-    let attrs = gtk::pango::AttrList::new();
-    let mut bg = gtk::pango::AttrColor::new_background(0x3535, 0x8484, 0xe4e4);
-    bg.set_start_index(from);
-    bg.set_end_index(to);
-    attrs.insert(bg);
-    let mut fg = gtk::pango::AttrColor::new_foreground(0xffff, 0xffff, 0xffff);
-    fg.set_start_index(from);
-    fg.set_end_index(to);
-    attrs.insert(fg);
-    label.set_attributes(Some(&attrs));
+    let attrs = range.map(|(start, end)| {
+        let text = label.text();
+        let byte = |chars: i32| text.char_indices().nth(chars as usize).map_or(text.len(), |(b, _)| b) as u32;
+        let (from, to) = (byte(start), byte(end));
+        let attrs = gtk::pango::AttrList::new();
+        let mut bg = gtk::pango::AttrColor::new_background(0x3535, 0x8484, 0xe4e4);
+        bg.set_start_index(from);
+        bg.set_end_index(to);
+        attrs.insert(bg);
+        let mut fg = gtk::pango::AttrColor::new_foreground(0xffff, 0xffff, 0xffff);
+        fg.set_start_index(from);
+        fg.set_end_index(to);
+        attrs.insert(fg);
+        attrs
+    });
+    label.set_attributes(attrs.as_ref());
+    // GTK merges attributes into the layout it already has, so the old highlight would
+    // stay on screen. Setting the text again makes it build a new layout.
+    let markup = label.label();
+    label.set_label("");
+    label.set_label(&markup);
 }
 
 pub struct ChatView {
@@ -207,7 +211,14 @@ impl ChatView {
         });
         this.input.add_controller(keys);
         let p = this.placeholder.clone();
-        this.input.buffer().connect_changed(move |b| p.set_visible(b.char_count() == 0));
+        let w = Rc::downgrade(&this);
+        this.input.buffer().connect_changed(move |b| {
+            p.set_visible(b.char_count() == 0);
+            // Typing moves on from whatever was selected.
+            if let Some(v) = w.upgrade() {
+                v.clear_selection();
+            }
+        });
 
         let w = Rc::downgrade(&this);
         this.call_btn.connect_clicked(move |_| {
@@ -272,6 +283,10 @@ impl ChatView {
         click.connect_pressed(move |g, n_press, x, y| {
             let Some(v) = w.upgrade() else { return };
             if !v.owns_press(g, x, y) {
+                // Scrolling keeps the selection; pressing a link or button doesn't.
+                if !v.on_scrollbar_or_touch(g, x, y) {
+                    v.clear_selection();
+                }
                 a.set(None);
                 g.set_state(gtk::EventSequenceState::Denied);
                 return;
@@ -387,6 +402,13 @@ impl ChatView {
         true
     }
 
+    fn on_scrollbar_or_touch(&self, g: &gtk::GestureClick, x: f64, y: f64) -> bool {
+        g.current_event_device().is_some_and(|d| d.source() == gtk::gdk::InputSource::Touchscreen)
+            || self.scroller.pick(x, y, gtk::PickFlags::DEFAULT).is_some_and(|h| {
+                h.is::<gtk::Scrollbar>() || h.ancestor(gtk::Scrollbar::static_type()).is_some()
+            })
+    }
+
     /// The text position under a point in the scroller: the nearest message above or
     /// below when it's between messages.
     fn spot_at(&self, x: f64, y: f64) -> Option<Spot> {
@@ -430,11 +452,24 @@ impl ChatView {
     }
 
     fn clear_selection(&self) {
+        let labels = self.texts.borrow();
         if let Some((from, to)) = self.selection.take() {
-            let labels = self.texts.borrow();
             for l in labels.iter().take(to.0 + 1).skip(from.0) {
                 highlight(l, None);
             }
+        }
+        // (A label's own right-click menu can "Select All" by itself.)
+        for l in labels.iter().filter(|l| l.selection_bounds().is_some()) {
+            l.select_region(0, 0);
+        }
+    }
+
+    /// A press anywhere in the window outside the message list deselects. (Inside it,
+    /// the list's own gesture decides.) `x` and `y` are in `window`'s coordinates.
+    pub fn press_in_window(&self, window: &impl IsA<gtk::Widget>, x: f64, y: f64) {
+        let point = gtk::graphene::Point::new(x as f32, y as f32);
+        if !self.scroller.compute_bounds(window).is_some_and(|b| b.contains_point(&point)) {
+            self.clear_selection();
         }
     }
 

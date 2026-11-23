@@ -531,6 +531,19 @@ impl App {
                 if handled { glib::Propagation::Stop } else { glib::Propagation::Proceed }
             });
             this.window.add_controller(keys);
+
+            // Clicking anywhere else deselects chat text. (It only watches: the click
+            // still goes to whatever was clicked.)
+            let click = gtk::GestureClick::new();
+            click.set_button(0);
+            click.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let w = Rc::downgrade(&this);
+            click.connect_pressed(move |_, _, x, y| {
+                if let Some(t) = w.upgrade() {
+                    t.chat_view.press_in_window(&t.window, x, y);
+                }
+            });
+            this.window.add_controller(click);
         }
 
         if this.store.borrow().settings.check_updates {
