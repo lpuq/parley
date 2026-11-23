@@ -757,7 +757,9 @@ impl App {
         let t = self.clone();
         glib::spawn_future_local(async move {
             use ksni::TrayMethods;
-            match rt.spawn(async move { tray.disable_dbus_name(sandboxed).spawn().await }).await {
+            // (Assumes a panel will turn up: at login Parley can start before it does, and
+            // would otherwise have no icon until it's restarted.)
+            match rt.spawn(async move { tray.disable_dbus_name(sandboxed).assume_sni_available(true).spawn().await }).await {
                 Ok(Ok(handle)) => *t.tray.borrow_mut() = Some(handle),
                 Ok(Err(e)) => tracing::info!("no system tray available ({e}); Parley still runs in the background"),
                 Err(_) => {}

@@ -31,6 +31,13 @@
     <content_attribute id="social-audio">intense</content_attribute>
   </content_rating>
   <releases>
+    <release version="0.12.4" date="2026-11-23">
+      <description>
+        <ul>
+          <li>Linux: the tray icon now appears even if Parley starts before your desktop's panel</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.12.3" date="2026-11-23">
       <description>
         <ul>

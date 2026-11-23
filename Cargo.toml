@@ -1,6 +1,6 @@
 [package]
 name = "parley"
-version = "0.12.3"
+version = "0.12.4"
 edition = "2024"
 description = "Private, serverless voice/video/screen-share calls for Linux"
 license = "GPL-3.0-or-later"

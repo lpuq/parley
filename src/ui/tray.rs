@@ -85,6 +85,14 @@ impl ksni::Tray for ParleyTray {
         );
         items
     }
+    fn watcher_online(&self) {
+        tracing::info!("system tray is back");
+    }
+    fn watcher_offline(&self, reason: ksni::OfflineReason) -> bool {
+        tracing::info!("no system tray for now: {reason:?}");
+        // Keep going: the icon returns when the panel does.
+        true
+    }
 }
 
 /// The app icon with a red dot in its top-right corner (unread messages).
